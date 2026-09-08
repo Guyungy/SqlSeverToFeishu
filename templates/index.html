@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQL Server → 飞书 同步向导</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-icon">⇄</div>
+                <div>
+                    <div class="brand-title">SQL → 飞书</div>
+                    <div class="brand-sub">数据同步向导</div>
+                </div>
+            </div>
+            <nav class="nav">
+                <button class="nav-item active" data-step="1" data-label="数据库配置"></button>
+                <button class="nav-item" data-step="2" data-label="飞书配置"></button>
+                <button class="nav-item" data-step="3" data-label="字段映射"></button>
+                <button class="nav-item" data-step="4" data-label="执行同步"></button>
+            </nav>
+            <div class="nav-footer">按步骤完成配置后执行同步</div>
+        </aside>
+        <main class="main">
+            <header class="topbar">
+                <div>
+                    <h1>SQL Server 到飞书多维表格同步</h1>
+                    <p class="topbar-sub">按左侧步骤完成配置，测试通过后再执行同步</p>
+                </div>
+            </header>
+            <div class="steps-container">
+                <section class="step active" id="step-1">
+                    <div class="card">
+                        <h2 class="card-title">1. 配置 SQL Server</h2>
+                        <p class="card-desc">填写本地 SQL Server 的连接信息和数据表名，然后点击测试。</p>
+                        <div class="form-grid" id="sql-form"></div>
+                        <div class="card-actions">
+                            <button class="btn secondary" id="test-sql-btn">测试 SQL Server 连接</button>
+                            <span id="sql-test-result" class="test-result"></span>
+                        </div>
+                    </div>
+                    <div class="step-footer">
+                        <button class="btn primary next-step" data-target="2">下一步：飞书配置 →</button>
+                    </div>
+                </section>
+                <section class="step" id="step-2">
+                    <div class="card">
+                        <h2 class="card-title">2. 配置飞书应用</h2>
+                        <p class="card-desc">填写自建应用的 App ID / Secret 和目标多维表格 Table ID，然后点击测试。</p>
+                        <div class="form-grid" id="feishu-form"></div>
+                        <div class="card-actions">
+                            <button class="btn secondary" id="test-feishu-btn">测试飞书连接</button>
+                            <span id="feishu-test-result" class="test-result"></span>
+                        </div>
+                    </div>
+                    <div class="step-footer">
+                        <button class="btn ghost prev-step" data-target="1">← 上一步</button>
+                        <button class="btn primary next-step" data-target="3">下一步：字段映射 →</button>
+                    </div>
+                </section>
+                <section class="step" id="step-3">
+                    <div class="card">
+                        <h2 class="card-title">3. 字段映射</h2>
+                        <p class="card-desc">SQL Server 列名 与 飞书多维表格字段名 的对应关系。</p>
+                        <table class="mapping-table">
+                            <thead>
+                                <tr><th>SQL Server 列</th><th>飞书字段名</th><th>类型</th></tr>
+                            </thead>
+                            <tbody id="mapping-body"></tbody>
+                        </table>
+                    </div>
+                    <div class="step-footer">
+                        <button class="btn ghost prev-step" data-target="2">← 上一步</button>
+                        <button class="btn primary next-step" data-target="4">下一步：执行同步 →</button>
+                    </div>
+                </section>
+                <section class="step" id="step-4">
+                    <div class="card">
+                        <h2 class="card-title">4. 执行同步</h2>
+                        <p class="card-desc">确认配置无误后，点击下方按钮开始同步。进度和日志会实时显示。</p>
+                        <div class="run-actions">
+                            <button class="btn success btn-lg" id="run-btn" disabled>开始同步</button>
+                            <span id="run-status" class="badge idle">就绪</span>
+                        </div>
+                        <div class="progress-wrap">
+                            <div class="progress-info">
+                                <span id="progress-phase">等待开始</span>
+                                <span id="progress-percent">0%</span>
+                            </div>
+                            <div class="progress-bar"><div id="progress-fill" class="progress-fill"></div></div>
+                        </div>
+                    </div>
+                    <div class="card log-card">
+                        <h2 class="card-title">实时日志</h2>
+                        <pre id="log-viewer"></pre>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+    <script>
+        const CONFIG_LABELS = {
+            DB_SERVER: 'SQL Server 地址',
+            DB_PORT: '端口',
+            DB_NAME: '数据库名',
+            DB_USER: '用户名',
+            DB_PASSWORD: '密码',
+            DB_TABLE: '数据表名',
+            FEISHU_APP_ID: '飞书 App ID',
+            FEISHU_APP_SECRET: '飞书 App Secret',
+            FEISHU_BASE_TABLE_ID: '多维表格 Table ID',
+            FEISHU_BASE_VIEW_ID: '多维表格 View ID',
+        };
+        document.querySelectorAll('.nav-item, .next-step, .prev-step').forEach(el => {
+            el.addEventListener('click', () => {
+                const step = el.dataset.step || el.dataset.target;
+                showStep(step);
+            });
+        });
+        function showStep(step) {
+            document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+            document.getElementById('step-' + step).classList.add('active');
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            document.querySelector(`.nav-item[data-step="${step}"]`).classList.add('active');
+        }
+        fetch('/api/config')
+            .then(r => r.json())
+            .then(data => {
+                const sqlForm = document.getElementById('sql-form');
+                const feishuForm = document.getElementById('feishu-form');
+                for (const [key, info] of Object.entries(data)) {
+                    const wrapper = document.createElement('div');
+                    wrapper.className = 'form-group';
+                    const label = document.createElement('label');
+                    label.textContent = info.label + (info.required ? ' *' : '');
+                    const input = document.createElement('input');
+                    input.name = key;
+                    input.value = info.value;
+                    input.placeholder = info.required ? '必填' : '可选';
+                    input.type = (key === 'DB_PASSWORD' || key === 'FEISHU_APP_SECRET') ? 'password' : 'text';
+                    input.addEventListener('input', debounce(saveConfig, 500));
+                    wrapper.appendChild(label);
+                    wrapper.appendChild(input);
+                    if (key.startsWith('DB_')) sqlForm.appendChild(wrapper);
+                    else feishuForm.appendChild(wrapper);
+                }
+                document.getElementById('run-btn').disabled = false;
+            });
+        fetch('/api/mapping')
+            .then(r => r.json())
+            .then(data => {
+                const tbody = document.getElementById('mapping-body');
+                data.mapping.forEach(m => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `<td>${m.sql}</td><td>${m.feishu}</td><td>${m.type}</td>`;
+                    tbody.appendChild(tr);
+                });
+            });
+        function getFormValues() {
+            const values = {};
+            document.querySelectorAll('input[name]').forEach(input => {
+                values[input.name] = input.value;
+            });
+            return values;
+        }
+        function saveConfig() {
+            fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(getFormValues())
+            });
+        }
+        function debounce(fn, wait) {
+            let t;
+            return () => {
+                clearTimeout(t);
+                t = setTimeout(fn, wait);
+            };
+        }
+        function setResult(id, ok, text) {
+            const el = document.getElementById(id);
+            el.textContent = text;
+            el.className = 'test-result ' + (ok ? 'ok' : 'fail');
+        }
+        document.getElementById('test-sql-btn').addEventListener('click', async () => {
+            setResult('sql-test-result', true, '测试中...');
+            saveConfig();
+            try {
+                const res = await fetch('/api/test/sql', { method: 'POST' });
+                const data = await res.json();
+                setResult('sql-test-result', data.ok, data.message);
+            } catch (err) {
+                setResult('sql-test-result', false, '请求失败: ' + err);
+            }
+        });
+        document.getElementById('test-feishu-btn').addEventListener('click', async () => {
+            setResult('feishu-test-result', true, '测试中...');
+            saveConfig();
+            try {
+                const res = await fetch('/api/test/feishu', { method: 'POST' });
+                const data = await res.json();
+                setResult('feishu-test-result', data.ok, data.message);
+            } catch (err) {
+                setResult('feishu-test-result', false, '请求失败: ' + err);
+            }
+        });
+        document.getElementById('run-btn').addEventListener('click', async () => {
+            saveConfig();
+            const btn = document.getElementById('run-btn');
+            if (btn.dataset.running === 'true') return;
+            btn.dataset.running = 'true';
+            btn.disabled = true;
+            document.getElementById('run-status').textContent = '运行中';
+            document.getElementById('run-status').className = 'badge running';
+            document.getElementById('log-viewer').textContent = '';
+            updateProgress(0, '准备同步');
+            try {
+                const res = await fetch('/api/run', { method: 'POST' });
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    lines.forEach(line => {
+                        if (line.trim()) appendLine(line);
+                    });
+                }
+                if (buffer.trim()) appendLine(buffer);
+            } catch (err) {
+                appendLine('请求出错: ' + err);
+            } finally {
+                btn.dataset.running = 'false';
+                btn.disabled = false;
+                document.getElementById('run-status').textContent = '就绪';
+                document.getElementById('run-status').className = 'badge idle';
+            }
+        });
+        function appendLine(line) {
+            const logViewer = document.getElementById('log-viewer');
+            if (line.startsWith('PROGRESS:')) {
+                const parts = line.split(':');
+                const phase = parts[1];
+                const percent = parseInt(parts[2], 10);
+                const message = parts.slice(3).join(':');
+                updateProgress(percent, message);
+                logViewer.textContent += `[${phase}] ${message}\n`;
+            } else {
+                logViewer.textContent += line + '\n';
+            }
+            logViewer.scrollTop = logViewer.scrollHeight;
+        }
+        function updateProgress(percent, text) {
+            document.getElementById('progress-fill').style.width = percent + '%';
+            document.getElementById('progress-percent').textContent = percent + '%';
+            document.getElementById('progress-phase').textContent = text;
+        }
+    </script>
+</body>
+</html>

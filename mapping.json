@@ -1,0 +1,18 @@
+{
+  "mapping": [
+    {"sql": "BillNodeID", "feishu": "状态", "type": "text"},
+    {"sql": "ZSAItemID", "feishu": "订单号", "type": "text"},
+    {"sql": "SAMyBillerID", "feishu": "业务员", "type": "text"},
+    {"sql": "ProductCode", "feishu": "款号", "type": "text"},
+    {"sql": "SABillDate", "feishu": "下单日期", "type": "text"},
+    {"sql": "_QtySum", "feishu": "总数量", "type": "text"},
+    {"sql": "SAMyBiller2ID", "feishu": "跟单员", "type": "text"},
+    {"sql": "SOPatternUserID", "feishu": "纸样师", "type": "text"},
+    {"sql": "_SATRBillNodeName", "feishu": "订单进度", "type": "text"},
+    {"sql": "ShipDate", "feishu": "货期", "type": "text"},
+    {"sql": "_XCutQtySum", "feishu": "实裁总数", "type": "text"},
+    {"sql": "_PackedQtySum", "feishu": "实际出货数", "type": "text"}
+  ],
+  "unique_key": "ZSAItemID",
+  "unique_key_label": "订单号"
+}

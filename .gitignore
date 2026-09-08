@@ -1,0 +1,19 @@
+# Python 虚拟环境（勿提交）
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 敏感配置（含密钥）
+.env
+
+# 日志
+*.log
+sync.log
+dashboard_server.log
+
+# macOS
+.DS_Store
+
+# WorkBuddy 项目本地数据（勿提交）
+.workbuddy/
