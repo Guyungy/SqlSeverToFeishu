@@ -40,9 +40,17 @@ CONFIG_KEYS = [
     ("DB_TABLE", "数据表名", True),
     ("FEISHU_APP_ID", "飞书 App ID", True),
     ("FEISHU_APP_SECRET", "飞书 App Secret", True),
-    ("FEISHU_BASE_TABLE_ID", "飞书多维表格 Table ID", True),
+    ("FEISHU_BASE_APP_TOKEN", "多维表格 App Token", True),
+    ("FEISHU_BASE_TABLE_ID", "多维表格 Table ID", True),
     ("FEISHU_BASE_VIEW_ID", "飞书多维表格 View ID", False),
 ]
+
+def _base_app_token():
+    """获取飞书多维表格的 app_token（bascn 开头，不是应用 App ID）。"""
+    v = (os.environ.get("FEISHU_BASE_APP_TOKEN") or "").strip()
+    if not v:
+        raise RuntimeError("缺少配置：多维表格 App Token（FEISHU_BASE_APP_TOKEN，bascn 开头），请到「飞书配置」填写")
+    return v
 
 _running_lock = threading.Lock()
 _running = False
@@ -95,11 +103,11 @@ def test_feishu():
     try:
         from sync import get_tenant_access_token
         token = get_tenant_access_token()
-        app_id = os.environ["FEISHU_APP_ID"]
+        app_token = _base_app_token()
         table_id = os.environ["FEISHU_BASE_TABLE_ID"]
         headers = {"Authorization": f"Bearer {token}"}
         resp = requests.get(
-            f"{FEISHU_API}/bitable/v1/apps/{app_id}/tables",
+            f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables",
             headers=headers,
         )
         resp.raise_for_status()
@@ -187,10 +195,13 @@ def get_feishu_fields():
     try:
         from sync import get_tenant_access_token
         token = get_tenant_access_token()
-        app_id = os.environ.get("FEISHU_APP_ID", "")
         table_id = os.environ.get("FEISHU_BASE_TABLE_ID", "")
-        if not app_id or not table_id:
-            return jsonify({"ok": False, "message": "请先在「飞书配置」填写 App ID 和 Table ID"})
+        try:
+            app_token = _base_app_token()
+        except RuntimeError as exc:
+            return jsonify({"ok": False, "message": str(exc)})
+        if not table_id:
+            return jsonify({"ok": False, "message": "请先在「飞书配置」填写 Table ID"})
         headers = {"Authorization": f"Bearer {token}"}
         page_token = None
         fields = []
@@ -199,7 +210,7 @@ def get_feishu_fields():
             if page_token:
                 params["page_token"] = page_token
             resp = requests.get(
-                f"{FEISHU_API}/bitable/v1/apps/{app_id}/tables/{table_id}/fields",
+                f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
                 headers=headers, params=params,
             )
             resp.raise_for_status()

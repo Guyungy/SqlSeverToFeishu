@@ -106,6 +106,7 @@ python3 -m venv .venv
 | DB_TABLE | 数据表名或视图名，如 `dbo.Orders` |
 | FEISHU_APP_ID | 飞书自建应用 App ID |
 | FEISHU_APP_SECRET | 飞书自建应用 App Secret |
+| FEISHU_BASE_APP_TOKEN | 飞书多维表格 App Token（`bascn` 开头，见 URL `/base/` 后） |
 | FEISHU_BASE_TABLE_ID | 目标多维表格 Table ID |
 
 ## 常见问题

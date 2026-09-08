@@ -42,6 +42,14 @@ UNIQUE_KEY_LABEL = MAPPING["unique_key_label"]
 FEISHU_API = "https://open.feishu.cn/open-apis"
 
 
+def base_app_token() -> str:
+    """飞书多维表格的 app_token（bascn 开头，不是应用 App ID cli_ 开头）。"""
+    v = (os.environ.get("FEISHU_BASE_APP_TOKEN") or "").strip()
+    if not v:
+        raise RuntimeError("缺少配置：多维表格 App Token（FEISHU_BASE_APP_TOKEN，bascn 开头），请在飞书配置中填写")
+    return v
+
+
 def get_sql_connection():
     """Return a pymssql connection based on environment variables."""
     server = os.environ["DB_SERVER"]
@@ -111,13 +119,13 @@ def get_tenant_access_token() -> str:
 def list_existing_records(token: str, unique_values: List[str]) -> Dict[str, str]:
     """Return a mapping from business key -> Feishu record_id for existing records."""
     table_id = os.environ["FEISHU_BASE_TABLE_ID"]
-    app_id = os.environ["FEISHU_APP_ID"]
+    app_token = base_app_token()
     headers = {"Authorization": f"Bearer {token}"}
     existing: Dict[str, str] = {}
     for value in unique_values:
         filter_expr = f'CurrentValue[{UNIQUE_KEY_LABEL}] = "{value}"'
         resp = requests.get(
-            f"{FEISHU_API}/bitable/v1/apps/{app_id}/tables/{table_id}/records",
+            f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables/{table_id}/records",
             headers=headers,
             params={"filter": filter_expr, "page_size": 1},
         )
@@ -130,9 +138,9 @@ def list_existing_records(token: str, unique_values: List[str]) -> Dict[str, str
 
 def batch_create_records(token: str, records: List[Dict[str, Any]]) -> None:
     table_id = os.environ["FEISHU_BASE_TABLE_ID"]
-    app_id = os.environ["FEISHU_APP_ID"]
+    app_token = base_app_token()
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"{FEISHU_API}/bitable/v1/apps/{app_id}/tables/{table_id}/records/batch_create"
+    url = f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
     resp = requests.post(url, headers=headers, json={"records": records})
     resp.raise_for_status()
     result = resp.json()
@@ -142,9 +150,9 @@ def batch_create_records(token: str, records: List[Dict[str, Any]]) -> None:
 
 def batch_update_records(token: str, records: List[Dict[str, Any]]) -> None:
     table_id = os.environ["FEISHU_BASE_TABLE_ID"]
-    app_id = os.environ["FEISHU_APP_ID"]
+    app_token = base_app_token()
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"{FEISHU_API}/bitable/v1/apps/{app_id}/tables/{table_id}/records/batch_update"
+    url = f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update"
     resp = requests.post(url, headers=headers, json={"records": records})
     resp.raise_for_status()
     result = resp.json()
