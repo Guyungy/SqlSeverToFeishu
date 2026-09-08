@@ -124,6 +124,98 @@ def get_mapping():
     except Exception as exc:
         return jsonify({"error": str(exc)})
 
+@app.route("/api/mapping", methods=["POST"])
+def save_mapping():
+    """保存字段映射与唯一键到 mapping.json（运行时可写，通用场景）。"""
+    payload = request.get_json(force=True) or {}
+    mapping = payload.get("mapping")
+    unique_key = payload.get("unique_key")
+    unique_key_label = payload.get("unique_key_label")
+
+    if not isinstance(mapping, list):
+        return jsonify({"ok": False, "message": "映射数据格式错误"}), 400
+
+    # 清洗：只保留 sql / feishu 两字段
+    cleaned = []
+    for m in mapping:
+        if isinstance(m, dict) and m.get("sql") and m.get("feishu"):
+            cleaned.append({"sql": m["sql"], "feishu": m["feishu"]})
+
+    data = {
+        "mapping": cleaned,
+        "unique_key": unique_key or "",
+        "unique_key_label": unique_key_label or "",
+    }
+    try:
+        with open(MAPPING_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return jsonify({"ok": True, "message": f"已保存 {len(cleaned)} 条字段映射", "data": data})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 500
+
+@app.route("/api/columns/sql", methods=["GET"])
+def get_sql_columns():
+    """自动读取 SQL Server 表的全部列名（通用场景）。"""
+    try:
+        from sync import get_sql_connection
+        table = os.environ.get("DB_TABLE", "").strip()
+        if not table:
+            return jsonify({"ok": False, "message": "请先在「数据库配置」填写并保存数据表名"})
+        # 从表名里拆出真正的表名（去 schema 前缀），用于 INFORMATION_SCHEMA
+        if "." in table:
+            bare = table.split(".")[-1].strip()
+            schema = table.split(".")[-2].strip() if len(table.split(".")) >= 2 else "dbo"
+        else:
+            bare, schema = table, "dbo"
+        bare = bare.strip("[]")
+        conn = get_sql_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = %s AND TABLE_SCHEMA = %s ORDER BY ORDINAL_POSITION",
+            (bare, schema),
+        )
+        cols = [r[0] for r in cur.fetchall()]
+        conn.close()
+        return jsonify({"ok": True, "columns": cols, "table": table})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)})
+
+@app.route("/api/fields/feishu", methods=["GET"])
+def get_feishu_fields():
+    """自动读取飞书多维表格的全部字段名（通用场景）。"""
+    try:
+        from sync import get_tenant_access_token
+        token = get_tenant_access_token()
+        app_id = os.environ.get("FEISHU_APP_ID", "")
+        table_id = os.environ.get("FEISHU_BASE_TABLE_ID", "")
+        if not app_id or not table_id:
+            return jsonify({"ok": False, "message": "请先在「飞书配置」填写 App ID 和 Table ID"})
+        headers = {"Authorization": f"Bearer {token}"}
+        page_token = None
+        fields = []
+        while True:
+            params = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            resp = requests.get(
+                f"{FEISHU_API}/bitable/v1/apps/{app_id}/tables/{table_id}/fields",
+                headers=headers, params=params,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                return jsonify({"ok": False, "message": data.get("msg", "飞书接口返回错误")})
+            items = data.get("data", {}).get("items", [])
+            fields.extend(i.get("field_name") for i in items)
+            if data.get("data", {}).get("has_more"):
+                page_token = data.get("data", {}).get("page_token")
+            else:
+                break
+        return jsonify({"ok": True, "fields": fields})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)})
+
 @app.route("/api/status")
 def status():
     return jsonify({"running": _running})

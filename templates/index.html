@@ -64,13 +64,40 @@
                 <section class="step" id="step-3">
                     <div class="card">
                         <h2 class="card-title">3. 字段映射</h2>
-                        <p class="card-desc">SQL Server 列名 与 飞书多维表格字段名 的对应关系。</p>
-                        <table class="mapping-table">
+                        <p class="card-desc">
+                            先读取两边的字段，再把「SQL Server 列」对应到「飞书字段名」，并选择一个字段作为「唯一键」（用于去重，建议用订单号/编号类字段）。
+                            完全通用的映射方式，换成任意表和字段都能用。
+                        </p>
+
+                        <div class="mapping-toolbar">
+                            <button class="btn secondary" id="load-sql-cols">① 读取 SQL Server 字段</button>
+                            <button class="btn secondary" id="load-feishu-fields">② 读取飞书表字段</button>
+                            <button class="btn secondary" id="auto-match-btn">自动按同名匹配</button>
+                            <span id="mapping-status" class="test-result"></span>
+                        </div>
+
+                        <table class="mapping-table" id="mapping-editor">
                             <thead>
-                                <tr><th>SQL Server 列</th><th>飞书字段名</th><th>类型</th></tr>
+                                <tr>
+                                    <th>SQL Server 列</th>
+                                    <th>→</th>
+                                    <th>飞书字段名</th>
+                                    <th></th>
+                                </tr>
                             </thead>
                             <tbody id="mapping-body"></tbody>
                         </table>
+                        <button class="btn ghost" id="add-row-btn">+ 添加一行</button>
+
+                        <div class="unique-key-row">
+                            <label for="unique-key-select"><b>唯一键（去重依据）：</b></label>
+                            <select id="unique-key-select"></select>
+                            <span class="hint">建议选「订单号」「编号」等唯一值字段</span>
+                        </div>
+
+                        <div class="card-actions">
+                            <button class="btn primary" id="save-mapping-btn">保存映射</button>
+                        </div>
                     </div>
                     <div class="step-footer">
                         <button class="btn ghost prev-step" data-target="2">← 上一步</button>
@@ -149,16 +176,213 @@
                 }
                 document.getElementById('run-btn').disabled = false;
             });
-        fetch('/api/mapping')
-            .then(r => r.json())
-            .then(data => {
-                const tbody = document.getElementById('mapping-body');
-                data.mapping.forEach(m => {
-                    const tr = document.createElement('tr');
-                    tr.innerHTML = `<td>${m.sql}</td><td>${m.feishu}</td><td>${m.type}</td>`;
-                    tbody.appendChild(tr);
-                });
+        // ================= 字段映射（通用场景）=================
+        let sqlColumns = [];      // 探测到的 SQL 列
+        let feishuFields = [];    // 探测到的飞书字段
+        let mappingRows = [];     // [{sql, feishu}]
+
+        // 加载已保存的映射（平滑兼容旧版）
+        async function loadMapping() {
+            try {
+                const res = await fetch('/api/mapping');
+                const data = await res.json();
+                if (data && data.mapping && Array.isArray(data.mapping)) {
+                    mappingRows = data.mapping.map(m => ({ sql: m.sql || '', feishu: m.feishu || '' }));
+                    if (data.mapping.every(m => m.type)) {
+                        // 旧格式含 type 字段，忽略即可
+                    }
+                } else {
+                    mappingRows = [{ sql: '', feishu: '' }];
+                }
+                // 回填唯一键
+                const uk = document.getElementById('unique-key-select');
+                if (data && data.unique_key) {
+                    uk.dataset.saved = data.unique_key;
+                }
+                renderMappingRows();
+            } catch (e) {
+                mappingRows = [{ sql: '', feishu: '' }];
+                renderMappingRows();
+            }
+        }
+
+        // ===== 读取 SQL 字段 =====
+        document.getElementById('load-sql-cols').addEventListener('click', async () => {
+            setMappingStatus(true, '读取 SQL 字段中...');
+            try {
+                const res = await fetch('/api/columns/sql');
+                const data = await res.json();
+                if (data.ok) {
+                    sqlColumns = data.columns;
+                    setMappingStatus(true, `已读取 ${sqlColumns.length} 个 SQL 字段（表: ${data.table}）`);
+                    // 让已有行的 SQL 下拉能选到新字段，并尝试同名匹配
+                    autoMatchByName();
+                    renderMappingRows();
+                } else {
+                    setMappingStatus(false, data.message || '读取失败');
+                }
+            } catch (e) {
+                setMappingStatus(false, '请求失败: ' + e);
+            }
+        });
+
+        // ===== 读取飞书字段 =====
+        document.getElementById('load-feishu-fields').addEventListener('click', async () => {
+            setMappingStatus(true, '读取飞书表字段中...');
+            try {
+                const res = await fetch('/api/fields/feishu');
+                const data = await res.json();
+                if (data.ok) {
+                    feishuFields = data.fields;
+                    setMappingStatus(true, `已读取 ${feishuFields.length} 个飞书字段`);
+                    // 已加载 SQL 字段时做一次同名匹配
+                    if (sqlColumns.length) autoMatchByName();
+                    renderMappingRows();
+                } else {
+                    setMappingStatus(false, data.message || '读取失败');
+                }
+            } catch (e) {
+                setMappingStatus(false, '请求失败: ' + e);
+            }
+        });
+
+        // ===== 自动按同名匹配 =====
+        document.getElementById('auto-match-btn').addEventListener('click', () => {
+            autoMatchByName();
+            renderMappingRows();
+            setMappingStatus(true, '已按同名自动匹配');
+        });
+        function autoMatchByName() {
+            if (!sqlColumns.length || !feishuFields.length) {
+                setMappingStatus(false, '请先读取 SQL 字段和飞书字段');
+                return;
+            }
+            // 每个 SQL 列尝试找一个同名的飞书字段
+            const used = new Set();
+            mappingRows.forEach(row => {
+                if (row.sql && !row.feishu) {
+                    const match = feishuFields.find(f => !used.has(f) && f === row.sql);
+                    if (match) { row.feishu = match; used.add(match); }
+                }
             });
+            // SQL 列尚未出现在行里的，补充整行做同名匹配
+            sqlColumns.forEach(col => {
+                if (!mappingRows.some(r => r.sql === col)) {
+                    const match = feishuFields.includes(col) ? col : '';
+                    if (match && !used.has(match)) { used.add(match); }
+                    mappingRows.push({ sql: col, feishu: match });
+                }
+            });
+        }
+
+        // ===== 渲染映射行 =====
+        function renderMappingRows() {
+            const tbody = document.getElementById('mapping-body');
+            tbody.innerHTML = '';
+            mappingRows.forEach((row, idx) => {
+                const tr = document.createElement('tr');
+
+                const tdSql = document.createElement('td');
+                const selSql = document.createElement('select');
+                selSql.className = 'mapping-select';
+                selSql.appendChild(new Option('（选择 SQL 列）', ''));
+                sqlColumns.forEach(c => selSql.appendChild(new Option(c, c)));
+                selSql.value = row.sql || '';
+                selSql.addEventListener('change', () => { mappingRows[idx].sql = selSql.value; syncUniqueKeyOptions(); });
+                tdSql.appendChild(selSql);
+
+                const tdArrow = document.createElement('td');
+                tdArrow.textContent = '→';
+                tdArrow.className = 'mapping-arrow';
+
+                const tdFeishu = document.createElement('td');
+                const selFeishu = document.createElement('select');
+                selFeishu.className = 'mapping-select';
+                selFeishu.appendChild(new Option('（不映射 / 留空）', ''));
+                feishuFields.forEach(f => selFeishu.appendChild(new Option(f, f)));
+                selFeishu.value = row.feishu || '';
+                selFeishu.addEventListener('change', () => { mappingRows[idx].feishu = selFeishu.value; });
+                tdFeishu.appendChild(selFeishu);
+
+                const tdDel = document.createElement('td');
+                const delBtn = document.createElement('button');
+                delBtn.className = 'btn ghost del-row';
+                delBtn.textContent = '删除';
+                delBtn.addEventListener('click', () => {
+                    mappingRows.splice(idx, 1);
+                    syncUniqueKeyOptions();
+                    renderMappingRows();
+                });
+                tdDel.appendChild(delBtn);
+
+                tr.appendChild(tdSql);
+                tr.appendChild(tdArrow);
+                tr.appendChild(tdFeishu);
+                tr.appendChild(tdDel);
+                tbody.appendChild(tr);
+            });
+            syncUniqueKeyOptions();
+        }
+
+        // ===== 回填唯一键下拉 =====
+        function syncUniqueKeyOptions() {
+            const uk = document.getElementById('unique-key-select');
+            const saved = uk.dataset.saved || '';
+            uk.innerHTML = '';
+            uk.appendChild(new Option('（请选择唯一键）', ''));
+            sqlColumns.forEach(c => {
+                const opt = new Option(c, c);
+                // 默认优先选订单号/编号类
+                if ((/订单|单号|编号|id|no|code/i.test(c)) && !saved) opt.selected = true;
+                uk.appendChild(opt);
+            });
+            // 已保存的键若存在则回选
+            if (saved && [...uk.options].some(o => o.value === saved)) uk.value = saved;
+            if (!saved) uk.dataset.saved = '';
+        }
+
+        // ===== 添加行 =====
+        document.getElementById('add-row-btn').addEventListener('click', () => {
+            mappingRows.push({ sql: '', feishu: '' });
+            renderMappingRows();
+        });
+
+        // ===== 保存映射 =====
+        document.getElementById('save-mapping-btn').addEventListener('click', async () => {
+            const uk = document.getElementById('unique-key-select');
+            const uniqueKey = uk.value;
+            const ukLabel = uniqueKey;
+            if (!uniqueKey) {
+                setMappingStatus(false, '请选择唯一键后再保存');
+                return;
+            }
+            const valid = mappingRows.filter(r => r.sql && r.feishu);
+            if (!valid.length) {
+                setMappingStatus(false, '至少需要一条有效的字段映射');
+                return;
+            }
+            setMappingStatus(true, '保存中...');
+            try {
+                const res = await fetch('/api/mapping', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mapping: valid, unique_key: uniqueKey, unique_key_label: ukLabel })
+                });
+                const data = await res.json();
+                setMappingStatus(data.ok, data.message || (data.ok ? '保存成功' : '保存失败'));
+                if (data.ok) uk.dataset.saved = uniqueKey;
+            } catch (e) {
+                setMappingStatus(false, '保存请求失败: ' + e);
+            }
+        });
+
+        function setMappingStatus(ok, text) {
+            const el = document.getElementById('mapping-status');
+            el.textContent = text;
+            el.className = 'test-result ' + (ok ? 'ok' : 'fail');
+        }
+
+        loadMapping();
         function getFormValues() {
             const values = {};
             document.querySelectorAll('input[name]').forEach(input => {
