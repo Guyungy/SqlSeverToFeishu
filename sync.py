@@ -19,6 +19,8 @@ import requests
 import pymssql
 from dotenv import load_dotenv
 
+from feishu_link import parse_feishu_base_url
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -42,11 +44,38 @@ UNIQUE_KEY_LABEL = MAPPING["unique_key_label"]
 FEISHU_API = "https://open.feishu.cn/open-apis"
 
 
+def resolve_feishu_target() -> Dict[str, str]:
+    """解析出飞书多维表格目标 {app_token, table_id, view_id}。
+
+    优先级：1) FEISHU_BASE_URL(完整链接，自动解析) 2) 旧的三个独立字段(APP_TOKEN/TABLE_ID/VIEW_ID)。
+    链接里解析出的值会覆盖独立字段中仍为占位的同名项。
+    """
+    url = (os.environ.get("FEISHU_BASE_URL") or "").strip()
+    parsed = parse_feishu_base_url(url) if url else {}
+    app_token = parsed.get("app_token") or (os.environ.get("FEISHU_BASE_APP_TOKEN") or "").strip()
+    table_id = parsed.get("table_id") or (os.environ.get("FEISHU_BASE_TABLE_ID") or "").strip()
+    view_id = parsed.get("view_id") or (os.environ.get("FEISHU_BASE_VIEW_ID") or "").strip()
+    return {"app_token": app_token, "table_id": table_id, "view_id": view_id}
+
+
 def base_app_token() -> str:
-    """飞书多维表格的 app_token（bascn 开头，不是应用 App ID cli_ 开头）。"""
-    v = (os.environ.get("FEISHU_BASE_APP_TOKEN") or "").strip()
+    """获取飞书多维表格的 app_token（bascn/Bak 等开头，不是应用 App ID cli_ 开头）。"""
+    v = resolve_feishu_target()["app_token"]
     if not v:
-        raise RuntimeError("缺少配置：多维表格 App Token（FEISHU_BASE_APP_TOKEN，bascn 开头），请在飞书配置中填写")
+        raise RuntimeError(
+            "缺少配置：请在「飞书配置」粘贴多维表格完整链接(FEISHU_BASE_URL)，"
+            "或填写多维表格 App Token(FEISHU_BASE_APP_TOKEN)"
+        )
+    return v
+
+
+def base_table_id() -> str:
+    v = resolve_feishu_target()["table_id"]
+    if not v:
+        raise RuntimeError(
+            "缺少配置：无法从链接解析到 Table ID。请在多维表格链接 URL 中带上 ?table=tblXXX，"
+            "或单独填写多维表格 Table ID(FEISHU_BASE_TABLE_ID)"
+        )
     return v
 
 
@@ -118,7 +147,7 @@ def get_tenant_access_token() -> str:
 
 def list_existing_records(token: str, unique_values: List[str]) -> Dict[str, str]:
     """Return a mapping from business key -> Feishu record_id for existing records."""
-    table_id = os.environ["FEISHU_BASE_TABLE_ID"]
+    table_id = base_table_id()
     app_token = base_app_token()
     headers = {"Authorization": f"Bearer {token}"}
     existing: Dict[str, str] = {}
@@ -137,7 +166,7 @@ def list_existing_records(token: str, unique_values: List[str]) -> Dict[str, str
 
 
 def batch_create_records(token: str, records: List[Dict[str, Any]]) -> None:
-    table_id = os.environ["FEISHU_BASE_TABLE_ID"]
+    table_id = base_table_id()
     app_token = base_app_token()
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
@@ -149,7 +178,7 @@ def batch_create_records(token: str, records: List[Dict[str, Any]]) -> None:
 
 
 def batch_update_records(token: str, records: List[Dict[str, Any]]) -> None:
-    table_id = os.environ["FEISHU_BASE_TABLE_ID"]
+    table_id = base_table_id()
     app_token = base_app_token()
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update"

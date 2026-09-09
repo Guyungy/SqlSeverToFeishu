@@ -46,6 +46,7 @@
 | --- | --- |
 | `dashboard.py` | 网页配置面板主程序 |
 | `sync.py` | 后台同步数据的核心脚本 |
+| `feishu_link.py` | 从飞书多维表格链接解析 app_token/table_id/view_id |
 | `mapping.json` | SQL 列 → 飞书字段 的映射配置 |
 | `.env.example` | 配置模板（复制为 `.env` 填写） |
 | `requirements.txt` | Python 依赖清单 |
@@ -106,8 +107,9 @@ python3 -m venv .venv
 | DB_TABLE | 数据表名或视图名，如 `dbo.Orders` |
 | FEISHU_APP_ID | 飞书自建应用 App ID |
 | FEISHU_APP_SECRET | 飞书自建应用 App Secret |
-| FEISHU_BASE_APP_TOKEN | 飞书多维表格 App Token（`bascn` 开头，见 URL `/base/` 后） |
-| FEISHU_BASE_TABLE_ID | 目标多维表格 Table ID |
+| FEISHU_BASE_URL | **（推荐）多维表格完整链接**：打开目标数据表后复制地址栏整条链接，程序自动识别 app_token/table_id/view_id |
+| FEISHU_BASE_APP_TOKEN | 备选：多维表格 App Token（`bascn`/`Bak` 开头，URL `/base/` 后那串；不是 `cli_` 的 App ID）。填了链接可留空 |
+| FEISHU_BASE_TABLE_ID | 备选：目标多维表格 Table ID（`tbl` 开头）。填了链接可留空 |
 
 ## 常见问题
 
@@ -117,10 +119,11 @@ python3 -m venv .venv
 - 防火墙未拦截
 - 命名实例填 `localhost\\SQLEXPRESS`
 
-### 飞书连接失败
+### 飞书连接失败 / 报 400 Bad Request
 - App ID / Secret 是否正确
 - 应用是否**发布了版本**、是否**关联到目标多维表格**
-- Table ID（`tbl` 开头）是否正确
+- **最常见**：把应用的 App ID（`cli_` 开头）误填成了多维表格 App Token → 400。请在「飞书配置」粘贴**多维表格完整链接**（或填 `bascn`/`Bak` 开头的 app_token + `tbl` 开头的 Table ID），不要填 App ID
+- 若链接解析不到 Table ID，请确认浏览器地址栏打开的是**具体数据表**（URL 含 `?table=tblXXX`）再复制
 
 ### 双击启动器报错：找不到 Python / 依赖
 - 先运行 `install.bat` / `install.command` 自动建环境并装依赖

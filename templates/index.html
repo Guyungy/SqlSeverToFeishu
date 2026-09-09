@@ -138,9 +138,15 @@
             DB_TABLE: '数据表名',
             FEISHU_APP_ID: '飞书 App ID',
             FEISHU_APP_SECRET: '飞书 App Secret',
-            FEISHU_BASE_APP_TOKEN: '多维表格 App Token（bascn...）',
-            FEISHU_BASE_TABLE_ID: '多维表格 Table ID',
-            FEISHU_BASE_VIEW_ID: '多维表格 View ID',
+            FEISHU_BASE_URL: '多维表格链接（推荐，粘贴即可）',
+            FEISHU_BASE_APP_TOKEN: 'App Token（填了链接可留空）',
+            FEISHU_BASE_TABLE_ID: 'Table ID（填了链接可留空）',
+            FEISHU_BASE_VIEW_ID: 'View ID（可留空）',
+        };
+        const CONFIG_HINTS = {
+            FEISHU_BASE_URL: '把浏览器地址栏里打开的「多维表格数据表」链接整条粘贴进来，会自动识别所在多维表格和数据表，无需再分辨 bascn/cli_/tbl。',
+            FEISHU_BASE_APP_TOKEN: '通常不需要填：粘贴「多维表格链接」后自动识别。如链接不含 base 路径才需要手动填。',
+            FEISHU_BASE_TABLE_ID: '通常不需要填：粘贴「多维表格链接」后自动识别。',
         };
         document.querySelectorAll('.nav-item, .next-step, .prev-step').forEach(el => {
             el.addEventListener('click', () => {
@@ -167,11 +173,17 @@
                     const input = document.createElement('input');
                     input.name = key;
                     input.value = info.value;
-                    input.placeholder = info.required ? '必填' : '可选';
+                    input.placeholder = (CONFIG_HINTS && CONFIG_HINTS[key]) ? '示例：粘贴完整链接' : (info.required ? '必填' : '可选');
                     input.type = (key === 'DB_PASSWORD' || key === 'FEISHU_APP_SECRET') ? 'password' : 'text';
                     input.addEventListener('input', debounce(saveConfig, 500));
                     wrapper.appendChild(label);
                     wrapper.appendChild(input);
+                    if (CONFIG_HINTS && CONFIG_HINTS[key]) {
+                        const tip = document.createElement('small');
+                        tip.className = 'field-hint';
+                        tip.textContent = CONFIG_HINTS[key];
+                        wrapper.appendChild(tip);
+                    }
                     if (key.startsWith('DB_')) sqlForm.appendChild(wrapper);
                     else feishuForm.appendChild(wrapper);
                 }

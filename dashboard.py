@@ -40,17 +40,21 @@ CONFIG_KEYS = [
     ("DB_TABLE", "数据表名", True),
     ("FEISHU_APP_ID", "飞书 App ID", True),
     ("FEISHU_APP_SECRET", "飞书 App Secret", True),
-    ("FEISHU_BASE_APP_TOKEN", "多维表格 App Token", True),
-    ("FEISHU_BASE_TABLE_ID", "多维表格 Table ID", True),
-    ("FEISHU_BASE_VIEW_ID", "飞书多维表格 View ID", False),
+    ("FEISHU_BASE_URL", "飞书多维表格链接(推荐)", False),
+    ("FEISHU_BASE_APP_TOKEN", "多维表格 App Token(可留空)", False),
+    ("FEISHU_BASE_TABLE_ID", "多维表格 Table ID(可留空)", False),
+    ("FEISHU_BASE_VIEW_ID", "飞书多维表格 View ID(可留空)", False),
 ]
 
+def _feishu_target():
+    """复用 sync 的解析逻辑：FEISHU_BASE_URL 链接优先，其次独立字段。"""
+    from sync import resolve_feishu_target
+    return resolve_feishu_target()
+
 def _base_app_token():
-    """获取飞书多维表格的 app_token（bascn 开头，不是应用 App ID）。"""
-    v = (os.environ.get("FEISHU_BASE_APP_TOKEN") or "").strip()
-    if not v:
-        raise RuntimeError("缺少配置：多维表格 App Token（FEISHU_BASE_APP_TOKEN，bascn 开头），请到「飞书配置」填写")
-    return v
+    """获取飞书多维表格的 app_token（bascn/Bak 等开头，不是应用 App ID cli_ 开头）。"""
+    from sync import base_app_token
+    return base_app_token()
 
 _running_lock = threading.Lock()
 _running = False
@@ -103,8 +107,10 @@ def test_feishu():
     try:
         from sync import get_tenant_access_token
         token = get_tenant_access_token()
-        app_token = _base_app_token()
-        table_id = os.environ["FEISHU_BASE_TABLE_ID"]
+        target = _feishu_target()
+        app_token = target["app_token"]
+        if not app_token:
+            return jsonify({"ok": False, "message": "缺少多维表格链接/App Token，请先在「飞书配置」填写"})
         headers = {"Authorization": f"Bearer {token}"}
         resp = requests.get(
             f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables",
@@ -114,12 +120,17 @@ def test_feishu():
         data = resp.json()
         if data.get("code") != 0:
             return jsonify({"ok": False, "message": data.get("msg", "飞书接口返回错误")})
-        tables = [t.get("name") for t in data.get("data", {}).get("items", [])]
-        has_table = table_id in [t.get("table_id") for t in data.get("data", {}).get("items", [])]
+        items = data.get("data", {}).get("items", [])
+        tables = [t.get("name") for t in items]
+        want_id = target["table_id"]
+        has_table = bool(want_id) and want_id in [t.get("table_id") for t in items]
+        hint = "已找到" if has_table else ("未找到，链接可能未带 table，请在地址栏把当前数据表打开后复制" if want_id else "链接未解析出 table_id，请在地址栏打开具体数据表后复制链接")
         return jsonify({
             "ok": True,
-            "message": f"飞书连接成功，共 {len(tables)} 个表格，目标表格{'已' if has_table else '未'}找到",
+            "message": f"飞书连接成功，共 {len(tables)} 个表格，目标表格{hint}",
             "tables": tables,
+            "table_ids": [t.get("table_id") for t in items],
+            "target": target,
         })
     except Exception as exc:
         return jsonify({"ok": False, "message": str(exc)})
@@ -195,13 +206,13 @@ def get_feishu_fields():
     try:
         from sync import get_tenant_access_token
         token = get_tenant_access_token()
-        table_id = os.environ.get("FEISHU_BASE_TABLE_ID", "")
-        try:
-            app_token = _base_app_token()
-        except RuntimeError as exc:
-            return jsonify({"ok": False, "message": str(exc)})
+        target = _feishu_target()
+        table_id = target["table_id"]
+        app_token = target["app_token"]
+        if not app_token:
+            return jsonify({"ok": False, "message": "缺少多维表格链接/App Token，请先在「飞书配置」填写"})
         if not table_id:
-            return jsonify({"ok": False, "message": "请先在「飞书配置」填写 Table ID"})
+            return jsonify({"ok": False, "message": "无法从链接解析出 Table ID。请在飞书里打开具体数据表后复制地址栏链接，或在「飞书配置」填写 Table ID"})
         headers = {"Authorization": f"Bearer {token}"}
         page_token = None
         fields = []
