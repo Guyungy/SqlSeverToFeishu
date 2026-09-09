@@ -38,7 +38,7 @@
 | --- | --- |
 | Python 3.9+ | 运行环境（脚本可自动建独立环境） |
 | SQL Server | 本地或内网，需开启 TCP/IP 协议 |
-| 飞书自建应用 + 多维表格 | 需要 App ID / Secret 和 Table ID |
+| 飞书自建应用 + 多维表格 | 需要 App ID / Secret，以及**多维表格链接**（或 App Token + Table ID） |
 
 ## 项目结构
 
@@ -53,6 +53,7 @@
 | `install.sh` / `install.bat` / `install.command` | 一键安装依赖 |
 | `start.sh` / `start.bat` / `start.command` | 启动程序 |
 | `使用手册（小白版）.md` | 零基础使用文档（推荐先看这个） |
+| `CHANGELOG.md` | 版本演进与更新记录 |
 
 ---
 
@@ -87,7 +88,7 @@ python3 -m venv .venv
 ## 使用步骤
 
 1. **数据库配置**：填 SQL Server 连接信息和数据表名，点「测试」
-2. **飞书配置**：填 App ID / Secret / Table ID，点「测试」
+2. **飞书配置**：填 App ID / Secret，以及**多维表格链接**（或手动填 App Token + Table ID），点「测试」
 3. **字段映射**：
    - 点「读取 SQL Server 字段」「读取飞书表字段」自动探测
    - 按同名自动匹配，或用下拉手动对应，可增删映射行
@@ -110,6 +111,7 @@ python3 -m venv .venv
 | FEISHU_BASE_URL | **（推荐）多维表格完整链接**：打开目标数据表后复制地址栏整条链接，程序自动识别 app_token/table_id/view_id |
 | FEISHU_BASE_APP_TOKEN | 备选：多维表格 App Token（`bascn`/`Bak` 开头，URL `/base/` 后那串；不是 `cli_` 的 App ID）。填了链接可留空 |
 | FEISHU_BASE_TABLE_ID | 备选：目标多维表格 Table ID（`tbl` 开头）。填了链接可留空 |
+| FEISHU_BASE_VIEW_ID | 可选：多维表格 View ID（`vew` 开头），一般不必填，同步不影响视图归属 |
 
 ## 常见问题
 
