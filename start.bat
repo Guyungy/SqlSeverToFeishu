@@ -13,9 +13,9 @@ set "DASHBOARD_PORT=5001"
 set "PY="
 
 REM ---------- 依次测试候选 Python ----------
-call :try_py ".venv\Scripts\python.exe"   "项目独立环境 (.venv)"
-call :try_py "python"                     "本机系统 Python (python)"
-call :try_py "py"                         "本机系统 Python (py)"
+if exist ".venv\Scripts\python.exe" call :try_py ".venv\Scripts\python.exe" "项目独立环境 (.venv)"
+call :try_py "python" "本机系统 Python (python)"
+call :try_py "py" "本机系统 Python (py)"
 
 if not defined PY (
     echo.
@@ -44,7 +44,7 @@ set "CAND=%~1"
 set "CAND_NAME=%~2"
 where "%CAND%" >nul 2>nul
 if errorlevel 1 exit /b 0
-%CAND% -c "import flask, pymssql, requests, dotenv" >nul 2>nul
+%CAND% -c "import sys, flask, pymssql, requests, dotenv; raise SystemExit(0 if sys.version_info ^>= (3, 9) else 1)" >nul 2>nul
 if errorlevel 1 (
     echo [跳过] %CAND_NAME% (%CAND%) 未安装全部依赖
     exit /b 0

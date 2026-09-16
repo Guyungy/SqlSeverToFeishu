@@ -31,15 +31,19 @@ elif command -v python >/dev/null 2>&1; then
     PY=python
 else
     echo -e "${RED}[错误] 未检测到 Python。${NC}"
-    echo "请先安装 Python 3.9 或更高版本，然后重新运行本脚本。"
+    echo "请先安装 Python 3.10 或更高版本，然后重新运行本脚本。"
     echo "下载地址（任选其一）："
     echo "  官网:   https://www.python.org/downloads/"
     echo "  Homebrew: brew install python3"
     exit 1
 fi
 
-echo -e "${YELLOW}[1/3] 检测到 Python: $(command -v $PY)${NC}"
+echo -e "${YELLOW}[1/3] 检测到 Python: $(command -v "$PY")${NC}"
 "$PY" --version
+if ! "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
+    echo -e "${RED}[错误] 需要 Python 3.10 或更高版本。${NC}"
+    exit 1
+fi
 
 # ---------- 2. 创建虚拟环境 ----------
 VENV_DIR=".venv"

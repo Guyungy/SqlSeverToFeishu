@@ -1,56 +1,59 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-从"飞书多维表格完整链接"解析出 app_token / table_id / view_id。
-用户只需复制浏览器地址栏里的多维表格链接，无需手工分辨 bascn/cli_/tbl/vew。
+"""Parse and validate a Feishu/Lark Base URL."""
 
-支持链接形态：
-  https://<租户>.feishu.cn/base/<app_token>?table=<table_id>&view=<view_id>
-  https://<租户>.feishu.cn/base/<app_token>?tbl=<table_id>            (部分旧分享链接用 tbl)
-  https://<租户>.feishu.cn/wiki/<wiki_token>                           (知识库内文档，无法直接用，需先转为多维表格独立链接)
-纯 app_token 裸串也能识别（作为兜底）。
-"""
 import re
 from typing import Dict
+from urllib.parse import parse_qs, unquote, urlparse
+
+TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9]{10,}$")
+ALLOWED_HOST_SUFFIXES = (".feishu.cn", ".larksuite.com", ".larkoffice.com")
+
+
+def _empty() -> Dict[str, str]:
+    return {"app_token": "", "table_id": "", "view_id": ""}
 
 
 def parse_feishu_base_url(raw: str) -> Dict[str, str]:
-    """解析飞书多维表格链接，返回 {app_token, table_id, view_id}（缺失项为空串）。"""
-    s = (raw or "").strip()
-    out = {"app_token": "", "table_id": "", "view_id": ""}
-    if not s:
-        return out
+    """Return app_token/table_id/view_id or raise ValueError for an unsafe URL."""
+    value = (raw or "").strip()
+    if not value:
+        return _empty()
+    if TOKEN_PATTERN.fullmatch(value):
+        return {"app_token": value, "table_id": "", "view_id": ""}
 
-    # 剥离 query 前的 path 部分，定位 /base/{app_token}
-    path = s.split("?", 1)[0]
-    m = re.search(r"/base/([A-Za-z0-9]+)", path)
-    if not m:
-        # 用户可能直接贴了裸 app_token
-        bare = re.fullmatch(r"[A-Za-z0-9]{10,}", s)
-        if bare:
-            out["app_token"] = bare.group(0)
-        return out
-    out["app_token"] = m.group(1)
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("飞书链接必须是完整的 HTTPS 地址")
+    hostname = parsed.hostname.lower()
+    if not any(hostname.endswith(suffix) for suffix in ALLOWED_HOST_SUFFIXES):
+        raise ValueError("链接域名不是受支持的飞书/Lark 域名")
 
-    # 解析 query 参数（table / tbl / view，顺序无关，兼容带 #hash）
-    query = s.split("?", 1)[1] if "?" in s else ""
-    query = query.split("#", 1)[0]
-    params = dict(re.findall(r"([^&=\s]+)=([^&=\s]*)", query))
-    table_id = params.get("table") or params.get("tbl") or params.get("table_id") or ""
-    view_id = params.get("view") or params.get("view_id") or ""
-    out["table_id"] = table_id
-    out["view_id"] = view_id
-    return out
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if "wiki" in parts:
+        raise ValueError("暂不支持知识库 wiki 链接，请打开多维表格后复制 /base/ 链接")
+    try:
+        base_index = parts.index("base")
+        app_token = parts[base_index + 1]
+    except (ValueError, IndexError):
+        raise ValueError("链接中未找到 /base/{app_token}")
+    if not TOKEN_PATTERN.fullmatch(app_token):
+        raise ValueError("链接中的多维表格 App Token 格式不正确")
+
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    table_id = (query.get("table") or query.get("tbl") or query.get("table_id") or [""])[0].strip()
+    view_id = (query.get("view") or query.get("view_id") or [""])[0].strip()
+    if table_id and not re.fullmatch(r"[A-Za-z0-9_-]+", table_id):
+        raise ValueError("链接中的 Table ID 格式不正确")
+    if view_id and not re.fullmatch(r"[A-Za-z0-9_-]+", view_id):
+        raise ValueError("链接中的 View ID 格式不正确")
+    return {"app_token": app_token, "table_id": table_id, "view_id": view_id}
 
 
 if __name__ == "__main__":
-    import sys
-    test_cases = [
-        "https://xxx.feishu.cn/base/BakJbdruzakB5YsmaKAcFK6MnJ2?table=tblK1bt0NLW6M2DO&view=vewABC123",
-        "https://xxx.feishu.cn/base/bascn1234567890?tbl=tblXYZ&view=vewQ",
-        "https://xxx.feishu.cn/base/BakAbcDef123",
-        "BakJbdruzakB5YsmaKAcFK6MnJ2",
-        "https://xxx.feishu.cn/wiki/wikcn123",
+    examples = [
+        "https://example.feishu.cn/base/BakExampleAppToken001?table=tblExampleTable01&view=vewExampleView01",
+        "BakExampleAppToken001",
     ]
-    for t in test_cases:
-        print(f"{t}\n  -> {parse_feishu_base_url(t)}\n")
+    for example in examples:
+        print(example, "->", parse_feishu_base_url(example))

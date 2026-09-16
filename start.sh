@@ -24,11 +24,11 @@ for entry in "${CANDIDATES[@]}"; do
     cmd="${entry%%:*}"
     name="${entry#*:}"
     if command -v "$cmd" >/dev/null 2>&1 || [ -x "$cmd" ]; then
-        if "$cmd" -c "import flask, pymssql, requests, dotenv" >/dev/null 2>&1; then
+        if "$cmd" -c "import sys, flask, pymssql, requests, dotenv; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >/dev/null 2>&1; then
             echo "[环境] 使用 $name ($cmd)"
             PY="$cmd"
         else
-            echo "[跳过] $name ($cmd) 未安装全部依赖"
+            echo "[跳过] $name ($cmd) 版本过低或未安装全部依赖"
         fi
     fi
 done

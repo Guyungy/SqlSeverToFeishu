@@ -27,7 +27,7 @@ if %errorlevel%==0 (
         set "PY=py"
     ) else (
         echo [错误] 未检测到 Python。
-        echo 请先安装 Python 3.9 或更高版本，然后重新运行本脚本。
+        echo 请先安装 Python 3.10 或更高版本，然后重新运行本脚本。
         echo 下载地址：https://www.python.org/downloads/
         echo 安装时务必勾选 "Add Python to PATH"！
         pause
@@ -37,6 +37,12 @@ if %errorlevel%==0 (
 
 echo [1/3] 检测到 Python: %PY%
 %PY% --version
+%PY% -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+if errorlevel 1 (
+    echo [错误] 需要 Python 3.10 或更高版本。
+    pause
+    exit /b 1
+)
 
 REM ---------- 2. 创建虚拟环境 ----------
 if not exist ".venv" (

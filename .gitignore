@@ -7,13 +7,17 @@ __pycache__/
 # 敏感配置（含密钥）
 .env
 
-# 日志
+# 本机同步配置、状态、日志与运行锁
+sync_config.json
+sync_state.json
 *.log
 sync.log
 dashboard_server.log
+.sync.lock
 
 # macOS
 .DS_Store
 
 # WorkBuddy 项目本地数据（勿提交）
 .workbuddy/
+.workbuddy-ai/

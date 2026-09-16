@@ -1,298 +1,393 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Web configuration and monitoring panel for the SQL Server -> Feishu sync script.
-Run: python dashboard.py
-Open: http://127.0.0.1:5000
-"""
+"""Local dashboard for multi-database SQL Server to Feishu synchronization."""
+
+import logging
 import os
-import sys
-import json
-import shutil
+import secrets
+import signal
 import subprocess
+import sys
 import threading
-from pathlib import Path
+import uuid
+from collections import deque
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
-import requests
-from flask import Flask, render_template, request, jsonify, Response
-from dotenv import load_dotenv, set_key
+from dotenv import load_dotenv
+from flask import Flask, abort, jsonify, render_template, request
 
+from multi_sync import feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
+from workspace import (
+    BASE_DIR,
+    ENV_PATH,
+    get_source,
+    load_config,
+    load_state,
+    new_id,
+    password_env_key,
+    public_config,
+    save_config,
+    save_state,
+    update_env,
+    validate_config,
+    validate_source,
+)
+
+load_dotenv(ENV_PATH, override=True)
 app = Flask(__name__)
-
-BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR / ".env"
+app.config["MAX_CONTENT_LENGTH"] = 512 * 1024
+CSRF_TOKEN = secrets.token_urlsafe(32)
 LOG_PATH = BASE_DIR / "sync.log"
-MAPPING_PATH = BASE_DIR / "mapping.json"
-FEISHU_API = "https://open.feishu.cn/open-apis"
+DASHBOARD_LOG_PATH = BASE_DIR / "dashboard_server.log"
+SECRET_MASKS = {"********", "************"}
+config_lock = threading.Lock()
+state_lock = threading.Lock()
 
-if not ENV_PATH.exists() and (BASE_DIR / ".env.example").exists():
-    shutil.copy(BASE_DIR / ".env.example", ENV_PATH)
+logger = logging.getLogger("dashboard")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler(DASHBOARD_LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8")
+handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(handler)
 
-load_dotenv(ENV_PATH)
 
-CONFIG_KEYS = [
-    ("DB_SERVER", "SQL Server 地址", True),
-    ("DB_PORT", "SQL Server 端口", True),
-    ("DB_NAME", "数据库名", True),
-    ("DB_USER", "用户名", False),
-    ("DB_PASSWORD", "密码", False),
-    ("DB_TABLE", "数据表名", True),
-    ("FEISHU_APP_ID", "飞书 App ID", True),
-    ("FEISHU_APP_SECRET", "飞书 App Secret", True),
-    ("FEISHU_BASE_URL", "飞书多维表格链接(推荐)", False),
-    ("FEISHU_BASE_APP_TOKEN", "多维表格 App Token(可留空)", False),
-    ("FEISHU_BASE_TABLE_ID", "多维表格 Table ID(可留空)", False),
-    ("FEISHU_BASE_VIEW_ID", "飞书多维表格 View ID(可留空)", False),
-]
+@app.before_request
+def protect_local_dashboard():
+    hostname = (request.host.split(":", 1)[0] or "").lower()
+    if hostname not in {"127.0.0.1", "localhost"}:
+        abort(403)
+    origin = request.headers.get("Origin")
+    if origin and (urlparse(origin).hostname or "").lower() not in {"127.0.0.1", "localhost"}:
+        abort(403)
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.path.startswith("/api/"):
+        if request.headers.get("X-CSRF-Token") != CSRF_TOKEN:
+            abort(403)
 
-def _feishu_target():
-    """复用 sync 的解析逻辑：FEISHU_BASE_URL 链接优先，其次独立字段。"""
-    from sync import resolve_feishu_target
-    return resolve_feishu_target()
 
-def _base_app_token():
-    """获取飞书多维表格的 app_token（bascn/Bak 等开头，不是应用 App ID cli_ 开头）。"""
-    from sync import base_app_token
-    return base_app_token()
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
-_running_lock = threading.Lock()
-_running = False
+
+def safe_error(exc: Exception, fallback: str) -> str:
+    if isinstance(exc, (ValueError, RuntimeError)):
+        return str(exc)
+    logger.exception("%s: %s", fallback, exc)
+    return f"{fallback}，详细信息已写入 dashboard_server.log"
+
+
+def feishu_public_config() -> Dict[str, Any]:
+    return {
+        "app_id": os.environ.get("FEISHU_APP_ID", ""),
+        "app_secret": "",
+        "has_app_secret": bool(os.environ.get("FEISHU_APP_SECRET")),
+        "base_url": os.environ.get("FEISHU_BASE_URL", ""),
+        "app_token": os.environ.get("FEISHU_BASE_APP_TOKEN", ""),
+    }
+
+
+def save_feishu_config(payload: Dict[str, Any]) -> None:
+    updates = {
+        "FEISHU_APP_ID": str(payload.get("app_id") or "").strip(),
+        "FEISHU_BASE_URL": str(payload.get("base_url") or "").strip(),
+        "FEISHU_BASE_APP_TOKEN": str(payload.get("app_token") or "").strip(),
+    }
+    secret = str(payload.get("app_secret") or "")
+    if secret and secret not in SECRET_MASKS:
+        updates["FEISHU_APP_SECRET"] = secret
+    update_env(updates)
+
+
+class JobManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.process: Optional[subprocess.Popen] = None
+        self.job_id: Optional[str] = None
+        self.status = "idle"
+        self.mode = ""
+        self.exit_code: Optional[int] = None
+        self.started_at: Optional[str] = None
+        self.finished_at: Optional[str] = None
+        self.cancel_requested = False
+        self.seq = 0
+        self.lines = deque(maxlen=5000)
+
+    def add_line(self, line: str) -> None:
+        with self.lock:
+            self.seq += 1
+            self.lines.append((self.seq, line.rstrip("\n")))
+
+    def start(self, dry_run: bool, sync_job_id: str = "") -> Dict[str, Any]:
+        with self.lock:
+            if self.status in {"starting", "running", "cancelling"}:
+                return {"ok": False, "message": "已有同步任务正在运行", "job_id": self.job_id}
+            self.job_id = uuid.uuid4().hex
+            self.status = "starting"
+            self.mode = "dry_run" if dry_run else "sync"
+            self.exit_code = None
+            self.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            self.finished_at = None
+            self.cancel_requested = False
+            self.seq = 0
+            self.lines.clear()
+            runtime_id = self.job_id
+        threading.Thread(target=self._run, args=(runtime_id, dry_run, sync_job_id), daemon=True).start()
+        return {"ok": True, "job_id": runtime_id, "mode": self.mode}
+
+    def _run(self, runtime_id: str, dry_run: bool, sync_job_id: str) -> None:
+        command = [sys.executable, "-u", str(BASE_DIR / "multi_sync.py")]
+        if dry_run:
+            command.append("--dry-run")
+        if sync_job_id:
+            command.extend(["--job-id", sync_job_id])
+        kwargs: Dict[str, Any] = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        try:
+            process = subprocess.Popen(
+                command, cwd=str(BASE_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                env={**os.environ, "PYTHONUNBUFFERED": "1"}, **kwargs,
+            )
+            with self.lock:
+                if self.job_id != runtime_id:
+                    process.terminate()
+                    return
+                self.process = process
+                self.status = "running"
+            if process.stdout is None:
+                raise RuntimeError("无法读取同步进程输出")
+            for line in process.stdout:
+                self.add_line(line)
+            process.wait()
+            with self.lock:
+                self.exit_code = process.returncode
+                self.status = "cancelled" if self.cancel_requested else ("success" if process.returncode == 0 else "failed")
+                self.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                self.process = None
+        except Exception as exc:
+            logger.exception("同步任务启动失败: %s", exc)
+            self.add_line("PROGRESS:error:0:同步任务启动失败，详见 dashboard_server.log")
+            with self.lock:
+                self.status = "failed"
+                self.exit_code = -1
+                self.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                self.process = None
+
+    def cancel(self) -> Dict[str, Any]:
+        with self.lock:
+            process = self.process
+            if not process or process.poll() is not None:
+                return {"ok": False, "message": "当前没有正在运行的任务"}
+            self.cancel_requested = True
+            self.status = "cancelling"
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+            return {"ok": True, "message": "已发送停止请求"}
+
+    def snapshot(self, after: int = 0) -> Dict[str, Any]:
+        with self.lock:
+            return {
+                "job_id": self.job_id, "status": self.status, "mode": self.mode,
+                "running": self.status in {"starting", "running", "cancelling"},
+                "exit_code": self.exit_code, "started_at": self.started_at,
+                "finished_at": self.finished_at, "cursor": self.seq,
+                "lines": [{"seq": seq, "text": line} for seq, line in self.lines if seq > after],
+            }
+
+
+jobs = JobManager()
+
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", csrf_token=CSRF_TOKEN)
 
-@app.route("/api/config", methods=["GET"])
-def get_config():
-    data = {}
-    for key, label, required in CONFIG_KEYS:
-        value = os.environ.get(key, "")
-        if key in ("DB_PASSWORD", "FEISHU_APP_SECRET") and value:
-            display = "*" * min(len(value), 12)
+
+@app.route("/api/workspace")
+def workspace_api():
+    try:
+        return jsonify({"ok": True, "config": public_config(), "feishu": feishu_public_config(), "state": load_state().get("jobs", {})})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "读取同步配置失败")}), 500
+
+
+@app.route("/api/feishu", methods=["POST"])
+def save_feishu_api():
+    try:
+        save_feishu_config(request.get_json(silent=True) or {})
+        return jsonify({"ok": True, "message": "飞书配置已保存；留空的 Secret 保持不变", "feishu": feishu_public_config()})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "保存飞书配置失败")}), 400
+
+
+@app.route("/api/feishu/test", methods=["POST"])
+def test_feishu_api():
+    try:
+        save_feishu_config(request.get_json(silent=True) or {})
+        app_token = resolve_app_token()
+        tables = feishu_client().list_tables(app_token)
+        return jsonify({"ok": True, "message": f"连接成功，当前多维表格包含 {len(tables)} 个数据表", "tables": [{"id": item.get("table_id"), "name": item.get("name")} for item in tables]})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "飞书连接失败")}), 400
+
+
+@app.route("/api/sources", methods=["POST"])
+def save_source_api():
+    try:
+        payload = request.get_json(silent=True) or {}
+        source_data = payload.get("source") or {}
+        config = load_config()
+        source_id = str(source_data.get("id") or new_id("source"))
+        existing = next((item for item in config["sources"] if item["id"] == source_id), None)
+        source_data["id"] = source_id
+        source_data["password_env"] = existing["password_env"] if existing else password_env_key(source_id)
+        source = validate_source(source_data)
+        password = str(payload.get("password") or "")
+        if password and password not in SECRET_MASKS:
+            update_env({source["password_env"]: password})
+        if existing:
+            config["sources"] = [source if item["id"] == source_id else item for item in config["sources"]]
         else:
-            display = value
-        data[key] = {"value": display, "label": label, "required": required}
-    return jsonify(data)
-
-@app.route("/api/config", methods=["POST"])
-def update_config():
-    payload = request.get_json(force=True) or {}
-    for key, _, _ in CONFIG_KEYS:
-        if key in payload:
-            set_key(str(ENV_PATH), key, payload[key] or "")
-    load_dotenv(str(ENV_PATH), override=True)
-    return jsonify({"success": True})
-
-@app.route("/api/test/sql", methods=["POST"])
-def test_sql():
-    try:
-        from sync import get_sql_connection
-        table = os.environ.get("DB_TABLE", "dbo.Orders")
-        conn = get_sql_connection()
-        cur = conn.cursor()
-        cur.execute(f"SELECT COUNT(*) FROM {table}")
-        count = cur.fetchone()[0]
-        conn.close()
-        return jsonify({
-            "ok": True,
-            "count": count,
-            "message": f"SQL Server 连接成功，表 {table} 共有 {count} 条记录",
-        })
+            config["sources"].append(source)
+        with config_lock:
+            saved = save_config(config)
+        return jsonify({"ok": True, "message": "数据源已保存", "config": public_config(saved), "source_id": source_id})
     except Exception as exc:
-        return jsonify({"ok": False, "message": str(exc)})
+        return jsonify({"ok": False, "message": safe_error(exc, "保存数据源失败")}), 400
 
-@app.route("/api/test/feishu", methods=["POST"])
-def test_feishu():
+
+@app.route("/api/sources/<source_id>", methods=["DELETE"])
+def delete_source_api(source_id: str):
     try:
-        from sync import get_tenant_access_token
-        token = get_tenant_access_token()
-        target = _feishu_target()
-        app_token = target["app_token"]
-        if not app_token:
-            return jsonify({"ok": False, "message": "缺少多维表格链接/App Token，请先在「飞书配置」填写"})
-        headers = {"Authorization": f"Bearer {token}"}
-        resp = requests.get(
-            f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables",
-            headers=headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 0:
-            return jsonify({"ok": False, "message": data.get("msg", "飞书接口返回错误")})
-        items = data.get("data", {}).get("items", [])
-        tables = [t.get("name") for t in items]
-        want_id = target["table_id"]
-        has_table = bool(want_id) and want_id in [t.get("table_id") for t in items]
-        hint = "已找到" if has_table else ("未找到，链接可能未带 table，请在地址栏把当前数据表打开后复制" if want_id else "链接未解析出 table_id，请在地址栏打开具体数据表后复制链接")
-        return jsonify({
-            "ok": True,
-            "message": f"飞书连接成功，共 {len(tables)} 个表格，目标表格{hint}",
-            "tables": tables,
-            "table_ids": [t.get("table_id") for t in items],
-            "target": target,
-        })
+        config = load_config()
+        if any(job["source_id"] == source_id for job in config["jobs"]):
+            raise ValueError("请先删除该数据源关联的同步任务")
+        config["sources"] = [item for item in config["sources"] if item["id"] != source_id]
+        with config_lock:
+            saved = save_config(config)
+        return jsonify({"ok": True, "message": "数据源已删除", "config": public_config(saved)})
     except Exception as exc:
-        return jsonify({"ok": False, "message": str(exc)})
+        return jsonify({"ok": False, "message": safe_error(exc, "删除数据源失败")}), 400
 
-@app.route("/api/mapping", methods=["GET"])
-def get_mapping():
+
+@app.route("/api/sources/<source_id>/test", methods=["POST"])
+def test_source_api(source_id: str):
     try:
-        with open(MAPPING_PATH, "r", encoding="utf-8") as f:
-            return jsonify(json.load(f))
+        source = get_source(load_config(), source_id)
+        with sql_connection(source) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT DB_NAME(), @@SERVERNAME")
+                database, server = cursor.fetchone()
+        return jsonify({"ok": True, "message": f"连接成功：{server or source['server']} / {database}"})
     except Exception as exc:
-        return jsonify({"error": str(exc)})
+        return jsonify({"ok": False, "message": safe_error(exc, "SQL Server 连接失败")}), 400
 
-@app.route("/api/mapping", methods=["POST"])
-def save_mapping():
-    """保存字段映射与唯一键到 mapping.json（运行时可写，通用场景）。"""
-    payload = request.get_json(force=True) or {}
-    mapping = payload.get("mapping")
-    unique_key = payload.get("unique_key")
-    unique_key_label = payload.get("unique_key_label")
 
-    if not isinstance(mapping, list):
-        return jsonify({"ok": False, "message": "映射数据格式错误"}), 400
-
-    # 清洗：只保留 sql / feishu 两字段
-    cleaned = []
-    for m in mapping:
-        if isinstance(m, dict) and m.get("sql") and m.get("feishu"):
-            cleaned.append({"sql": m["sql"], "feishu": m["feishu"]})
-
-    data = {
-        "mapping": cleaned,
-        "unique_key": unique_key or "",
-        "unique_key_label": unique_key_label or "",
-    }
+@app.route("/api/sources/<source_id>/databases")
+def source_databases_api(source_id: str):
     try:
-        with open(MAPPING_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return jsonify({"ok": True, "message": f"已保存 {len(cleaned)} 条字段映射", "data": data})
+        return jsonify({"ok": True, "databases": list_databases(get_source(load_config(), source_id))})
     except Exception as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 500
+        return jsonify({"ok": False, "message": safe_error(exc, "读取数据库列表失败")}), 400
 
-@app.route("/api/columns/sql", methods=["GET"])
-def get_sql_columns():
-    """自动读取 SQL Server 表的全部列名（通用场景）。"""
+
+@app.route("/api/sources/<source_id>/tables")
+def source_tables_api(source_id: str):
     try:
-        from sync import get_sql_connection
-        table = os.environ.get("DB_TABLE", "").strip()
+        return jsonify({"ok": True, "tables": list_tables(get_source(load_config(), source_id))})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "读取数据表失败")}), 400
+
+
+@app.route("/api/sources/<source_id>/columns")
+def source_columns_api(source_id: str):
+    try:
+        schema = request.args.get("schema", "dbo")
+        table = request.args.get("table", "")
         if not table:
-            return jsonify({"ok": False, "message": "请先在「数据库配置」填写并保存数据表名"})
-        # 从表名里拆出真正的表名（去 schema 前缀），用于 INFORMATION_SCHEMA
-        if "." in table:
-            bare = table.split(".")[-1].strip()
-            schema = table.split(".")[-2].strip() if len(table.split(".")) >= 2 else "dbo"
-        else:
-            bare, schema = table, "dbo"
-        bare = bare.strip("[]")
-        conn = get_sql_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-            "WHERE TABLE_NAME = %s AND TABLE_SCHEMA = %s ORDER BY ORDINAL_POSITION",
-            (bare, schema),
-        )
-        cols = [r[0] for r in cur.fetchall()]
-        conn.close()
-        return jsonify({"ok": True, "columns": cols, "table": table})
+            raise ValueError("缺少数据表名")
+        return jsonify({"ok": True, "columns": list_columns(get_source(load_config(), source_id), schema, table)})
     except Exception as exc:
-        return jsonify({"ok": False, "message": str(exc)})
+        return jsonify({"ok": False, "message": safe_error(exc, "读取字段失败")}), 400
 
-@app.route("/api/fields/feishu", methods=["GET"])
-def get_feishu_fields():
-    """自动读取飞书多维表格的全部字段名（通用场景）。"""
+
+@app.route("/api/jobs", methods=["POST"])
+def save_jobs_api():
     try:
-        from sync import get_tenant_access_token
-        token = get_tenant_access_token()
-        target = _feishu_target()
-        table_id = target["table_id"]
-        app_token = target["app_token"]
-        if not app_token:
-            return jsonify({"ok": False, "message": "缺少多维表格链接/App Token，请先在「飞书配置」填写"})
-        if not table_id:
-            return jsonify({"ok": False, "message": "无法从链接解析出 Table ID。请在飞书里打开具体数据表后复制地址栏链接，或在「飞书配置」填写 Table ID"})
-        headers = {"Authorization": f"Bearer {token}"}
-        page_token = None
-        fields = []
-        while True:
-            params = {"page_size": 100}
-            if page_token:
-                params["page_token"] = page_token
-            resp = requests.get(
-                f"{FEISHU_API}/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
-                headers=headers, params=params,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("code") != 0:
-                return jsonify({"ok": False, "message": data.get("msg", "飞书接口返回错误")})
-            items = data.get("data", {}).get("items", [])
-            fields.extend(i.get("field_name") for i in items)
-            if data.get("data", {}).get("has_more"):
-                page_token = data.get("data", {}).get("page_token")
-            else:
-                break
-        return jsonify({"ok": True, "fields": fields})
+        raw_jobs = (request.get_json(silent=True) or {}).get("jobs")
+        if not isinstance(raw_jobs, list):
+            raise ValueError("任务列表格式错误")
+        config = load_config()
+        validated = validate_config({**config, "jobs": raw_jobs})
+        for job in validated["jobs"]:
+            source = get_source(validated, job["source_id"])
+            metadata = {item["name"] for item in list_columns(source, job["schema"], job["table"])}
+            missing = [item["source"] for item in job["columns"] if item["source"] not in metadata]
+            if missing:
+                raise ValueError(f"任务 {job['name']} 中字段已不存在: {', '.join(missing)}")
+        with config_lock:
+            saved = save_config(validated)
+        return jsonify({"ok": True, "message": f"已保存 {len(saved['jobs'])} 个同步任务", "config": public_config(saved)})
     except Exception as exc:
-        return jsonify({"ok": False, "message": str(exc)})
+        return jsonify({"ok": False, "message": safe_error(exc, "保存同步任务失败")}), 400
 
-@app.route("/api/status")
-def status():
-    return jsonify({"running": _running})
 
-def _stream_sync():
-    global _running
-    with _running_lock:
-        if _running:
-            yield "PROGRESS:busy:0:同步任务正在运行，请等待完成。\n"
-            return
-        _running = True
-
+@app.route("/api/jobs/<job_id>/state", methods=["DELETE"])
+def reset_job_state_api(job_id: str):
     try:
-        with open(LOG_PATH, "a", encoding="utf-8") as log_file:
-            log_file.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始同步\n")
-            process = subprocess.Popen(
-                [sys.executable, "sync.py"],
-                cwd=str(BASE_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            if process.stdout is None:
-                yield "PROGRESS:error:0:无法读取同步进程输出\n"
-                return
-
-            for line in process.stdout:
-                log_file.write(line)
-                log_file.flush()
-                yield line
-
-            process.wait()
-            exit_msg = f"同步结束，退出码: {process.returncode}\n"
-            log_file.write(exit_msg)
-            yield exit_msg
+        with state_lock:
+            state = load_state()
+            state["jobs"].pop(job_id, None)
+            save_state(state)
+        return jsonify({"ok": True, "message": "增量游标已重置，下次将执行全量扫描"})
     except Exception as exc:
-        yield f"PROGRESS:error:0:运行出错: {exc}\n"
-    finally:
-        _running = False
+        return jsonify({"ok": False, "message": safe_error(exc, "重置增量状态失败")}), 400
+
 
 @app.route("/api/run", methods=["POST"])
-def run_sync():
-    return Response(_stream_sync(), mimetype="text/plain")
+def run_api():
+    try:
+        payload = request.get_json(silent=True) or {}
+        config = load_config()
+        requested_job = str(payload.get("job_id") or "")
+        enabled = [job for job in config["jobs"] if job.get("enabled") and (not requested_job or job["id"] == requested_job)]
+        if not enabled:
+            raise ValueError("没有可运行的同步任务")
+        resolve_app_token()
+        result = jobs.start(bool(payload.get("dry_run")), requested_job)
+        return jsonify(result), 200 if result.get("ok") else 409
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "启动同步失败")}), 400
+
+
+@app.route("/api/cancel", methods=["POST"])
+def cancel_api():
+    result = jobs.cancel()
+    return jsonify(result), 200 if result.get("ok") else 409
+
+
+@app.route("/api/status")
+def status_api():
+    return jsonify(jobs.snapshot(max(0, request.args.get("after", 0, type=int))))
+
 
 @app.route("/api/logs")
-def logs():
-    n = request.args.get("n", 200, type=int)
-    if LOG_PATH.exists():
-        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        return jsonify({"log": "".join(lines[-n:])})
-    return jsonify({"log": ""})
+def logs_api():
+    n = min(1000, max(1, request.args.get("n", 200, type=int)))
+    if not LOG_PATH.exists():
+        return jsonify({"log": ""})
+    with LOG_PATH.open("r", encoding="utf-8", errors="replace") as file:
+        lines = deque(file, maxlen=n)
+    return jsonify({"log": "".join(lines)})
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("DASHBOARD_PORT", 5000))
-    app.run(host="127.0.0.1", port=port, debug=False)
+    port = int(os.environ.get("DASHBOARD_PORT", "5001"))
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
