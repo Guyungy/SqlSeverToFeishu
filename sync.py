@@ -23,6 +23,7 @@ import requests
 from dotenv import load_dotenv
 
 from feishu_link import parse_feishu_base_url
+from workspace import runtime_settings
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -182,7 +183,7 @@ def get_sql_connection():
         "database": os.environ["DB_NAME"],
         "charset": "utf8",
         "login_timeout": 10,
-        "timeout": int(os.environ.get("DB_QUERY_TIMEOUT", "60")),
+        "timeout": int(runtime_settings()["query_timeout"]),
     }
     if user:
         kwargs.update(user=user, password=os.environ.get("DB_PASSWORD") or "")
@@ -416,7 +417,7 @@ def get_tenant_access_token() -> str:
     return client._auth()
 
 
-def _date_to_milliseconds(value: Any) -> int:
+def _date_to_milliseconds(value: Any, timezone_offset: Optional[float] = None) -> int:
     if isinstance(value, datetime):
         dt = value
     elif isinstance(value, date):
@@ -432,17 +433,20 @@ def _date_to_milliseconds(value: Any) -> int:
     else:
         raise ConfigError(f"不支持的日期值类型: {type(value).__name__}")
     if dt.tzinfo is None:
+        # 逐行调用，所以这里不做配置文件 I/O：内部调用方一律显式传入时区偏移，
+        # 只有外部直接调用才退回环境变量（与改造前行为一致）。
+        raw_offset = timezone_offset if timezone_offset is not None else (os.environ.get("SYNC_TIMEZONE_OFFSET") or 8)
         try:
-            offset = float(os.environ.get("SYNC_TIMEZONE_OFFSET", "8"))
-        except ValueError as exc:
-            raise ConfigError("SYNC_TIMEZONE_OFFSET 必须是数字，例如中国标准时间填写 8") from exc
+            offset = float(raw_offset)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("时区偏移必须是数字，例如中国标准时间填写 8") from exc
         if not -12 <= offset <= 14:
-            raise ConfigError("SYNC_TIMEZONE_OFFSET 必须在 -12 到 14 之间")
+            raise ConfigError("时区偏移必须在 -12 到 14 之间")
         dt = dt.replace(tzinfo=timezone(timedelta(hours=offset)))
     return int(dt.timestamp() * 1000)
 
 
-def convert_value(value: Any, field_type: int) -> Any:
+def convert_value(value: Any, field_type: int, timezone_offset: Optional[float] = None) -> Any:
     if value is None:
         return None
     if isinstance(value, bytes):
@@ -457,7 +461,7 @@ def convert_value(value: Any, field_type: int) -> Any:
         text = str(value).strip()
         return float(text) if "." in text else int(text)
     if field_type == 5:
-        return _date_to_milliseconds(value)
+        return _date_to_milliseconds(value, timezone_offset)
     if field_type == 7:
         if isinstance(value, bool):
             return value
@@ -477,15 +481,20 @@ def convert_value(value: Any, field_type: int) -> Any:
 
 
 def build_record(
-    row: Dict[str, Any], mapping: Sequence[Dict[str, str]], field_types: Dict[str, int]
+    row: Dict[str, Any], mapping: Sequence[Dict[str, str]], field_types: Dict[str, int],
+    settings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    settings = settings or runtime_settings()
+    null_policy = str(settings["null_policy"]).lower()
+    timezone_offset = settings["timezone_offset"]
     fields: Dict[str, Any] = {}
-    null_policy = (os.environ.get("SYNC_NULL_POLICY") or "skip").lower()
     for item in mapping:
         value = row.get(item["sql"])
         if value is None and null_policy == "skip":
             continue
-        fields[item["feishu"]] = convert_value(value, field_types.get(item["feishu"], 1))
+        fields[item["feishu"]] = convert_value(
+            value, field_types.get(item["feishu"], 1), timezone_offset
+        )
     return {"fields": fields}
 
 
@@ -539,6 +548,7 @@ def sync_lock():
 
 def prepare_sync() -> Tuple[FeishuClient, Dict[str, str], List[Dict[str, Any]], List[Dict[str, Any]], int]:
     target = validate_environment()
+    settings = runtime_settings()
     mapping_config = load_mapping()
     mapping = mapping_config["mapping"]
     unique_key = mapping_config["unique_key"]
@@ -579,7 +589,7 @@ def prepare_sync() -> Tuple[FeishuClient, Dict[str, str], List[Dict[str, Any]], 
     to_update: List[Dict[str, Any]] = []
     skipped = 0
     for row, key in zip(rows, keys):
-        record = build_record(row, mapping, field_types)
+        record = build_record(row, mapping, field_types, settings)
         current = existing.get(key)
         if current:
             if _records_equal(record["fields"], current.get("fields") or {}):

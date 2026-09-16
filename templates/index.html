@@ -17,6 +17,7 @@
             <button class="nav-item" data-view="sources">数据源</button>
             <button class="nav-item" data-view="builder">同步设计器</button>
             <button class="nav-item" data-view="runs">执行与日志</button>
+            <button class="nav-item" data-view="settings">运行设置</button>
         </nav>
         <div class="sidebar-note">支持多个数据库、多个表、字段勾选和增量游标。</div>
     </aside>
@@ -136,11 +137,29 @@
             </div>
             <div class="panel"><div class="panel-head"><h2>运行日志</h2><button id="clear-log" class="btn secondary">清空显示</button></div><pre id="log"></pre></div>
         </section>
+
+        <section id="view-settings" class="view">
+            <div class="panel narrow">
+                <div class="panel-head"><div><p class="kicker">RUNTIME</p><h2>运行设置</h2></div><span id="settings-badge" class="pill neutral">默认值</span></div>
+                <p class="muted">飞书凭据、数据库账号密码、以及这里的所有选项都在本页面填写和保存，程序会自动写入本机的 <b>sync_config.json</b> 与 <b>.env</b>，不需要手工编辑任何配置文件。</p>
+                <div class="form-grid">
+                    <label>SQL 查询超时（秒）<input id="set-timeout" type="number" min="1" max="600" step="1"><small>单条查询最长执行时间，超时即报错，避免大表把任务挂死</small></label>
+                    <label>SQL NULL 处理<select id="set-null">
+                        <option value="skip">跳过 —— 不覆盖飞书里已有的值</option>
+                        <option value="overwrite">覆盖 —— 把飞书对应字段清空</option>
+                    </select><small>SQL 侧为 NULL 时怎么处理飞书字段</small></label>
+                    <label>时区偏移<input id="set-tz" type="number" min="-12" max="14" step="0.5"><small>SQL 无时区时间按此偏移解释，中国标准时间填 8</small></label>
+                    <label>服务端口<input id="set-port" type="number" min="1024" max="65535" step="1"><small>改动后需重启面板生效；命令行指定 DASHBOARD_PORT 时以命令行为准</small></label>
+                </div>
+                <div class="notice"><strong>当前来源</strong><span id="settings-origin">正在读取...</span></div>
+                <div class="actions"><button id="save-settings" class="btn primary">保存运行设置</button><span id="settings-message" class="message" aria-live="polite"></span></div>
+            </div>
+        </section>
     </main>
 </div>
 <script>
 const csrf = document.querySelector('meta[name="csrf-token"]').content;
-const store = { config: {sources: [], jobs: []}, feishu: {}, states: {}, feishuTables: [], tables: [], columns: [], cursor: 0, running: false };
+const store = { config: {sources: [], jobs: []}, feishu: {}, settings: {}, settingsDirty: false, states: {}, feishuTables: [], tables: [], columns: [], cursor: 0, running: false };
 const $ = id => document.getElementById(id);
 async function api(url, options={}) {
     const headers = new Headers(options.headers || {}); headers.set('X-CSRF-Token', csrf);
@@ -159,9 +178,10 @@ function newId(prefix) { return `${prefix}_${crypto.randomUUID().replaceAll('-',
 
 async function loadWorkspace() {
     const data=await api('/api/workspace'); if(!data.ok){$('global-status').textContent=data.message;return;}
-    store.config=data.config; store.feishu=data.feishu; store.states=data.state||{};
+    store.config=data.config; store.feishu=data.feishu; store.settings=data.settings||{}; store.states=data.state||{};
     $('fs-app-id').value=store.feishu.app_id||''; $('fs-url').value=store.feishu.base_url||''; $('fs-token').value=store.feishu.app_token||'';
     $('fs-secret').placeholder=store.feishu.has_app_secret?'已安全保存，留空不变':'请输入 App Secret';
+    renderSettings();
     renderAll(); const status=await api('/api/status'); if(status.running){store.running=true;store.cursor=0;poll();}
 }
 function renderAll(){
@@ -177,6 +197,44 @@ function sourceName(id){ return store.config.sources.find(s=>s.id===id)?.name||i
 function feishuPayload(){return {app_id:$('fs-app-id').value.trim(),app_secret:$('fs-secret').value,base_url:$('fs-url').value.trim(),app_token:$('fs-token').value.trim()};}
 $('save-feishu').onclick=async()=>{const d=await api('/api/feishu',{method:'POST',body:JSON.stringify(feishuPayload())});message('feishu-message',d.ok,d.message);if(d.ok){store.feishu=d.feishu;$('fs-secret').value='';}};
 $('test-feishu').onclick=async()=>{message('feishu-message',true,'正在连接...');const d=await api('/api/feishu/test',{method:'POST',body:JSON.stringify(feishuPayload())});message('feishu-message',d.ok,d.message);$('feishu-badge').textContent=d.ok?'已连接':'连接失败';$('feishu-badge').className=`pill ${d.ok?'good':'bad'}`;if(d.ok){store.feishuTables=d.tables||[];$('feishu-tables').innerHTML=store.feishuTables.map(t=>`<span>${escapeHtml(t.name)}</span>`).join('');fillExistingTables();}};
+
+const SETTING_LABELS={query_timeout:'查询超时',null_policy:'NULL 处理',timezone_offset:'时区偏移',dashboard_port:'服务端口'};
+const SETTING_ORIGINS={settings:'界面设置',env:'环境变量',default:'默认值'};
+function renderSettings(force){
+    const data=store.settings||{}, eff=data.effective||{}, origins=data.origins||{};
+    if(!force && store.settingsDirty){
+        // 用户正在编辑时不要用服务端值覆盖输入框，只更新来源说明。
+    }else{
+        if(eff.query_timeout!==undefined)$('set-timeout').value=eff.query_timeout;
+        if(eff.null_policy!==undefined)$('set-null').value=eff.null_policy;
+        if(eff.timezone_offset!==undefined)$('set-tz').value=eff.timezone_offset;
+        if(eff.dashboard_port!==undefined)$('set-port').value=eff.dashboard_port;
+        store.settingsDirty=false;
+    }
+    $('settings-origin').textContent=Object.keys(SETTING_LABELS)
+        .map(k=>`${SETTING_LABELS[k]}取自${SETTING_ORIGINS[origins[k]]||'默认值'}`).join('；')
+        +'。保存后即存到本机配置文件。';
+    const fromEnv=Object.values(origins).filter(v=>v==='env').length;
+    $('settings-badge').textContent=fromEnv?`${fromEnv} 项被环境变量覆盖`:'界面可控';
+    $('settings-badge').className=`pill ${fromEnv?'neutral':'good'}`;
+}
+$('save-settings').onclick=async()=>{
+    const before=(store.settings||{}).effective||{};
+    const payload={query_timeout:Number($('set-timeout').value),null_policy:$('set-null').value,timezone_offset:Number($('set-tz').value),dashboard_port:Number($('set-port').value)};
+    message('settings-message',true,'正在保存...');
+    const d=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
+    if(!d.ok){message('settings-message',false,d.message);return;}
+    store.settings=d.settings;
+    const notes=[];
+    if(Number(before.dashboard_port)!==payload.dashboard_port)notes.push('端口改动需重启面板生效');
+    if(Number(before.timezone_offset)!==payload.timezone_offset||before.null_policy!==payload.null_policy)notes.push('时区或 NULL 策略变更后，下次同步会自动全量重扫以保证数据正确');
+    message('settings-message',true,'运行设置已保存'+(notes.length?`；${notes.join('；')}`:''));
+    renderSettings(true);
+};
+['set-timeout','set-null','set-tz','set-port'].forEach(id=>{
+    $(id).addEventListener('input',()=>{store.settingsDirty=true;});
+    $(id).addEventListener('change',()=>{store.settingsDirty=true;});
+});
 
 function blankSource(){return {id:'',name:'',server:'',port:1433,database:'',user:'',has_password:false,enabled:true};}
 function editSource(s=blankSource()){$('source-id').value=s.id||'';$('source-name').value=s.name||'';$('source-server').value=s.server||'';$('source-port').value=s.port||1433;$('source-database').value=s.database||'';$('source-user').value=s.user||'';$('source-password').value='';$('source-password').placeholder=s.has_password?'已安全保存，留空不变':'输入密码';$('source-editor-title').textContent=s.id?`编辑 ${s.name}`:'添加数据源';$('test-source').disabled=!s.id;$('load-databases').disabled=!s.id;$('delete-source').disabled=!s.id;message('source-message',true,'');}

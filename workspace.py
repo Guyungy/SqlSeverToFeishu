@@ -70,8 +70,90 @@ def password_env_key(source_id: str) -> str:
     return f"SQL_SOURCE_{safe}_PASSWORD"
 
 
+# 运行设置：界面可配，落盘在 sync_config.json 的 settings 段。
+# env_key 仅作向后兼容的兜底（老用户写在 .env 里的值仍然生效）。
+# env_first=True 表示该键在环境变量里显式给出时优先（端口属于启动参数，
+# 命令行 `DASHBOARD_PORT=5099 ./start.sh` 的意图强于界面里保存的值）。
+SETTINGS_SPEC: Dict[str, Dict[str, Any]] = {
+    "query_timeout": {"env_key": "DB_QUERY_TIMEOUT", "default": 60, "env_first": False},
+    "null_policy": {"env_key": "SYNC_NULL_POLICY", "default": "skip", "env_first": False},
+    "timezone_offset": {"env_key": "SYNC_TIMEZONE_OFFSET", "default": 8, "env_first": False},
+    "dashboard_port": {"env_key": "DASHBOARD_PORT", "default": 5001, "env_first": True},
+}
+# 历史文档里写过 SYNC_NULL_POLICY=clear，语义等同 overwrite。
+# 必须继续接受，否则老配置会被静默降级成 skip（从"清空"变成"跳过"）。
+NULL_POLICY_ALIASES = {"skip": "skip", "overwrite": "overwrite", "clear": "overwrite"}
+CONFIG_VERSION = 3
+
+
+def _clean_int(value: Any, label: str, minimum: int, maximum: int) -> int:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}必须是整数") from None
+    if not minimum <= number <= maximum:
+        raise ValueError(f"{label}必须在 {minimum}-{maximum} 之间")
+    return number
+
+
+def validate_settings(raw: Any) -> Dict[str, Any]:
+    """Only keep and validate keys the caller explicitly provided."""
+    if raw is None or raw == "":
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("运行设置格式错误")
+    result: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in SETTINGS_SPEC:
+            raise ValueError(f"不支持的运行设置项: {key}")
+        if value is None or value == "":
+            continue
+        if key == "query_timeout":
+            result[key] = _clean_int(value, "查询超时（秒）", 1, 600)
+        elif key == "dashboard_port":
+            result[key] = _clean_int(value, "服务端口", 1024, 65535)
+        elif key == "null_policy":
+            policy = NULL_POLICY_ALIASES.get(str(value).strip().lower())
+            if policy is None:
+                raise ValueError("SQL NULL 处理只能是 跳过(skip) 或 覆盖(overwrite)")
+            result[key] = policy
+        elif key == "timezone_offset":
+            try:
+                offset = float(str(value).strip())
+            except (TypeError, ValueError):
+                raise ValueError("时区偏移必须是数字") from None
+            if not -12 <= offset <= 14:
+                raise ValueError("时区偏移必须在 -12 到 +14 之间")
+            result[key] = offset
+    return result
+
+
+def runtime_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Effective runtime settings: 界面设置 > .env > 默认值（端口例外，见上方说明）。"""
+    if config is None:
+        try:
+            config = load_config()
+        except (RuntimeError, OSError, ValueError):
+            config = None
+    try:
+        stored = validate_settings((config or {}).get("settings"))
+    except (TypeError, ValueError):
+        stored = {}
+    settings: Dict[str, Any] = {}
+    for key, spec in SETTINGS_SPEC.items():
+        env_raw = (os.environ.get(spec["env_key"]) or "").strip()
+        if env_raw and (spec["env_first"] or key not in stored):
+            try:
+                settings[key] = validate_settings({key: env_raw})[key]
+                continue
+            except (TypeError, ValueError):
+                pass
+        settings[key] = stored.get(key, spec["default"])
+    return settings
+
+
 def empty_config() -> Dict[str, Any]:
-    return {"version": 2, "sources": [], "jobs": []}
+    return {"version": CONFIG_VERSION, "sources": [], "jobs": [], "settings": {}}
 
 
 def _legacy_config() -> Dict[str, Any]:
@@ -124,7 +206,7 @@ def _legacy_config() -> Dict[str, Any]:
                 })
         except (OSError, ValueError, KeyError, TypeError):
             pass
-    return {"version": 2, "sources": [source], "jobs": jobs}
+    return {"version": CONFIG_VERSION, "sources": [source], "jobs": jobs, "settings": {}}
 
 
 def load_config() -> Dict[str, Any]:
@@ -257,7 +339,12 @@ def validate_config(data: Dict[str, Any]) -> Dict[str, Any]:
     job_ids = [item["id"] for item in jobs]
     if len(job_ids) != len(set(job_ids)):
         raise ValueError("同步任务 ID 重复")
-    return {"version": 2, "sources": sources, "jobs": jobs}
+    return {
+        "version": CONFIG_VERSION,
+        "sources": sources,
+        "jobs": jobs,
+        "settings": validate_settings(data.get("settings")),
+    }
 
 
 def save_config(data: Dict[str, Any]) -> Dict[str, Any]:

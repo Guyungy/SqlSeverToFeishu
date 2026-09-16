@@ -214,8 +214,10 @@ class FingerprintAndCursorTests(unittest.TestCase):
 
     def fingerprint(self, job, table_id=None):
         types = {c["target"]: multi_sync.column_field_type(c, job["unique_key"]) for c in job["columns"]}
+        # 显式传入设置，避免测试隐式依赖本机 sync_config.json 里的运行设置。
+        settings = {"timezone_offset": 8, "null_policy": "skip", "query_timeout": 60, "dashboard_port": 5001}
         return multi_sync.job_fingerprint(
-            self.source(), job, "app_token", table_id or job["target"]["table_id"], types
+            self.source(), job, "app_token", table_id or job["target"]["table_id"], types, settings
         )
 
     def test_fingerprint_changes_when_sync_semantics_change(self):
@@ -381,6 +383,170 @@ class FieldCreationTests(unittest.TestCase):
         }
         multi_sync.create_field(FakeClient(), "app_token", "tbl_1", job["columns"][0], job["unique_key"])
         self.assertEqual(calls[0][1]["type"], 1)
+
+
+class RuntimeSettingsTests(unittest.TestCase):
+    """运行设置从界面保存到 sync_config.json，且必须能覆盖 .env 的旧写法。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp.name) / "sync_config.json"
+        self.env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        self.env_patch.start()
+        for key in ("DB_QUERY_TIMEOUT", "SYNC_NULL_POLICY", "SYNC_TIMEZONE_OFFSET", "DASHBOARD_PORT"):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        self.env_patch.stop()
+        self.temp.cleanup()
+
+    def test_defaults_when_nothing_is_configured(self):
+        with mock.patch.object(workspace, "CONFIG_PATH", self.config_path):
+            self.assertEqual(workspace.runtime_settings(workspace.empty_config()), {
+                "query_timeout": 60,
+                "null_policy": "skip",
+                "timezone_offset": 8,
+                "dashboard_port": 5001,
+            })
+
+    def test_env_is_used_when_interface_has_no_value(self):
+        os.environ["DB_QUERY_TIMEOUT"] = "30"
+        os.environ["SYNC_NULL_POLICY"] = "overwrite"
+        config = {**workspace.empty_config(), "settings": {}}
+        settings = workspace.runtime_settings(config)
+        self.assertEqual(settings["query_timeout"], 30)
+        self.assertEqual(settings["null_policy"], "overwrite")
+
+    def test_interface_value_beats_env(self):
+        os.environ["DB_QUERY_TIMEOUT"] = "30"
+        config = {**workspace.empty_config(), "settings": {"query_timeout": 120}}
+        self.assertEqual(workspace.runtime_settings(config)["query_timeout"], 120)
+
+    def test_port_prefers_explicit_env_over_interface(self):
+        """端口是启动参数：命令行 DASHBOARD_PORT 的意图强于界面里保存的值。"""
+        os.environ["DASHBOARD_PORT"] = "5099"
+        config = {**workspace.empty_config(), "settings": {"dashboard_port": 5001}}
+        self.assertEqual(workspace.runtime_settings(config)["dashboard_port"], 5099)
+
+    def test_invalid_env_falls_back_to_default_instead_of_crashing(self):
+        os.environ["DB_QUERY_TIMEOUT"] = "abc"
+        os.environ["SYNC_TIMEZONE_OFFSET"] = "99"
+        settings = workspace.runtime_settings({**workspace.empty_config(), "settings": {}})
+        self.assertEqual(settings["query_timeout"], 60)
+        self.assertEqual(settings["timezone_offset"], 8)
+
+    def test_legacy_clear_alias_still_means_overwrite(self):
+        """旧文档让用户写 SYNC_NULL_POLICY=clear，不能静默降级成 skip。"""
+        self.assertEqual(workspace.validate_settings({"null_policy": "clear"})["null_policy"], "overwrite")
+        os.environ["SYNC_NULL_POLICY"] = "clear"
+        settings = workspace.runtime_settings({**workspace.empty_config(), "settings": {}})
+        self.assertEqual(settings["null_policy"], "overwrite")
+
+    def test_validation_rejects_out_of_range_and_unknown_values(self):
+        cases = {
+            "查询超时越界": {"query_timeout": 0},
+            "查询超时非数字": {"query_timeout": "很快"},
+            "NULL 策略非法": {"null_policy": "maybe"},
+            "时区越界": {"timezone_offset": 20},
+            "端口越界": {"dashboard_port": 80},
+            "未知设置项": {"unknown_key": 1},
+        }
+        for label, payload in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                workspace.validate_settings(payload)
+
+    def test_config_round_trip_persists_settings(self):
+        with mock.patch.object(workspace, "CONFIG_PATH", self.config_path):
+            workspace.save_config({**workspace.empty_config(), "settings": {
+                "query_timeout": 45, "null_policy": "overwrite", "timezone_offset": 8, "dashboard_port": 5099,
+            }})
+            self.assertEqual(workspace.runtime_settings()["dashboard_port"], 5099)
+            self.assertEqual(workspace.runtime_settings()["null_policy"], "overwrite")
+
+    def test_version_two_config_without_settings_still_loads(self):
+        """老配置文件没有 settings 段，读取时必须补默认值而不是报错。"""
+        legacy = {"version": 2, "sources": [], "jobs": []}
+        validated = workspace.validate_config(legacy)
+        self.assertEqual(validated["settings"], {})
+        self.assertEqual(validated["version"], workspace.CONFIG_VERSION)
+
+
+class SettingsApiTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp.name) / "sync_config.json"
+        self.client = dashboard.app.test_client()
+        self.headers = {"Host": "127.0.0.1:5001", "X-CSRF-Token": dashboard.CSRF_TOKEN}
+        self.patcher = mock.patch.object(workspace, "CONFIG_PATH", self.config_path)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.temp.cleanup()
+
+    def test_workspace_api_exposes_settings_and_origins(self):
+        data = self.client.get("/api/workspace", headers={"Host": "127.0.0.1:5001"}).get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["settings"]["effective"]["query_timeout"], 60)
+        self.assertEqual(data["settings"]["origins"]["query_timeout"], "default")
+
+    def test_saving_settings_persists_and_shows_interface_origin(self):
+        response = self.client.post("/api/settings", headers=self.headers, json={
+            "query_timeout": 15, "null_policy": "overwrite", "timezone_offset": 8, "dashboard_port": 5001,
+        })
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["settings"]["effective"]["query_timeout"], 15)
+        self.assertEqual(payload["settings"]["origins"]["null_policy"], "settings")
+
+        reloaded = self.client.get("/api/workspace", headers={"Host": "127.0.0.1:5001"}).get_json()
+        self.assertEqual(reloaded["settings"]["effective"]["null_policy"], "overwrite")
+
+    def test_invalid_settings_are_rejected_without_writing(self):
+        response = self.client.post("/api/settings", headers=self.headers, json={"dashboard_port": 80})
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()["ok"])
+        self.assertFalse(self.config_path.exists())
+
+
+class SettingsFingerprintTests(unittest.TestCase):
+    """时区与 NULL 策略决定 SQL 值怎么变成飞书值，改动后必须作废旧游标。"""
+
+    def source(self):
+        return {"id": "source_a", "server": "127.0.0.1", "port": 1433, "database": "Orders", "user": "reader"}
+
+    def job(self):
+        return {
+            "id": "job_1", "name": "订单", "source_id": "source_a", "schema": "dbo", "table": "Orders",
+            "enabled": True,
+            "columns": [{"source": "OrderId", "target": "订单号", "sql_type": "int", "nullable": False}],
+            "unique_key": "OrderId",
+            "incremental": {"enabled": True, "column": "UpdatedAt"},
+            "target": {"mode": "auto", "table_id": "tbl_1", "table_name": "订单", "auto_create_fields": True},
+        }
+
+    def fingerprint(self, settings):
+        return multi_sync.job_fingerprint(self.source(), self.job(), "app_token", "tbl_1", {"订单号": 2}, settings)
+
+    def test_timezone_and_null_policy_change_the_fingerprint(self):
+        base = {"query_timeout": 60, "null_policy": "skip", "timezone_offset": 8, "dashboard_port": 5001}
+        baseline = self.fingerprint(base)
+        self.assertNotEqual(self.fingerprint({**base, "timezone_offset": 0}), baseline)
+        self.assertNotEqual(self.fingerprint({**base, "null_policy": "overwrite"}), baseline)
+
+    def test_query_timeout_does_not_invalidate_cursors(self):
+        """超时只影响失败重试，不改变值语义，不应触发全量重扫。"""
+        base = {"query_timeout": 60, "null_policy": "skip", "timezone_offset": 8, "dashboard_port": 5001}
+        self.assertEqual(self.fingerprint({**base, "query_timeout": 600}), self.fingerprint(base))
+
+    def test_timezone_offset_is_applied_to_naive_datetimes(self):
+        # 墙上时间 2026-01-01 08:00 按 UTC+8 解释 == 2026-01-01T00:00Z
+        naive = datetime(2026, 1, 1, 8, 0)
+        utc8 = sync.convert_value(naive, 5, 8)
+        utc0 = sync.convert_value(naive, 5, 0)
+        self.assertEqual(utc8, 1767225600000)
+        self.assertEqual(utc0 - utc8, 8 * 60 * 60 * 1000)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,6 @@ REM  全都不可用则给友好提示
 REM ============================================================
 setlocal
 cd /d "%~dp0"
-set "DASHBOARD_PORT=5001"
 set "PY="
 
 REM ---------- 依次测试候选 Python ----------
@@ -26,8 +25,12 @@ if not defined PY (
     exit /b 1
 )
 
-echo 启动面板: http://127.0.0.1:%DASHBOARD_PORT%
-echo （启动后请勿关闭本窗口）
+if defined DASHBOARD_PORT (
+    echo [环境] 端口由 DASHBOARD_PORT=%DASHBOARD_PORT% 指定（优先于界面设置）
+) else (
+    echo [环境] 端口取自界面「运行设置」，未设置时默认 5001
+)
+echo （启动后请勿关闭本窗口，浏览器会自动显示实际地址）
 echo.
 %PY% dashboard.py
 if errorlevel 1 (
@@ -44,7 +47,7 @@ set "CAND=%~1"
 set "CAND_NAME=%~2"
 where "%CAND%" >nul 2>nul
 if errorlevel 1 exit /b 0
-%CAND% -c "import sys, flask, pymssql, requests, dotenv; raise SystemExit(0 if sys.version_info ^>= (3, 9) else 1)" >nul 2>nul
+%CAND% -c "import sys, flask, pymssql, requests, dotenv; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
 if errorlevel 1 (
     echo [跳过] %CAND_NAME% (%CAND%) 未安装全部依赖
     exit /b 0

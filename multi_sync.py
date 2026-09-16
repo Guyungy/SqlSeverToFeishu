@@ -31,6 +31,7 @@ from workspace import (
     get_source,
     load_config,
     load_state,
+    runtime_settings,
     save_config,
     save_state,
     source_password,
@@ -67,15 +68,21 @@ def validate_target_fields(job: Dict[str, Any], field_types: Dict[str, int]) -> 
 
 
 def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
-                    table_id: Optional[str], field_types: Dict[str, int]) -> str:
-    """Bind cursors to their actual source, target and conversion semantics."""
+                    table_id: Optional[str], field_types: Dict[str, int],
+                    settings: Optional[Dict[str, Any]] = None) -> str:
+    """Bind cursors to their actual source, target and conversion semantics.
+
+    时区与 NULL 策略参与指纹：这两项决定同一个 SQL 值怎么变成飞书值，
+    改动后旧游标必须失效并全量重扫，否则边界数据会按新语义被静默跳过。
+    """
+    settings = settings or runtime_settings()
     identity = {
-        "version": 1,
+        "version": 2,
         "source": {key: source.get(key) for key in ("id", "server", "port", "database", "user")},
         "job": {key: job.get(key) for key in ("schema", "table", "columns", "unique_key", "incremental")},
         "app_token": app_token, "table_id": table_id, "field_types": field_types,
-        "timezone": os.environ.get("SYNC_TIMEZONE_OFFSET", "8"),
-        "null_policy": os.environ.get("SYNC_NULL_POLICY", "skip"),
+        "timezone": settings["timezone_offset"],
+        "null_policy": settings["null_policy"],
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
@@ -97,14 +104,16 @@ def feishu_client() -> FeishuClient:
     return FeishuClient(app_id, app_secret)
 
 
-def sql_connection(source: Dict[str, Any], database: Optional[str] = None):
+def sql_connection(source: Dict[str, Any], database: Optional[str] = None,
+                   settings: Optional[Dict[str, Any]] = None):
+    settings = settings or runtime_settings()
     kwargs: Dict[str, Any] = {
         "server": source["server"],
         "port": int(source.get("port", 1433)),
         "database": database or source["database"],
         "charset": "utf8",
         "login_timeout": 10,
-        "timeout": int(os.environ.get("DB_QUERY_TIMEOUT", "60")),
+        "timeout": int(settings["query_timeout"]),
     }
     if source.get("user"):
         kwargs.update(user=source["user"], password=source_password(source))
@@ -290,7 +299,8 @@ def normalize_business_key(value: Any, field_type: int) -> str:
 
 
 def validate_row_keys(
-    rows: Sequence[Dict[str, Any]], unique_key: str, job_name: str, field_type: int
+    rows: Sequence[Dict[str, Any]], unique_key: str, job_name: str, field_type: int,
+    timezone_offset: Optional[float] = None,
 ) -> List[str]:
     keys: List[str] = []
     seen = set()
@@ -298,7 +308,7 @@ def validate_row_keys(
     for row in rows:
         try:
             raw = row.get(unique_key)
-            key = normalize_business_key(convert_value(raw, field_type), field_type)
+            key = normalize_business_key(convert_value(raw, field_type, timezone_offset), field_type)
         except ConfigError as exc:
             raise ConfigError(f"任务 {job_name} 的唯一键 {unique_key}: {exc}") from exc
         if key in seen:
@@ -432,9 +442,10 @@ def ensure_target(
     return table_id, field_types, action
 
 
-def build_record(row: Dict[str, Any], columns: Sequence[Dict[str, Any]], field_types: Dict[str, int]) -> Dict[str, Any]:
+def build_record(row: Dict[str, Any], columns: Sequence[Dict[str, Any]], field_types: Dict[str, int],
+                 settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     fields = {}
-    null_policy = (os.environ.get("SYNC_NULL_POLICY") or "skip").lower()
+    null_policy = str((settings or runtime_settings())["null_policy"]).lower()
     for column in columns:
         value = row.get(column["source"])
         if value is None and null_policy == "skip":
@@ -452,9 +463,10 @@ def run_job(
     dry_run: bool,
 ) -> Dict[str, Any]:
     source = get_source(config, job["source_id"])
+    settings = runtime_settings(config)
     table_id, field_types, target_action = ensure_target(client, app_token, config, job, dry_run)
     validate_target_fields(job, field_types)
-    fingerprint = job_fingerprint(source, job, app_token, table_id, field_types)
+    fingerprint = job_fingerprint(source, job, app_token, table_id, field_types, settings)
     job_state = state["jobs"].get(job["id"]) or {}
     # A saved cursor is only reusable while the source, fields, key and target table stay identical.
     cursor_reset = bool(job_state.get("fingerprint")) and job_state["fingerprint"] != fingerprint
@@ -469,7 +481,9 @@ def run_job(
     unique_field_type = field_types.get(
         unique_column["target"], column_field_type(unique_column, job["unique_key"])
     )
-    keys = validate_row_keys(rows, job["unique_key"], job["name"], unique_field_type)
+    keys = validate_row_keys(
+        rows, job["unique_key"], job["name"], unique_field_type, settings["timezone_offset"]
+    )
 
     existing: Dict[str, Dict[str, Any]] = {}
     if table_id:
@@ -481,7 +495,7 @@ def run_job(
     updates: List[Dict[str, Any]] = []
     skipped = 0
     for row, key in zip(rows, keys):
-        record = build_record(row, job["columns"], field_types)
+        record = build_record(row, job["columns"], field_types, settings)
         current = existing.get(key)
         if current:
             if _records_equal(record["fields"], current.get("fields") or {}):

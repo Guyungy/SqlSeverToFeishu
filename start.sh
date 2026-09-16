@@ -8,7 +8,6 @@
 # ============================================================
 
 cd "$(dirname "$0")"
-PORT="${DASHBOARD_PORT:-5001}"
 PY=""
 
 # 候选列表：.venv 优先，再试常见系统 python3
@@ -24,7 +23,7 @@ for entry in "${CANDIDATES[@]}"; do
     cmd="${entry%%:*}"
     name="${entry#*:}"
     if command -v "$cmd" >/dev/null 2>&1 || [ -x "$cmd" ]; then
-        if "$cmd" -c "import sys, flask, pymssql, requests, dotenv; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >/dev/null 2>&1; then
+        if "$cmd" -c "import sys, flask, pymssql, requests, dotenv; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >/dev/null 2>&1; then
             echo "[环境] 使用 $name ($cmd)"
             PY="$cmd"
         else
@@ -41,5 +40,10 @@ if [ -z "$PY" ]; then
     exit 1
 fi
 
-echo "启动面板: http://127.0.0.1:${PORT}"
-DASHBOARD_PORT="${PORT}" exec "$PY" dashboard.py
+if [ -n "${DASHBOARD_PORT:-}" ]; then
+    echo "[环境] 端口由 DASHBOARD_PORT=${DASHBOARD_PORT} 指定（优先于界面设置）"
+else
+    echo "[环境] 端口取自界面「运行设置」，未设置时默认 5001"
+fi
+
+exec "$PY" dashboard.py

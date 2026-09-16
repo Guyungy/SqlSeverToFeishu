@@ -23,16 +23,19 @@ from multi_sync import feishu_client, list_columns, list_databases, list_tables,
 from workspace import (
     BASE_DIR,
     ENV_PATH,
+    SETTINGS_SPEC,
     get_source,
     load_config,
     load_state,
     new_id,
     password_env_key,
     public_config,
+    runtime_settings,
     save_config,
     save_state,
     update_env,
     validate_config,
+    validate_settings,
     validate_source,
 )
 
@@ -102,6 +105,25 @@ def save_feishu_config(payload: Dict[str, Any]) -> None:
     if secret and secret not in SECRET_MASKS:
         updates["FEISHU_APP_SECRET"] = secret
     update_env(updates)
+
+
+def settings_payload(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Effective settings plus where each value came from, so the UI can be honest
+    about a .env value overriding what was saved in the page."""
+    config = config if config is not None else load_config()
+    stored = validate_settings(config.get("settings"))
+    origins: Dict[str, str] = {}
+    for key, spec in SETTINGS_SPEC.items():
+        env_set = bool((os.environ.get(spec["env_key"]) or "").strip())
+        if spec.get("env_first") and env_set:
+            origins[key] = "env"
+        elif key in stored:
+            origins[key] = "settings"
+        elif env_set:
+            origins[key] = "env"
+        else:
+            origins[key] = "default"
+    return {"effective": runtime_settings(config), "stored": stored, "origins": origins}
 
 
 class JobManager:
@@ -213,9 +235,29 @@ def index():
 @app.route("/api/workspace")
 def workspace_api():
     try:
-        return jsonify({"ok": True, "config": public_config(), "feishu": feishu_public_config(), "state": load_state().get("jobs", {})})
+        config = public_config()
+        return jsonify({
+            "ok": True,
+            "config": config,
+            "feishu": feishu_public_config(),
+            "settings": settings_payload(),
+            "state": load_state().get("jobs", {}),
+        })
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "读取同步配置失败")}), 500
+
+
+@app.route("/api/settings", methods=["POST"])
+def save_settings_api():
+    try:
+        payload = request.get_json(silent=True) or {}
+        config = load_config()
+        config["settings"] = validate_settings(payload)
+        with config_lock:
+            saved = save_config(config)
+        return jsonify({"ok": True, "message": "运行设置已保存", "settings": settings_payload(saved)})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "保存运行设置失败")}), 400
 
 
 @app.route("/api/feishu", methods=["POST"])
@@ -389,5 +431,6 @@ def logs_api():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("DASHBOARD_PORT", "5001"))
+    port = int(runtime_settings()["dashboard_port"])
+    print(f"启动面板: http://127.0.0.1:{port}")
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
