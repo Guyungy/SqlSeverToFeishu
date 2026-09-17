@@ -79,11 +79,13 @@ SETTINGS_SPEC: Dict[str, Dict[str, Any]] = {
     "null_policy": {"env_key": "SYNC_NULL_POLICY", "default": "skip", "env_first": False},
     "timezone_offset": {"env_key": "SYNC_TIMEZONE_OFFSET", "default": 8, "env_first": False},
     "dashboard_port": {"env_key": "DASHBOARD_PORT", "default": 5001, "env_first": True},
+    "schedule_enabled": {"env_key": "SYNC_SCHEDULE_ENABLED", "default": False, "env_first": False},
+    "schedule_interval_minutes": {"env_key": "SYNC_SCHEDULE_INTERVAL_MINUTES", "default": 60, "env_first": False},
 }
 # 历史文档里写过 SYNC_NULL_POLICY=clear，语义等同 overwrite。
 # 必须继续接受，否则老配置会被静默降级成 skip（从"清空"变成"跳过"）。
 NULL_POLICY_ALIASES = {"skip": "skip", "overwrite": "overwrite", "clear": "overwrite"}
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 
 def _clean_int(value: Any, label: str, minimum: int, maximum: int) -> int:
@@ -125,6 +127,16 @@ def validate_settings(raw: Any) -> Dict[str, Any]:
             if not -12 <= offset <= 14:
                 raise ValueError("时区偏移必须在 -12 到 +14 之间")
             result[key] = offset
+        elif key == "schedule_enabled":
+            if isinstance(value, bool):
+                result[key] = value
+            else:
+                text = str(value).strip().lower()
+                if text not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+                    raise ValueError("定时同步开关必须是布尔值")
+                result[key] = text in {"1", "true", "yes", "on"}
+        elif key == "schedule_interval_minutes":
+            result[key] = _clean_int(value, "同步间隔（分钟）", 1, 10080)
     return result
 
 

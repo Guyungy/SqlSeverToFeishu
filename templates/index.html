@@ -150,7 +150,13 @@
                     </select><small>SQL 侧为 NULL 时怎么处理飞书字段</small></label>
                     <label>时区偏移<input id="set-tz" type="number" min="-12" max="14" step="0.5"><small>SQL 无时区时间按此偏移解释，中国标准时间填 8</small></label>
                     <label>服务端口<input id="set-port" type="number" min="1024" max="65535" step="1"><small>改动后需重启面板生效；命令行指定 DASHBOARD_PORT 时以命令行为准</small></label>
+                    <label>定时同步<select id="set-schedule-enabled">
+                        <option value="false">关闭</option>
+                        <option value="true">开启</option>
+                    </select><small>开启后，面板运行期间自动同步所有已启用任务</small></label>
+                    <label>同步间隔（分钟）<input id="set-schedule-interval" type="number" min="1" max="10080" step="1"><small>从保存或启动面板后开始计时；建议不少于 5 分钟</small></label>
                 </div>
+                <div class="notice"><strong>定时状态</strong><span id="schedule-status">正在读取...</span></div>
                 <div class="notice"><strong>当前来源</strong><span id="settings-origin">正在读取...</span></div>
                 <div class="actions"><button id="save-settings" class="btn primary">保存运行设置</button><span id="settings-message" class="message" aria-live="polite"></span></div>
             </div>
@@ -159,7 +165,7 @@
 </div>
 <script>
 const csrf = document.querySelector('meta[name="csrf-token"]').content;
-const store = { config: {sources: [], jobs: []}, feishu: {}, settings: {}, settingsDirty: false, states: {}, feishuTables: [], tables: [], columns: [], cursor: 0, running: false };
+const store = { config: {sources: [], jobs: []}, feishu: {}, settings: {}, schedule: {}, settingsDirty: false, states: {}, feishuTables: [], tables: [], columns: [], cursor: 0, running: false };
 const $ = id => document.getElementById(id);
 async function api(url, options={}) {
     const headers = new Headers(options.headers || {}); headers.set('X-CSRF-Token', csrf);
@@ -178,7 +184,7 @@ function newId(prefix) { return `${prefix}_${crypto.randomUUID().replaceAll('-',
 
 async function loadWorkspace() {
     const data=await api('/api/workspace'); if(!data.ok){$('global-status').textContent=data.message;return;}
-    store.config=data.config; store.feishu=data.feishu; store.settings=data.settings||{}; store.states=data.state||{};
+    store.config=data.config; store.feishu=data.feishu; store.settings=data.settings||{}; store.schedule=data.schedule||{}; store.states=data.state||{};
     $('fs-app-id').value=store.feishu.app_id||''; $('fs-url').value=store.feishu.base_url||''; $('fs-token').value=store.feishu.app_token||'';
     $('fs-secret').placeholder=store.feishu.has_app_secret?'已安全保存，留空不变':'请输入 App Secret';
     renderSettings();
@@ -198,7 +204,7 @@ function feishuPayload(){return {app_id:$('fs-app-id').value.trim(),app_secret:$
 $('save-feishu').onclick=async()=>{const d=await api('/api/feishu',{method:'POST',body:JSON.stringify(feishuPayload())});message('feishu-message',d.ok,d.message);if(d.ok){store.feishu=d.feishu;$('fs-secret').value='';}};
 $('test-feishu').onclick=async()=>{message('feishu-message',true,'正在连接...');const d=await api('/api/feishu/test',{method:'POST',body:JSON.stringify(feishuPayload())});message('feishu-message',d.ok,d.message);$('feishu-badge').textContent=d.ok?'已连接':'连接失败';$('feishu-badge').className=`pill ${d.ok?'good':'bad'}`;if(d.ok){store.feishuTables=d.tables||[];$('feishu-tables').innerHTML=store.feishuTables.map(t=>`<span>${escapeHtml(t.name)}</span>`).join('');fillExistingTables();}};
 
-const SETTING_LABELS={query_timeout:'查询超时',null_policy:'NULL 处理',timezone_offset:'时区偏移',dashboard_port:'服务端口'};
+const SETTING_LABELS={query_timeout:'查询超时',null_policy:'NULL 处理',timezone_offset:'时区偏移',dashboard_port:'服务端口',schedule_enabled:'定时同步',schedule_interval_minutes:'同步间隔'};
 const SETTING_ORIGINS={settings:'界面设置',env:'环境变量',default:'默认值'};
 function renderSettings(force){
     const data=store.settings||{}, eff=data.effective||{}, origins=data.origins||{};
@@ -209,6 +215,8 @@ function renderSettings(force){
         if(eff.null_policy!==undefined)$('set-null').value=eff.null_policy;
         if(eff.timezone_offset!==undefined)$('set-tz').value=eff.timezone_offset;
         if(eff.dashboard_port!==undefined)$('set-port').value=eff.dashboard_port;
+        if(eff.schedule_enabled!==undefined)$('set-schedule-enabled').value=String(eff.schedule_enabled);
+        if(eff.schedule_interval_minutes!==undefined)$('set-schedule-interval').value=eff.schedule_interval_minutes;
         store.settingsDirty=false;
     }
     $('settings-origin').textContent=Object.keys(SETTING_LABELS)
@@ -217,21 +225,24 @@ function renderSettings(force){
     const fromEnv=Object.values(origins).filter(v=>v==='env').length;
     $('settings-badge').textContent=fromEnv?`${fromEnv} 项被环境变量覆盖`:'界面可控';
     $('settings-badge').className=`pill ${fromEnv?'neutral':'good'}`;
+    const sch=store.schedule||{};
+    $('schedule-status').textContent=sch.enabled?(sch.next_run_at?`已开启，下次运行：${new Date(sch.next_run_at).toLocaleString()}（每 ${sch.interval_minutes} 分钟）`:(sch.message||'已开启')):'未开启；需要面板保持运行';
 }
 $('save-settings').onclick=async()=>{
     const before=(store.settings||{}).effective||{};
-    const payload={query_timeout:Number($('set-timeout').value),null_policy:$('set-null').value,timezone_offset:Number($('set-tz').value),dashboard_port:Number($('set-port').value)};
+    const payload={query_timeout:Number($('set-timeout').value),null_policy:$('set-null').value,timezone_offset:Number($('set-tz').value),dashboard_port:Number($('set-port').value),schedule_enabled:$('set-schedule-enabled').value==='true',schedule_interval_minutes:Number($('set-schedule-interval').value)};
     message('settings-message',true,'正在保存...');
     const d=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
     if(!d.ok){message('settings-message',false,d.message);return;}
     store.settings=d.settings;
+    store.schedule=d.schedule||store.schedule;
     const notes=[];
     if(Number(before.dashboard_port)!==payload.dashboard_port)notes.push('端口改动需重启面板生效');
     if(Number(before.timezone_offset)!==payload.timezone_offset||before.null_policy!==payload.null_policy)notes.push('时区或 NULL 策略变更后，下次同步会自动全量重扫以保证数据正确');
     message('settings-message',true,'运行设置已保存'+(notes.length?`；${notes.join('；')}`:''));
     renderSettings(true);
 };
-['set-timeout','set-null','set-tz','set-port'].forEach(id=>{
+['set-timeout','set-null','set-tz','set-port','set-schedule-enabled','set-schedule-interval'].forEach(id=>{
     $(id).addEventListener('input',()=>{store.settingsDirty=true;});
     $(id).addEventListener('change',()=>{store.settingsDirty=true;});
 });

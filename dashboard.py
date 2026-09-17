@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 from collections import deque
@@ -228,6 +229,85 @@ class JobManager:
 jobs = JobManager()
 
 
+class ScheduleManager:
+    """Run all enabled jobs at a fixed interval while the dashboard is alive."""
+
+    def __init__(self, job_manager: JobManager):
+        self.job_manager = job_manager
+        self.wakeup = threading.Event()
+        self.lock = threading.Lock()
+        self.started = False
+        self.next_run_at: Optional[str] = None
+        self.last_attempt_at: Optional[str] = None
+        self.last_message = "定时同步未启用"
+
+    def start(self) -> None:
+        with self.lock:
+            if self.started:
+                return
+            self.started = True
+        threading.Thread(target=self._loop, daemon=True, name="sync-scheduler").start()
+
+    def reload(self) -> None:
+        settings = runtime_settings()
+        if settings["schedule_enabled"]:
+            next_timestamp = time.time() + int(settings["schedule_interval_minutes"]) * 60
+            next_text = datetime.fromtimestamp(next_timestamp).astimezone().isoformat(timespec="seconds")
+            self._set_status(next_run_at=next_text, message="定时同步已重新安排")
+        else:
+            self._set_status(next_run_at=None, message="定时同步未启用")
+        self.wakeup.set()
+
+    def snapshot(self) -> Dict[str, Any]:
+        settings = runtime_settings()
+        with self.lock:
+            return {
+                "enabled": bool(settings["schedule_enabled"]),
+                "interval_minutes": int(settings["schedule_interval_minutes"]),
+                "next_run_at": self.next_run_at,
+                "last_attempt_at": self.last_attempt_at,
+                "message": self.last_message,
+            }
+
+    def _set_status(self, *, next_run_at: Optional[str], message: str, attempted: bool = False) -> None:
+        with self.lock:
+            self.next_run_at = next_run_at
+            self.last_message = message
+            if attempted:
+                self.last_attempt_at = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def _loop(self) -> None:
+        while True:
+            settings = runtime_settings()
+            if not settings["schedule_enabled"]:
+                self._set_status(next_run_at=None, message="定时同步未启用")
+                self.wakeup.wait()
+                self.wakeup.clear()
+                continue
+            interval_seconds = int(settings["schedule_interval_minutes"]) * 60
+            next_timestamp = time.time() + interval_seconds
+            next_text = datetime.fromtimestamp(next_timestamp).astimezone().isoformat(timespec="seconds")
+            self._set_status(next_run_at=next_text, message=f"将在 {settings['schedule_interval_minutes']} 分钟后自动同步")
+            if self.wakeup.wait(interval_seconds):
+                self.wakeup.clear()
+                continue
+            try:
+                config = load_config()
+                if not any(job.get("enabled") for job in config["jobs"]):
+                    self._set_status(next_run_at=None, message="没有已启用的同步任务，本轮已跳过", attempted=True)
+                    continue
+                resolve_app_token()
+                result = self.job_manager.start(False)
+                message = "定时同步已启动" if result.get("ok") else result.get("message", "本轮定时同步未启动")
+                self._set_status(next_run_at=None, message=message, attempted=True)
+            except Exception as exc:
+                logger.exception("定时同步启动失败: %s", exc)
+                self._set_status(next_run_at=None, message=safe_error(exc, "定时同步启动失败"), attempted=True)
+
+
+scheduler = ScheduleManager(jobs)
+
+
 @app.route("/")
 def index():
     return render_template("index.html", csrf_token=CSRF_TOKEN)
@@ -242,6 +322,7 @@ def workspace_api():
             "config": config,
             "feishu": feishu_public_config(),
             "settings": settings_payload(),
+            "schedule": scheduler.snapshot(),
             "state": load_state().get("jobs", {}),
         })
     except Exception as exc:
@@ -256,7 +337,8 @@ def save_settings_api():
         config["settings"] = validate_settings(payload)
         with config_lock:
             saved = save_config(config)
-        return jsonify({"ok": True, "message": "运行设置已保存", "settings": settings_payload(saved)})
+        scheduler.reload()
+        return jsonify({"ok": True, "message": "运行设置已保存", "settings": settings_payload(saved), "schedule": scheduler.snapshot()})
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "保存运行设置失败")}), 400
 
@@ -418,7 +500,9 @@ def cancel_api():
 
 @app.route("/api/status")
 def status_api():
-    return jsonify(jobs.snapshot(max(0, request.args.get("after", 0, type=int))))
+    result = jobs.snapshot(max(0, request.args.get("after", 0, type=int)))
+    result["schedule"] = scheduler.snapshot()
+    return jsonify(result)
 
 
 @app.route("/api/logs")
@@ -437,4 +521,5 @@ if __name__ == "__main__":
     print(f"启动面板: {dashboard_url}")
     if os.environ.get("NO_AUTO_BROWSER", "").strip().lower() not in {"1", "true", "yes"}:
         threading.Timer(1.0, webbrowser.open, args=(dashboard_url,)).start()
+    scheduler.start()
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

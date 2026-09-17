@@ -393,7 +393,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.config_path = Path(self.temp.name) / "sync_config.json"
         self.env_patch = mock.patch.dict(os.environ, {}, clear=False)
         self.env_patch.start()
-        for key in ("DB_QUERY_TIMEOUT", "SYNC_NULL_POLICY", "SYNC_TIMEZONE_OFFSET", "DASHBOARD_PORT"):
+        for key in ("DB_QUERY_TIMEOUT", "SYNC_NULL_POLICY", "SYNC_TIMEZONE_OFFSET", "DASHBOARD_PORT", "SYNC_SCHEDULE_ENABLED", "SYNC_SCHEDULE_INTERVAL_MINUTES"):
             os.environ.pop(key, None)
 
     def tearDown(self):
@@ -407,6 +407,8 @@ class RuntimeSettingsTests(unittest.TestCase):
                 "null_policy": "skip",
                 "timezone_offset": 8,
                 "dashboard_port": 5001,
+                "schedule_enabled": False,
+                "schedule_interval_minutes": 60,
             })
 
     def test_env_is_used_when_interface_has_no_value(self):
@@ -449,6 +451,9 @@ class RuntimeSettingsTests(unittest.TestCase):
             "NULL 策略非法": {"null_policy": "maybe"},
             "时区越界": {"timezone_offset": 20},
             "端口越界": {"dashboard_port": 80},
+            "同步间隔过短": {"schedule_interval_minutes": 0},
+            "同步间隔过长": {"schedule_interval_minutes": 10081},
+            "定时开关非法": {"schedule_enabled": "sometimes"},
             "未知设置项": {"unknown_key": 1},
         }
         for label, payload in cases.items():
@@ -459,9 +464,12 @@ class RuntimeSettingsTests(unittest.TestCase):
         with mock.patch.object(workspace, "CONFIG_PATH", self.config_path):
             workspace.save_config({**workspace.empty_config(), "settings": {
                 "query_timeout": 45, "null_policy": "overwrite", "timezone_offset": 8, "dashboard_port": 5099,
+                "schedule_enabled": True, "schedule_interval_minutes": 15,
             }})
             self.assertEqual(workspace.runtime_settings()["dashboard_port"], 5099)
             self.assertEqual(workspace.runtime_settings()["null_policy"], "overwrite")
+            self.assertTrue(workspace.runtime_settings()["schedule_enabled"])
+            self.assertEqual(workspace.runtime_settings()["schedule_interval_minutes"], 15)
 
     def test_version_two_config_without_settings_still_loads(self):
         """老配置文件没有 settings 段，读取时必须补默认值而不是报错。"""
@@ -489,16 +497,20 @@ class SettingsApiTests(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(data["settings"]["effective"]["query_timeout"], 60)
         self.assertEqual(data["settings"]["origins"]["query_timeout"], "default")
+        self.assertFalse(data["schedule"]["enabled"])
 
     def test_saving_settings_persists_and_shows_interface_origin(self):
         response = self.client.post("/api/settings", headers=self.headers, json={
             "query_timeout": 15, "null_policy": "overwrite", "timezone_offset": 8, "dashboard_port": 5001,
+            "schedule_enabled": True, "schedule_interval_minutes": 30,
         })
         payload = response.get_json()
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["settings"]["effective"]["query_timeout"], 15)
         self.assertEqual(payload["settings"]["origins"]["null_policy"], "settings")
+        self.assertTrue(payload["schedule"]["enabled"])
+        self.assertEqual(payload["schedule"]["interval_minutes"], 30)
 
         reloaded = self.client.get("/api/workspace", headers={"Host": "127.0.0.1:5001"}).get_json()
         self.assertEqual(reloaded["settings"]["effective"]["null_policy"], "overwrite")
@@ -508,6 +520,58 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse(response.get_json()["ok"])
         self.assertFalse(self.config_path.exists())
+
+
+class ScheduleManagerTests(unittest.TestCase):
+    def test_scheduler_starts_all_enabled_jobs_after_interval(self):
+        starts = []
+
+        class FakeJobs:
+            def start(self, dry_run, sync_job_id=""):
+                starts.append((dry_run, sync_job_id))
+                return {"ok": True}
+
+        class StopLoop(Exception):
+            pass
+
+        class FakeEvent:
+            calls = 0
+
+            def wait(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return False
+                raise StopLoop
+
+            def clear(self):
+                pass
+
+            def set(self):
+                pass
+
+        manager = dashboard.ScheduleManager(FakeJobs())
+        manager.wakeup = FakeEvent()
+        settings = {
+            "schedule_enabled": True, "schedule_interval_minutes": 1,
+            "query_timeout": 60, "null_policy": "skip", "timezone_offset": 8, "dashboard_port": 5001,
+        }
+        config = {"jobs": [{"id": "job_1", "enabled": True}]}
+        with mock.patch.object(dashboard, "runtime_settings", return_value=settings), \
+             mock.patch.object(dashboard, "load_config", return_value=config), \
+             mock.patch.object(dashboard, "resolve_app_token", return_value="app_token"), \
+             self.assertRaises(StopLoop):
+            manager._loop()
+        self.assertEqual(starts, [(False, "")])
+        self.assertIsNotNone(manager.last_attempt_at)
+
+    def test_scheduler_skips_when_job_manager_is_busy(self):
+        class BusyJobs:
+            def start(self, dry_run, sync_job_id=""):
+                return {"ok": False, "message": "已有同步任务正在运行"}
+
+        manager = dashboard.ScheduleManager(BusyJobs())
+        manager._set_status(next_run_at=None, message="已有同步任务正在运行", attempted=True)
+        self.assertEqual(manager.snapshot()["message"], "已有同步任务正在运行")
 
 
 class SettingsFingerprintTests(unittest.TestCase):
