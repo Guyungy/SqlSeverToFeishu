@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import webbrowser
 from collections import deque
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -432,5 +433,8 @@ def logs_api():
 
 if __name__ == "__main__":
     port = int(runtime_settings()["dashboard_port"])
-    print(f"启动面板: http://127.0.0.1:{port}")
+    dashboard_url = f"http://127.0.0.1:{port}"
+    print(f"启动面板: {dashboard_url}")
+    if os.environ.get("NO_AUTO_BROWSER", "").strip().lower() not in {"1", "true", "yes"}:
+        threading.Timer(1.0, webbrowser.open, args=(dashboard_url,)).start()
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

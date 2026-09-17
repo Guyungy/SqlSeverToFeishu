@@ -75,6 +75,11 @@ echo.
 echo 请双击 start.bat 启动程序，然后浏览器打开 http://127.0.0.1:5001
 echo.
 
+if /I "%~1"=="/auto" (
+    call start.bat
+    exit /b %errorlevel%
+)
+
 choice /c YN /m "是否现在直接启动程序 (Y/N)"
 if errorlevel 2 goto :end
 call start.bat

@@ -72,6 +72,10 @@ else
 fi
 echo "  2. 浏览器打开 http://127.0.0.1:5001"
 echo ""
+if [ "${AUTO_START:-}" = "1" ]; then
+    exec ./start.sh
+fi
+
 read -r -p "是否现在直接启动程序？(y/n) " ans
 if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
     exec ./start.sh
