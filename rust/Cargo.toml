@@ -1,0 +1,72 @@
+[package]
+name = "sqlserver-to-feishu"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "把 SQL Server 数据同步到飞书多维表格"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "sqlfeishu"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"
+
+# 开发/校验阶段不需要调试符号，且关闭增量编译：
+# 这一步能把 target/ 体积压低 1–2 GB，对空间紧张的机器是必需的。
+[profile.dev]
+debug = false
+incremental = false
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "fs",
+    "io-util",
+] }
+# 原版 tiberius 已停止维护且带未修补的 TLS 安全公告，
+# 必须使用社区延续版 tiberius-ng（导入名仍是 tiberius）。
+# 禁掉默认 feature 后需要显式选 TLS 实现：macOS 上 native-tls 走
+# Security Framework，与 SQL Server 的 TLS 协商不兼容，因此统一用 rustls。
+tiberius = { package = "tiberius-ng", version = "0.13", default-features = false, features = [
+    "rustls",
+    "tds80",
+    "chrono",
+    "bigdecimal",
+    "sql-browser-tokio",
+] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "gzip",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+dotenvy = "0.15"
+uuid = { version = "1", features = ["v4"] }
+
+# 集成测试要直接驱动库里的异步接口。
+# 这些 crate 本来就在依赖树里，列进 dev-dependencies 不会增加编译量。
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+anyhow = "1"
+serde_json = "1"
+# 连接类问题只在协议细节出错时暴露，光看最终报错定位不到。
+# 集成测试里可以用 SQLFEISHU_TEST_LOG=1 打开 tiberius 的 TRACE 日志。
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }

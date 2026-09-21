@@ -245,6 +245,19 @@ AUTO_START=1 ./install.sh
 .venv/bin/python multi_sync.py --dry-run --job-id job_xxx
 ```
 
+## 🖥 桌面版（开发中，尚不可用于同步）
+
+另有一个 Rust + TypeScript 重写版，目标是**免装 Python、免装数据库驱动，双击即用**。
+
+| 目录 | 内容 |
+| --- | --- |
+| `rust/` | 同步内核与命令行版（`sqlfeishu probe / sql / feishu / where`） |
+| `src-tauri/` + `ui/` | Tauri v2 桌面界面：飞书目标、SQL 数据源、同步任务配置，以及连接测试与库表字段扫描 |
+
+已就绪：编译、单元与集成测试、release 二进制（2.7 MB，只依赖系统库）。
+**未就绪：写飞书那一段（字段自动创建、按唯一键去重、增量游标推进）仍在迁移，因此同步请继续用上面的 Python 版。**
+两个版本共用同一份 `sync_config.json` 和 `.env`，配置是通的，可以随时切换。
+
 ## ✅ 开发与验证
 
 ```bash

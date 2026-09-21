@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SqlFeishuSync",
+  "version": "0.1.0",
+  "identifier": "com.sqlfeishu.desktop",
+  "build": {
+    "beforeDevCommand": "node ui/build.mjs --watch",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "node ui/build.mjs",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "SQL Server → 飞书同步",
+        "width": 1180,
+        "height": 820,
+        "minWidth": 940,
+        "minHeight": 620
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

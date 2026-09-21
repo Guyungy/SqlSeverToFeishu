@@ -1,0 +1,42 @@
+[package]
+name = "sqlfeishu-desktop"
+version = "0.1.0"
+description = "SQL Server 到飞书多维表格同步（桌面版）"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[lib]
+# 与产物名错开，避免 Windows 上 lib/bin 同名冲突。
+name = "sqlfeishu_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# 同步内核：命令行版与桌面版共用同一套 config / feishu / mssql，
+# 不复制逻辑，避免两边行为漂移。
+sqlserver-to-feishu = { path = "../rust" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true
+
+# dev profile 默认带完整调试符号、且开增量编译，target/ 会膨胀到 GB 级。
+# 桌面端的依赖树（tauri + wry + tao + 整个 tokio/reqwest 栈）尤其明显，
+# 关掉这两项后体积降一个数量级。调试时如果要符号，单独临时覆盖即可。
+[profile.dev]
+debug = false
+incremental = false

@@ -1,0 +1,19 @@
+{
+  "name": "sqlfeishu-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "ui:build": "node ui/build.mjs",
+    "ui:watch": "node ui/build.mjs --watch",
+    "typecheck": "tsc -p ui/tsconfig.json",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.5",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口的默认能力。前端只通过自己定义的命令访问后端，不需要额外的系统权限。",
+  "windows": ["main"],
+  "permissions": ["core:default", "opener:default"]
+}

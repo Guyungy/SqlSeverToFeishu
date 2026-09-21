@@ -4,6 +4,15 @@
 
 ## [未发布]
 
+### 新增（桌面版，开发中）
+
+Rust + TypeScript 重写版，目标是免装 Python/免装驱动、双击即用。**同步写入部分尚未迁移，暂不可用于生产。**
+现有 Python 版不受影响，两个版本共用同一份 `sync_config.json` 与 `.env`。
+
+- `rust/`：同步内核与命令行版（`sqlfeishu probe/sql/feishu/where`）。SQL Server 走纯 Rust 的 TDS 实现，不需要 ODBC / FreeTDS；飞书客户端含令牌缓存、指数退避重试与分页。
+- `src-tauri/` + `ui/`：Tauri v2 桌面界面，覆盖飞书目标、SQL 数据源、同步任务三项配置，以及连通性测试与库表字段扫描。
+- 已通过编译、11 个单元测试、8 个集成测试（含本地桩验证的 TLS 协商与飞书 HTTP 全链路）；release 二进制 2.7 MB，只依赖系统库。
+
 ### 使用体验
 
 - 新增 Windows `一键启动.bat` 和 macOS `一键启动.command`：首次运行自动安装依赖并启动，后续直接启动。

@@ -21,3 +21,15 @@ dashboard_server.log
 # WorkBuddy 项目本地数据（勿提交）
 .workbuddy/
 .workbuddy-ai/
+
+# Rust 编译产物（体积大且可再生，勿提交）
+rust/target/
+src-tauri/target/
+src-tauri/gen/
+
+# 前端依赖与构建产物
+node_modules/
+ui/dist/
+
+# .env 写入时的临时文件（原文件已在上面忽略）
+.env.tmp
