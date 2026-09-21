@@ -73,9 +73,7 @@ async fn probe_sql(paths: &AppPaths) -> Result<()> {
     let settings = config::RuntimeSettings::effective(Some(&config.settings));
     println!(
         "[SQL] 运行设置：查询超时 {} 秒，NULL 处理 {}，时区 UTC+{}",
-        settings.query_timeout,
-        settings.null_policy,
-        settings.timezone_offset
+        settings.query_timeout, settings.null_policy, settings.timezone_offset
     );
 
     for source in &config.sources {
@@ -135,7 +133,11 @@ async fn probe_feishu() -> Result<()> {
 
     let client = feishu::FeishuClient::from_env()?;
     let tables = client.list_tables(&target.app_token).await?;
-    println!("[飞书] 多维表格 {} 共 {} 张表", target.app_token, tables.len());
+    println!(
+        "[飞书] 多维表格 {} 共 {} 张表",
+        target.app_token,
+        tables.len()
+    );
     for table in &tables {
         let name = table
             .get("name")

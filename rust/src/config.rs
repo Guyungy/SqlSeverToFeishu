@@ -83,7 +83,9 @@ impl AppPaths {
             let key = if trimmed.starts_with('#') {
                 None
             } else {
-                trimmed.split_once('=').map(|(key, _)| key.trim().to_string())
+                trimmed
+                    .split_once('=')
+                    .map(|(key, _)| key.trim().to_string())
             };
             match key {
                 Some(name) => match pending.iter().position(|(key, _)| *key == name) {
@@ -109,8 +111,7 @@ impl AppPaths {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
         }
-        std::fs::rename(&temp, &path)
-            .with_context(|| format!("无法替换 {}", path.display()))?;
+        std::fs::rename(&temp, &path).with_context(|| format!("无法替换 {}", path.display()))?;
         Ok(path)
     }
 
@@ -136,8 +137,7 @@ impl AppPaths {
     pub fn load_env(&self) -> Result<()> {
         let path = self.env_path();
         if path.exists() {
-            dotenvy::from_path(&path)
-                .with_context(|| format!("无法读取 {}", path.display()))?;
+            dotenvy::from_path(&path).with_context(|| format!("无法读取 {}", path.display()))?;
         }
         Ok(())
     }
@@ -163,8 +163,7 @@ impl AppPaths {
         let text = serde_json::to_string_pretty(value)?;
         std::fs::write(&temp, format!("{text}\n"))
             .with_context(|| format!("无法写入 {}", temp.display()))?;
-        std::fs::rename(&temp, path)
-            .with_context(|| format!("无法替换 {}", path.display()))?;
+        std::fs::rename(&temp, path).with_context(|| format!("无法替换 {}", path.display()))?;
         Ok(())
     }
 }
@@ -183,9 +182,7 @@ fn is_writable(dir: &Path) -> bool {
 #[cfg(target_os = "macos")]
 fn user_data_dir() -> PathBuf {
     std::env::var_os("HOME")
-        .map(|home| {
-            PathBuf::from(home).join("Library/Application Support/SqlSeverToFeishu")
-        })
+        .map(|home| PathBuf::from(home).join("Library/Application Support/SqlSeverToFeishu"))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -624,7 +621,10 @@ mod tests {
 
         let text = std::fs::read_to_string(paths.env_path()).unwrap();
         assert!(text.contains("# 注释必须保留"), "注释被丢掉了: {text}");
-        assert!(text.contains("OLD_KEY=\"keep\""), "未命中的键被改动了: {text}");
+        assert!(
+            text.contains("OLD_KEY=\"keep\""),
+            "未命中的键被改动了: {text}"
+        );
         assert!(
             text.contains(r#"NEW_KEY="含\"引号\"与中文""#),
             "值必须转义: {text}"
@@ -636,7 +636,10 @@ mod tests {
                 .unwrap()
                 .map(|item| item.unwrap())
                 .collect();
-        assert_eq!(parsed.get("DB_SERVER").map(String::as_str), Some("10.0.0.5"));
+        assert_eq!(
+            parsed.get("DB_SERVER").map(String::as_str),
+            Some("10.0.0.5")
+        );
         assert_eq!(
             parsed.get("NEW_KEY").map(String::as_str),
             Some("含\"引号\"与中文")
@@ -690,7 +693,10 @@ mod tests {
     fn null_policy_accepts_legacy_clear() {
         assert_eq!(NullPolicy::parse("clear").unwrap(), NullPolicy::Overwrite);
         assert_eq!(NullPolicy::parse("").unwrap(), NullPolicy::Skip);
-        assert_eq!(NullPolicy::parse("OVERWRITE").unwrap(), NullPolicy::Overwrite);
+        assert_eq!(
+            NullPolicy::parse("OVERWRITE").unwrap(),
+            NullPolicy::Overwrite
+        );
         assert!(NullPolicy::parse("bogus").is_err());
     }
 

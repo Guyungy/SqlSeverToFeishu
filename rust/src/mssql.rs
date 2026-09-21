@@ -53,10 +53,7 @@ pub async fn connect_with(source: &DataSource, trust_cert: bool) -> Result<SqlCl
     if !source.database.is_empty() {
         config.database(source.database.clone());
     }
-    config.authentication(AuthMethod::sql_server(
-        source.user.clone(),
-        password,
-    ));
+    config.authentication(AuthMethod::sql_server(source.user.clone(), password));
     if trust_cert {
         config.trust_cert();
     }
@@ -123,15 +120,8 @@ pub async fn list_tables(client: &mut SqlClient) -> Result<Vec<TableInfo>> {
         .filter_map(|row| {
             let schema = row.get::<&str, _>(0)?.to_string();
             let name = row.get::<&str, _>(1)?.to_string();
-            let kind = row
-                .get::<&str, _>(2)
-                .unwrap_or("BASE TABLE")
-                .to_string();
-            Some(TableInfo {
-                schema,
-                name,
-                kind,
-            })
+            let kind = row.get::<&str, _>(2).unwrap_or("BASE TABLE").to_string();
+            Some(TableInfo { schema, name, kind })
         })
         .collect())
 }
@@ -148,10 +138,7 @@ pub async fn list_columns(
                WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 \
                ORDER BY ORDINAL_POSITION";
     let stream = client
-        .query(
-            sql,
-            &[&schema as &dyn ToSql, &table as &dyn ToSql],
-        )
+        .query(sql, &[&schema as &dyn ToSql, &table as &dyn ToSql])
         .await
         .context("查询字段列表失败")?;
     let rows = stream.into_first_result().await?;
@@ -159,10 +146,7 @@ pub async fn list_columns(
         .iter()
         .filter_map(|row| {
             let name = row.get::<&str, _>(0)?.to_string();
-            let data_type = row
-                .get::<&str, _>(1)
-                .unwrap_or("nvarchar")
-                .to_string();
+            let data_type = row.get::<&str, _>(1).unwrap_or("nvarchar").to_string();
             let nullable = row
                 .get::<&str, _>(2)
                 .map(|value| value.eq_ignore_ascii_case("YES"))

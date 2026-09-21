@@ -257,11 +257,11 @@ impl FeishuClient {
                 continue;
             }
 
-            let data: serde_json::Value = response
-                .json()
-                .await
-                .context("飞书授权响应无法解析")?;
-            let code = data.get("code").and_then(|value| value.as_i64()).unwrap_or(0);
+            let data: serde_json::Value = response.json().await.context("飞书授权响应无法解析")?;
+            let code = data
+                .get("code")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
             let token = data
                 .get("tenant_access_token")
                 .and_then(|value| value.as_str())
@@ -334,7 +334,10 @@ impl FeishuClient {
             } else {
                 serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }))
             };
-            let code = data.get("code").and_then(|value| value.as_i64()).unwrap_or(0);
+            let code = data
+                .get("code")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
 
             if matches!(status.as_u16(), 401 | 403) || TOKEN_EXPIRED_CODES.contains(&code) {
                 *self.token.lock().await = None;
@@ -343,9 +346,7 @@ impl FeishuClient {
 
             if status.as_u16() == 429 || status.is_server_error() || TRANSIENT_CODES.contains(&code)
             {
-                last_error = Some(anyhow!(
-                    "飞书接口暂时不可用（HTTP {status}, code {code}）"
-                ));
+                last_error = Some(anyhow!("飞书接口暂时不可用（HTTP {status}, code {code}）"));
                 match retry_after {
                     Some(seconds) => {
                         tokio::time::sleep(Duration::from_secs_f64(seconds.min(30.0))).await
@@ -471,7 +472,8 @@ mod tests {
     #[test]
     fn accepts_tbl_alias_and_bare_token() {
         let target =
-            parse_base_url("https://x.feishu.cn/base/BakExampleAppToken001?tbl=tblAbc123456").unwrap();
+            parse_base_url("https://x.feishu.cn/base/BakExampleAppToken001?tbl=tblAbc123456")
+                .unwrap();
         assert_eq!(target.table_id, "tblAbc123456");
 
         let bare = parse_base_url("BakExampleAppToken001").unwrap();

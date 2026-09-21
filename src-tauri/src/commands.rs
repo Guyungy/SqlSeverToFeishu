@@ -84,9 +84,7 @@ fn workspace_of(paths: &AppPaths) -> CmdResult<Workspace> {
 }
 
 fn save_config(paths: &AppPaths, config: &SyncConfig) -> CmdResult<()> {
-    paths
-        .write_json(&paths.config_path(), config)
-        .map_err(fail)
+    paths.write_json(&paths.config_path(), config).map_err(fail)
 }
 
 #[tauri::command]
@@ -108,14 +106,14 @@ pub struct FeishuInput {
 }
 
 #[tauri::command]
-pub async fn save_feishu(
-    state: State<'_, AppState>,
-    input: FeishuInput,
-) -> CmdResult<Workspace> {
+pub async fn save_feishu(state: State<'_, AppState>, input: FeishuInput) -> CmdResult<Workspace> {
     let paths = &state.paths;
     let mut updates = vec![
         ("FEISHU_APP_ID".to_string(), input.app_id.trim().to_string()),
-        ("FEISHU_BASE_URL".to_string(), input.base_url.trim().to_string()),
+        (
+            "FEISHU_BASE_URL".to_string(),
+            input.base_url.trim().to_string(),
+        ),
         (
             "FEISHU_BASE_APP_TOKEN".to_string(),
             input.base_app_token.trim().to_string(),
@@ -165,7 +163,11 @@ pub async fn test_feishu(_state: State<'_, AppState>) -> CmdResult<Vec<String>> 
             .get("table_id")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        let marker = if id == target.table_id { "  ← 目标表" } else { "" };
+        let marker = if id == target.table_id {
+            "  ← 目标表"
+        } else {
+            ""
+        };
         lines.push(format!("  {name} [{id}]{marker}"));
     }
     if tables.len() > 20 {
@@ -224,10 +226,7 @@ pub struct SourceInput {
 }
 
 #[tauri::command]
-pub async fn save_source(
-    state: State<'_, AppState>,
-    input: SourceInput,
-) -> CmdResult<Workspace> {
+pub async fn save_source(state: State<'_, AppState>, input: SourceInput) -> CmdResult<Workspace> {
     let paths = &state.paths;
     let mut config = config_of(paths)?;
 
@@ -462,9 +461,7 @@ pub async fn delete_job(state: State<'_, AppState>, id: String) -> CmdResult<Wor
     let state_path = paths.state_path();
     let mut sync_state = SyncState::load(&state_path).map_err(fail)?;
     sync_state.jobs.remove(&id);
-    paths
-        .write_json(&state_path, &sync_state)
-        .map_err(fail)?;
+    paths.write_json(&state_path, &sync_state).map_err(fail)?;
 
     workspace_of(paths)
 }
@@ -483,11 +480,19 @@ fn job_states_of(paths: &AppPaths) -> CmdResult<Vec<JobStateView>> {
     Ok(sync_state
         .jobs
         .into_iter()
-        .map(|(id, JobState { fingerprint, cursor })| JobStateView {
-            id,
-            fingerprint,
-            cursor,
-        })
+        .map(
+            |(
+                id,
+                JobState {
+                    fingerprint,
+                    cursor,
+                },
+            )| JobStateView {
+                id,
+                fingerprint,
+                cursor,
+            },
+        )
         .collect())
 }
 

@@ -64,8 +64,7 @@ async fn trusted_self_signed_cert_completes_tls_handshake() {
 
     let error = mssql::connect_with(&source(server.port), true)
         .await
-        .err()
-        .expect("桩不会完成 TDS 登录，连接必须报错");
+        .expect_err("桩不会完成 TDS 登录，连接必须报错");
     let message = format!("{error:#}");
 
     let log = server.wait_for_log_count("ok", 1, Duration::from_secs(15));
@@ -90,8 +89,7 @@ async fn rejects_self_signed_cert_when_verification_is_on() {
 
     let error = mssql::connect_with(&source(server.port), false)
         .await
-        .err()
-        .expect("严格校验下自签证书必须被拒绝");
+        .expect_err("严格校验下自签证书必须被拒绝");
     let message = format!("{error:#}");
 
     let log = server.wait_for_log_count("fail", 1, Duration::from_secs(15));
@@ -110,8 +108,7 @@ async fn refuses_to_continue_when_server_disables_encryption() {
 
     let error = mssql::connect_with(&source(server.port), true)
         .await
-        .err()
-        .expect("服务器不支持加密时必须拒绝继续，而不是明文登录");
+        .expect_err("服务器不支持加密时必须拒绝继续，而不是明文登录");
     let message = format!("{error:#}");
 
     let log = server.wait_for_log_count("plain", 1, Duration::from_secs(15));

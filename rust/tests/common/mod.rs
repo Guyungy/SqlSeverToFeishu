@@ -49,14 +49,15 @@ impl StubServer {
         assert!(fixture.exists(), "找不到桩脚本 {}", fixture.display());
 
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let log_path = std::env::temp_dir().join(format!(
-            "sqlfeishu-stub-{}-{seq}.log",
-            std::process::id()
-        ));
+        let log_path =
+            std::env::temp_dir().join(format!("sqlfeishu-stub-{}-{seq}.log", std::process::id()));
         let _ = std::fs::remove_file(&log_path);
 
         // 约定：所有桩脚本的第一个参数都是日志文件，自定义参数排在后面。
-        let mut args: Vec<String> = vec![fixture.display().to_string(), log_path.display().to_string()];
+        let mut args: Vec<String> = vec![
+            fixture.display().to_string(),
+            log_path.display().to_string(),
+        ];
         args.extend_from_slice(extra_args);
 
         let mut child = Command::new(python_binary())
