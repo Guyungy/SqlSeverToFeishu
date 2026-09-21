@@ -134,13 +134,16 @@ def serve_one(raw):
 
         if MODE == "plain":
             raw.sendall(tds_packet(PACKET_TYPE_RESPONSE, prelogin_response(ENCRYPT_NOT_SUP)))
-            # 客户端此时应当拒绝继续。多读一会儿，避免带着未读数据关闭
-            # 触发 RST，把「明确拒绝」变成看起来像网络故障。
+            # 先记日志再等客户端收尾：客户端读到「不支持加密」就立刻报错了，
+            # 若把 note 放在后面的 recv 之后，测试端读日志时会读到空文件
+            # （这与 feishu_mock 里那处竞态是同一类问题）。
+            note("plain")
+            # 多读一会儿，避免带着未读数据关闭触发 RST，
+            # 把「明确拒绝」变成看起来像网络故障。
             try:
                 raw.recv(4096)
             except OSError:
                 pass
-            note("plain")
             return
 
         raw.sendall(tds_packet(PACKET_TYPE_RESPONSE, prelogin_response(ENCRYPT_ON)))

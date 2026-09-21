@@ -59,7 +59,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # 静音默认 stderr 访问日志
         pass
 
-    def _send(self, status, payload):
+    def _send(self, status, payload, code=None):
+        """先记日志、再回响应。
+
+        顺序很关键：反过来写（先回响应后记日志）会引入竞态 —— 客户端拿到
+        响应就返回，测试端读日志时那一行**可能还没落盘**。这在 macOS 上
+        大概率侥幸通过，在 Windows 上必然翻车（实测就是这么暴露出来的）。
+        先记日志后回响应，则「客户端收到了响应」就蕴含「日志已写好」。
+        """
+        if code is None:
+            code = payload.get("code", 0) if isinstance(payload, dict) else 0
+        self._record(status, code)
+
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -76,7 +87,6 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if kind_of(path) != "auth":
             self._send(404, {"code": 404})
-            self._record(404, 404)
             return
         STATE["auth"] += 1
         self._send(
@@ -88,7 +98,6 @@ class Handler(BaseHTTPRequestHandler):
                 "expire": 7200,
             },
         )
-        self._record(200, 0)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -99,7 +108,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.headers.get("Authorization", "").startswith("Bearer "):
             self._send(401, {"code": 99991661, "msg": "missing authorization"})
-            self._record(401, 99991661)
             return
 
         if kind == "tables":
@@ -108,17 +116,14 @@ class Handler(BaseHTTPRequestHandler):
 
             if app_token.startswith("appRetry429") and hit == 1:
                 self._send(429, {"code": 1254290, "msg": "too many requests"})
-                self._record(429, 1254290)
                 return
 
             if app_token.startswith("appStaleTkn") and hit == 1:
                 self._send(200, {"code": 99991663, "msg": "token expired"})
-                self._record(200, 99991663)
                 return
 
             if app_token.startswith("appBizErr"):
                 self._send(200, {"code": 1254005, "msg": "app not found"})
-                self._record(200, 1254005)
                 return
 
             if app_token.startswith("appPaging"):
@@ -139,7 +144,6 @@ class Handler(BaseHTTPRequestHandler):
                         ],
                     }
                 self._send(200, {"code": 0, "msg": "ok", "data": payload})
-                self._record(200, 0)
                 return
 
             payload = {
@@ -148,7 +152,6 @@ class Handler(BaseHTTPRequestHandler):
                 "items": [{"table_id": "tblA", "name": "唯一一张表"}],
             }
             self._send(200, {"code": 0, "msg": "ok", "data": payload})
-            self._record(200, 0)
             return
 
         if kind == "fields":
@@ -162,11 +165,9 @@ class Handler(BaseHTTPRequestHandler):
                 ],
             }
             self._send(200, {"code": 0, "msg": "ok", "data": payload})
-            self._record(200, 0)
             return
 
         self._send(404, {"code": 404, "msg": "not found"})
-        self._record(404, 404)
 
 
 def main():
