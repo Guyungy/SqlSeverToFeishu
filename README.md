@@ -19,6 +19,7 @@
 <img src="https://img.shields.io/badge/macOS-支持-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
 <img src="https://img.shields.io/badge/Linux-支持-fcc624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
 <img src="https://img.shields.io/badge/管理页面-仅本机访问-2ea44f?style=flat-square" alt="仅本机访问">
+<img src="https://img.shields.io/badge/许可证-GPL--3.0-blue?style=flat-square" alt="GPL-3.0">
 
 </div>
 
@@ -442,8 +443,10 @@ SqlSeverToFeishu/
 
 如果这个项目帮你省掉了手写同步脚本的时间，欢迎点个 Star。
 
+本项目采用 **GNU General Public License v3.0**。你可以使用、修改和再分发本项目；分发修改版或衍生作品时，需继续使用 GPL-3.0，并按许可证要求提供对应源代码。完整条款请查看 [LICENSE](LICENSE)。
+
 <div align="center">
 
-**[提交 Issue](https://github.com/Guyungy/SqlSeverToFeishu/issues)** · **[查看更新日志](CHANGELOG.md)**
+**[GPL-3.0](LICENSE)** · **[提交 Issue](https://github.com/Guyungy/SqlSeverToFeishu/issues)** · **[查看更新日志](CHANGELOG.md)**
 
 </div>

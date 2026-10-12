@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 description = "把 SQL Server 数据同步到飞书多维表格"
-license = "MIT"
+license = "GPL-3.0-only"
 publish = false
 
 [[bin]]

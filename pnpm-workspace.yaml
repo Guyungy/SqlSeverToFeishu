@@ -4,3 +4,10 @@
 # 所以显式放行；其余依赖不需要任何脚本权限。
 allowBuilds:
   esbuild: true
+
+# 关闭「执行 run 脚本前自动校验并安装依赖」。
+# 注意：pnpm 11 只从 .npmrc 读取 auth/registry，该配置必须写在 pnpm-workspace.yaml，
+# 写 .npmrc 无效（已用受控实验验证）。不关的话，本机 WorkBuddy 的 safe-delete 守护
+# 会拦下 install 中途清理 _tmp_<pid>_<hash> 的步骤，而 node_modules 此时已被删除
+# → `pnpm run dev` 既起不来、依赖也被清空。
+verifyDepsBeforeRun: false

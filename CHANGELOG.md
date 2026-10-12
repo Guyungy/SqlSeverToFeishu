@@ -4,6 +4,10 @@
 
 ## [未发布]
 
+### 许可证
+
+- 项目许可证统一为 GNU General Public License v3.0（`GPL-3.0-only`），并同步更新 README、Rust Cargo 与 npm 元数据。
+
 ### 新增（桌面版，开发中）
 
 Rust + TypeScript 重写版，目标是免装 Python/免装驱动、双击即用。**同步写入部分尚未迁移，暂不可用于生产。**

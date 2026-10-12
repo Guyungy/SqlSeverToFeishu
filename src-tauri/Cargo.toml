@@ -2,6 +2,7 @@
 name = "sqlfeishu-desktop"
 version = "0.1.0"
 description = "SQL Server 到飞书多维表格同步（桌面版）"
+license = "GPL-3.0-only"
 edition = "2021"
 rust-version = "1.88"
 publish = false
