@@ -31,5 +31,14 @@ src-tauri/gen/
 node_modules/
 ui/dist/
 
-# .env 写入时的临时文件（原文件已在上面忽略）
-.env.tmp
+# 原子写入产生的临时文件（原文件已在上面忽略）。
+# Python 用 tempfile.mkstemp 生成随机后缀（.env.a1b2c3、.sync_config.json.a1b2c3）；
+# Rust 用 <原名>.<pid>.<序号>.tmp（.env.12345.0.tmp、sync_config.json.12345.0.tmp）。
+# 两种样式都要盖到。Rust 那份用 [0-9] 限定 pid，免得连同 *.json.example 这类模板一起误伤。
+.env.*
+# 别把 .env.example 这种要提交的模板一起误伤
+!.env.example
+*.json.[0-9]*
+.sync_config.json.*
+.sync_state.json.*
+*.json.tmp

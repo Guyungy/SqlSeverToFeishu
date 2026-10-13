@@ -3,15 +3,21 @@
 //! 对齐 Python 版 `sync.py` 中的 `FeishuClient`：同样的重试策略、
 //! 同样的令牌过期码集合，同样在分页缺 `page_token` 时立即失败而不是继续翻页。
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 
+use crate::config::env_or_map;
+
 pub const DEFAULT_API_BASE: &str = "https://open.feishu.cn/open-apis";
 const MAX_ATTEMPTS: usize = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
+/// 分页上限（每页 500 条）：约 10 万条。用于兜底「服务器一直回 has_more
+/// 且游标不推进」的病态响应，避免 `loop` 永不退出。
+const MAX_PAGES: usize = 200;
 
 /// 飞书返回这些业务码时属于可重试的暂时性故障。
 const TRANSIENT_CODES: [i64; 3] = [1254290, 1254291, 1254607];
@@ -167,6 +173,8 @@ pub struct FeishuClient {
     app_id: String,
     app_secret: String,
     token: tokio::sync::Mutex<Option<String>>,
+    /// 授权进行中标志：并发的首个请求只发起一次 auth，其余等待其完成。
+    auth_inflight: tokio::sync::Mutex<bool>,
 }
 
 impl FeishuClient {
@@ -196,13 +204,19 @@ impl FeishuClient {
             app_id: app_id.into(),
             app_secret: app_secret.into(),
             token: tokio::sync::Mutex::new(None),
+            auth_inflight: tokio::sync::Mutex::new(false),
         })
     }
 
     /// 从环境变量构造；缺 App ID / Secret 时报错。
     pub fn from_env() -> Result<Self> {
-        let app_id = std::env::var("FEISHU_APP_ID").unwrap_or_default();
-        let app_secret = std::env::var("FEISHU_APP_SECRET").unwrap_or_default();
+        Self::from_map(&HashMap::new())
+    }
+
+    /// 从 `.env` 映射构造（其次进程环境）；缺 App ID / Secret 时报错。
+    pub fn from_map(env: &HashMap<String, String>) -> Result<Self> {
+        let app_id = env_or_map(env, "FEISHU_APP_ID");
+        let app_secret = env_or_map(env, "FEISHU_APP_SECRET");
         if app_id.trim().is_empty() || app_secret.trim().is_empty() {
             return Err(anyhow!("缺少 FEISHU_APP_ID 或 FEISHU_APP_SECRET"));
         }
@@ -211,18 +225,57 @@ impl FeishuClient {
 
     /// 目标多维表格：优先解析链接，其次回退到独立的 token 环境变量。
     pub fn target_from_env() -> Result<BaseTarget> {
-        let url = std::env::var("FEISHU_BASE_URL").unwrap_or_default();
+        Self::target_from_map(&HashMap::new())
+    }
+
+    /// 同 [`FeishuClient::target_from_env`]，但先查 `.env` 映射。
+    pub fn target_from_map(env: &HashMap<String, String>) -> Result<BaseTarget> {
+        let url = env_or_map(env, "FEISHU_BASE_URL");
         let mut target = parse_base_url(&url)?;
         if target.app_token.is_empty() {
-            target.app_token = env_value("FEISHU_BASE_APP_TOKEN");
+            target.app_token = env_or_map(env, "FEISHU_BASE_APP_TOKEN");
         }
         if target.table_id.is_empty() {
-            target.table_id = env_value("FEISHU_BASE_TABLE_ID");
+            target.table_id = env_or_map(env, "FEISHU_BASE_TABLE_ID");
         }
         if target.view_id.is_empty() {
-            target.view_id = env_value("FEISHU_BASE_VIEW_ID");
+            target.view_id = env_or_map(env, "FEISHU_BASE_VIEW_ID");
         }
         Ok(target)
+    }
+
+    /// 取一个可用令牌：缓存命中直接返回，否则做单飞授权。
+    ///
+    /// 关键点：`auth()` 是网络往返，绝不能持锁执行——否则拿锁的请求一旦卡住，
+    /// 其他请求全部排队等它。这里先用 `auth_inflight` 让并发请求只授权一次，
+    /// 真正的取值与写回都用短临界区。
+    async fn token(&self) -> Result<String> {
+        if let Some(token) = self.token.lock().await.clone() {
+            return Ok(token);
+        }
+
+        let mut inflight = self.auth_inflight.lock().await;
+        if !*inflight {
+            *inflight = true;
+            let result = self.auth().await;
+            // 先解锁再写缓存：让等待的请求能立刻观察到新令牌。
+            *inflight = false;
+            drop(inflight);
+
+            let fresh = result?;
+            *self.token.lock().await = Some(fresh.clone());
+            return Ok(fresh);
+        }
+        drop(inflight);
+
+        // 已有请求在授权：轮询等待其写回缓存（授权失败时超时退出，不永久挂住）。
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(token) = self.token.lock().await.clone() {
+                return Ok(token);
+            }
+        }
+        Err(anyhow!("等待飞书令牌超时"))
     }
 
     async fn auth(&self) -> Result<String> {
@@ -289,17 +342,7 @@ impl FeishuClient {
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..MAX_ATTEMPTS {
-            let token = {
-                let mut guard = self.token.lock().await;
-                match guard.clone() {
-                    Some(token) => token,
-                    None => {
-                        let fresh = self.auth().await?;
-                        *guard = Some(fresh.clone());
-                        fresh
-                    }
-                }
-            };
+            let token = self.token().await?;
 
             let mut builder = self
                 .http
@@ -328,11 +371,36 @@ impl FeishuClient {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<f64>().ok());
 
+            // 可重试的服务端状态（429 / 5xx）必须在解析响应体**之前**处理：
+            // 这类响应体往往是网关或反向代理返回的 HTML 错误页，根本不是 JSON。
+            // 若先解析，就会把这个本可重试的瞬时故障变成一次硬失败，也就丢掉了
+            // 原有的重试语义（HEAD 用 `{"raw": text}` 兜底时靠重试侥幸掩盖了这一点）。
+            if status.as_u16() == 429 || status.is_server_error() {
+                last_error = Some(anyhow!("飞书接口暂时不可用（HTTP {status}）"));
+                match retry_after {
+                    Some(seconds) => {
+                        tokio::time::sleep(Duration::from_secs_f64(seconds.min(30.0))).await
+                    }
+                    None => sleep_backoff(attempt).await,
+                }
+                continue;
+            }
+
             let text = response.text().await.unwrap_or_default();
-            let data: serde_json::Value = if text.trim().is_empty() {
+            let trimmed = text.trim();
+            // 空响应体：当作成功（某些删除类接口返回 204，省掉一层特判）。
+            // 非空但不是 JSON：一律判失败。此前用 `{"raw": text}` 兜底，会让
+            // `code` 落到默认值 0，把一个 HTML 错误页/网关页当成成功返回。
+            let data: serde_json::Value = if trimmed.is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }))
+                serde_json::from_str(trimmed).map_err(|error| {
+                    anyhow!(
+                        "飞书接口返回的不是 JSON（HTTP {status}）: {}（响应片段: {}）",
+                        error,
+                        snippet(trimmed)
+                    )
+                })?
             };
             let code = data
                 .get("code")
@@ -344,8 +412,7 @@ impl FeishuClient {
                 continue;
             }
 
-            if status.as_u16() == 429 || status.is_server_error() || TRANSIENT_CODES.contains(&code)
-            {
+            if TRANSIENT_CODES.contains(&code) {
                 last_error = Some(anyhow!("飞书接口暂时不可用（HTTP {status}, code {code}）"));
                 match retry_after {
                     Some(seconds) => {
@@ -414,7 +481,7 @@ impl FeishuClient {
         let mut items: Vec<serde_json::Value> = Vec::new();
         let mut page_token: Option<String> = None;
 
-        loop {
+        for _ in 0..MAX_PAGES {
             let mut query = vec![("page_size".to_string(), "500".to_string())];
             if let Some(extra) = &extra {
                 query.extend(extra.iter().cloned());
@@ -441,17 +508,30 @@ impl FeishuClient {
             }
 
             match page.get("page_token").and_then(|value| value.as_str()) {
-                Some(token) if !token.is_empty() => page_token = Some(token.to_string()),
+                Some(token) if !token.is_empty() => {
+                    // 游标没前进说明服务端不认这个 page_token，继续翻会死循环。
+                    if page_token.as_deref() == Some(token) {
+                        return Err(anyhow!(
+                            "飞书分页游标未推进（page_token={token}），已中止以避免死循环"
+                        ));
+                    }
+                    page_token = Some(token.to_string());
+                }
                 _ => return Err(anyhow!("飞书分页响应缺少 page_token")),
             }
         }
+
+        Err(anyhow!("飞书分页超过 {MAX_PAGES} 页，已中止"))
     }
 }
 
-fn env_value(key: &str) -> String {
-    std::env::var(key)
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default()
+/// 取一段足够诊断、又不会把整页 HTML 塞进报错的响应片段。
+fn snippet(text: &str) -> String {
+    let mut out: String = text.chars().take(200).collect();
+    if text.chars().count() > 200 {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]

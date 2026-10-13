@@ -67,6 +67,80 @@ async fn retries_after_rate_limit() {
 }
 
 #[tokio::test]
+async fn retries_non_json_gateway_error() {
+    // 5xx 的响应体常常是网关的 HTML 错误页。客户端必须在解析响应体之前
+    // 就按状态码决定重试，否则「解析失败」会把这个可自愈的瞬时故障
+    // 变成一次硬失败 —— 顺序写反就退化成这样。
+    let server = StubServer::start("feishu_mock.py", &[]);
+    let client = client(&server);
+
+    let tables = client
+        .list_tables("appGateway5xx0001")
+        .await
+        .expect("非 JSON 的 502 也应当被当成可重试故障");
+    assert_eq!(tables.len(), 1);
+
+    let log = server.log();
+    assert!(log.contains("-> 502"), "首次应当真的收到 502: {log}");
+    assert_eq!(
+        log.matches("/tables?").count(),
+        2,
+        "502 之后应当重试一次: {log}"
+    );
+}
+
+#[tokio::test]
+async fn aborts_when_page_token_does_not_advance() {
+    // 服务端一直回 has_more，却把刚发过去的游标原样退回。若不判断「游标是否
+    // 前进」，客户端会带着同一个游标反复请求，直到撞上 MAX_PAGES —— 期间每页
+    // 都拿到重复数据。必须在原地踏步的那一刻就中止。
+    let server = StubServer::start("feishu_mock.py", &[]);
+    let client = client(&server);
+
+    let error = client
+        .list_tables("appStuckCursor00001")
+        .await
+        .expect_err("游标未推进必须中止，不能死循环");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("游标未推进"),
+        "错误信息应当点明游标没前进: {message}"
+    );
+
+    let log = server.log();
+    assert_eq!(
+        log.matches("/tables?").count(),
+        2,
+        "只应请求两次（首页 + 发现游标未进的那一页）: {log}"
+    );
+}
+
+#[tokio::test]
+async fn errors_when_has_more_without_page_token() {
+    // has_more=true 却不给 page_token：既翻不下去，也不能当作「读完了」，
+    // 否则会静默少读数据 —— 用户看到的是同步成功但数据不全。
+    let server = StubServer::start("feishu_mock.py", &[]);
+    let client = client(&server);
+
+    let error = client
+        .list_tables("appNoToken00000001")
+        .await
+        .expect_err("声明还有下页却缺少游标必须报错");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("缺少 page_token"),
+        "错误信息应当点明缺游标: {message}"
+    );
+
+    let log = server.log();
+    assert_eq!(
+        log.matches("/tables?").count(),
+        1,
+        "缺游标时根本无从重试，只应请求一次: {log}"
+    );
+}
+
+#[tokio::test]
 async fn refreshes_expired_token() {
     let server = StubServer::start("feishu_mock.py", &[]);
     let client = client(&server);

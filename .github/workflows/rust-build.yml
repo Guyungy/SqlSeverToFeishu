@@ -5,15 +5,21 @@ on:
     branches: [main]
     paths:
       - 'rust/**'
+      - 'src-tauri/**'
       - '.github/workflows/rust-build.yml'
   pull_request:
     paths:
       - 'rust/**'
+      - 'src-tauri/**'
       - '.github/workflows/rust-build.yml'
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+# 这些 workflow 只读取仓库内容，不写回也不需要额外权限。
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -46,13 +52,20 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          # 同一 job 要在两个 macOS 架构上各编一份，不按 target 分开会互相覆盖缓存。
+          key: ${{ matrix.target }}
 
-      - name: 格式检查（不阻塞构建）
-        continue-on-error: true
+      - name: 格式检查
         run: cargo fmt --all -- --check
 
-      - name: 静态检查（不阻塞构建）
-        continue-on-error: true
+      # 桌面端是独立 workspace（src-tauri/Cargo.toml），上面的 fmt/clippy 都只
+      # 作用于 rust/。这里补一次桌面端的格式检查，否则 commands.rs 这类文件
+      # 从未被任何 workflow 把关过。
+      - name: 桌面端格式检查
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: 静态检查
         run: cargo clippy --all-targets --target ${{ matrix.target }}
 
       - name: 单元测试

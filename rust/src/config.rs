@@ -5,6 +5,7 @@
 //! 所以这里先探测 exe 同目录是否可写，不可写则退回用户数据目录。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -102,7 +103,7 @@ impl AppPaths {
             lines.push(format!("{key}={}", quote_env_value(&value)));
         }
 
-        let temp = self.base_dir.join(".env.tmp");
+        let temp = temp_path(&path);
         std::fs::write(&temp, format!("{}\n", lines.join("\n")))
             .with_context(|| format!("无法写入 {}", temp.display()))?;
         // .env 里有密码，权限必须是 0600（Python 版同样这么设）。
@@ -115,31 +116,43 @@ impl AppPaths {
         Ok(path)
     }
 
-    /// 把新写入的 `.env` 同步进当前进程的环境变量。
+    /// 载入 `.env` 到当前进程环境（存在才载入，缺失不是错误）。
     ///
-    /// `dotenvy` 默认不覆盖已存在的变量，所以保存后不重新载入的话，
-    /// 界面里改的值要重启才生效。
-    pub fn reload_env(&self) -> Result<()> {
+    /// 用 `from_path_iter` + `set_var` 而不是 `dotenvy::from_path`：后者不会覆盖
+    /// 已存在的进程环境变量，而桌面版「界面里改完立即生效」要求 `.env` 的值优先。
+    ///
+    /// **只允许在启动阶段调用**（`main` 刚进入、尚未起工作线程时）：多线程运行时
+    /// 起来之后再 `set_var` 是未定义行为，且 release 版 `panic = "abort"` 会直接
+    /// 崩掉进程。保存配置之后的刷新走 [`AppPaths::env_map`]，绝不回写进程环境。
+    pub fn load_env(&self) -> Result<()> {
         let path = self.env_path();
         if !path.exists() {
             return Ok(());
         }
-        let values = dotenvy::from_path_iter(&path)
-            .with_context(|| format!("无法解析 {}", path.display()))?;
-        for item in values {
-            let (key, value) = item.with_context(|| format!("{} 格式错误", path.display()))?;
+        for (key, value) in self.env_map()? {
             std::env::set_var(key, value);
         }
         Ok(())
     }
 
-    /// 载入 `.env`（存在才载入，缺失不是错误）。
-    pub fn load_env(&self) -> Result<()> {
+    /// 解析 `.env` 为内存映射，**不触碰进程环境**。
+    ///
+    /// 保存配置后需要让新值立即生效时用这个：调用方把它挂在 `AppState` 里，
+    /// 凭据读取优先从这里取，因此既不用 `set_var`（多线程下是 UB），
+    /// 也不必重启应用。
+    pub fn env_map(&self) -> Result<std::collections::HashMap<String, String>> {
         let path = self.env_path();
-        if path.exists() {
-            dotenvy::from_path(&path).with_context(|| format!("无法读取 {}", path.display()))?;
+        if !path.exists() {
+            return Ok(std::collections::HashMap::new());
         }
-        Ok(())
+        let values = dotenvy::from_path_iter(&path)
+            .with_context(|| format!("无法解析 {}", path.display()))?;
+        let mut map = std::collections::HashMap::new();
+        for item in values {
+            let (key, value) = item.with_context(|| format!("{} 格式错误", path.display()))?;
+            map.insert(key, value);
+        }
+        Ok(map)
     }
 
     pub fn read_config(&self) -> Result<SyncConfig> {
@@ -159,12 +172,33 @@ impl AppPaths {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temp = path.with_extension("json.tmp");
+        let temp = temp_path(path);
         let text = serde_json::to_string_pretty(value)?;
         std::fs::write(&temp, format!("{text}\n"))
             .with_context(|| format!("无法写入 {}", temp.display()))?;
         std::fs::rename(&temp, path).with_context(|| format!("无法替换 {}", path.display()))?;
         Ok(())
+    }
+}
+
+/// 同目录临时文件用的进程内单调计数。
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 生成「同目录 + 唯一后缀」的临时文件路径。
+///
+/// 早先用固定名字（`.env.tmp`、`x.json.tmp`）：两个并发保存会写同一个临时文件，
+/// 后写者可能覆盖前者的内容，两次 rename 的先后还会错乱，导致配置回退到旧值。
+/// 带上 pid 与单调计数后，同一进程内的并发写不再互相踩踏（跨进程也不易重名）。
+fn temp_path(path: &Path) -> PathBuf {
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.{seq}.tmp", std::process::id()));
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
     }
 }
 
@@ -200,6 +234,26 @@ fn user_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 进程环境值，去掉首尾空白；空串按「未设置」处理。
+pub fn process_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 读取密钥：先看 `.env` 内存映射，再退回进程环境。
+///
+/// `env` 由 `AppState` 在保存配置后刷新；桌面版凭据只写进 `.env`（不写进程
+/// 环境），所以这里以映射为准。命令行版没有映射，走 `process_env` 即可。
+pub fn env_or_map(env: &std::collections::HashMap<String, String>, key: &str) -> String {
+    env.get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| process_env(key))
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------- 数据源
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,11 +282,19 @@ fn default_true() -> bool {
 }
 
 impl DataSource {
+    /// 密码：进程环境优先（与 Python 版一致），其次查 `.env` 映射。
+    ///
+    /// 桌面版不再把 `.env` 回写进程环境，改由 `AppState.env` 提供；
+    /// 映射为空时（命令行版）行为与原来完全相同。
+    pub fn password_with(&self, env: &std::collections::HashMap<String, String>) -> String {
+        match process_env(&self.password_env).or_else(|| process_env("DB_PASSWORD")) {
+            Some(value) => value,
+            None => env_or_map(env, &self.password_env),
+        }
+    }
+
     pub fn password(&self) -> String {
-        std::env::var(&self.password_env)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| std::env::var("DB_PASSWORD").unwrap_or_default())
+        self.password_with(&std::collections::HashMap::new())
     }
 }
 
@@ -383,44 +445,54 @@ impl Default for RuntimeSettings {
 impl RuntimeSettings {
     /// 取值优先级：界面设置 > `.env` > 默认值。
     /// 服务端口例外——命令行显式设置 `DASHBOARD_PORT` 时以命令行为准。
-    pub fn effective(raw: Option<&Self>) -> Self {
+    ///
+    /// `env` 是 `.env` 内存映射：桌面版保存后立即生效靠它；命令行版传空映射，
+    /// 只读进程环境，行为不变。
+    pub fn effective_with(raw: Option<&Self>, env: &EnvMap) -> Self {
         let mut settings = raw.cloned().unwrap_or_default();
 
         // 端口属于启动参数：命令行显式给出时，意图强于界面里保存的值。
-        if let Some(value) = env_string("DASHBOARD_PORT") {
+        if let Some(value) = env_lookup(env, "DASHBOARD_PORT") {
             if let Ok(port) = value.parse::<u16>() {
                 settings.dashboard_port = port;
             }
         }
 
-        if let Some(value) = env_string("DB_QUERY_TIMEOUT") {
+        if let Some(value) = env_lookup(env, "DB_QUERY_TIMEOUT") {
             if let Ok(parsed) = value.parse::<u64>() {
                 settings.query_timeout = parsed.clamp(1, 600);
             }
         }
-        if let Some(value) = env_string("SYNC_NULL_POLICY") {
+        if let Some(value) = env_lookup(env, "SYNC_NULL_POLICY") {
             if let Ok(policy) = NullPolicy::parse(&value) {
                 settings.null_policy = policy.as_str().to_string();
             }
         }
-        if let Some(value) = env_string("SYNC_TIMEZONE_OFFSET") {
+        if let Some(value) = env_lookup(env, "SYNC_TIMEZONE_OFFSET") {
             if let Ok(parsed) = value.parse::<f64>() {
                 if (-12.0..=14.0).contains(&parsed) {
                     settings.timezone_offset = parsed;
                 }
             }
         }
-        if let Some(value) = env_string("SYNC_SCHEDULE_ENABLED") {
+        if let Some(value) = env_lookup(env, "SYNC_SCHEDULE_ENABLED") {
             settings.schedule_enabled = matches!(
                 value.to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
         }
-        if let Some(value) = env_u64("SYNC_SCHEDULE_INTERVAL_MINUTES") {
-            settings.schedule_interval_minutes = value.clamp(1, 10080);
+        if let Some(value) = env_lookup(env, "SYNC_SCHEDULE_INTERVAL_MINUTES") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                settings.schedule_interval_minutes = parsed.clamp(1, 10080);
+            }
         }
 
         settings
+    }
+
+    /// 只读进程环境的便捷入口（命令行版用）。
+    pub fn effective(raw: Option<&Self>) -> Self {
+        Self::effective_with(raw, &EnvMap::new())
     }
 
     pub fn null_policy_kind(&self) -> NullPolicy {
@@ -428,15 +500,15 @@ impl RuntimeSettings {
     }
 }
 
-fn env_string(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
+/// `.env` 的键值映射类型别名。
+pub type EnvMap = std::collections::HashMap<String, String>;
+
+/// 读取一个环境项：`.env` 映射优先，其次进程环境，最后放弃。
+fn env_lookup(env: &EnvMap, key: &str) -> Option<String> {
+    env.get(key)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn env_u64(key: &str) -> Option<u64> {
-    env_string(key).and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| process_env(key))
 }
 
 // ------------------------------------------------------------ 顶层配置

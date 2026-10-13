@@ -8,13 +8,39 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use sqlserver_to_feishu::config::{
-    password_env_key, AppPaths, ColumnMapping, DataSource, Incremental, JobState, RuntimeSettings,
-    SyncConfig, SyncJob, SyncState, TargetConfig,
+    env_or_map, password_env_key, AppPaths, ColumnMapping, DataSource, EnvMap, Incremental,
+    JobState, RuntimeSettings, SyncConfig, SyncJob, SyncState, TargetConfig,
 };
 use sqlserver_to_feishu::{feishu, mssql};
 
+/// 应用级共享状态。
+///
+/// `config_lock` 串行化「读配置 → 改配置 → 写回」这一整套动作。桌面端多个
+/// 命令可能同时触发（用户连点保存、后台自动刷新），没有锁时两次读改写会
+/// 用后一次的结果覆盖前一次，用户会莫名丢改动。用标准库锁就够：这些命令
+/// 体内没有 `.await`，不会把非 `Send` 的 guard 跨线程持有。
 pub struct AppState {
     pub paths: AppPaths,
+    pub config_lock: std::sync::Mutex<()>,
+}
+
+impl AppState {
+    pub fn new(paths: AppPaths) -> Self {
+        Self {
+            paths,
+            config_lock: std::sync::Mutex::new(()),
+        }
+    }
+}
+
+/// 取配置锁。锁中毒只可能来自持锁线程 panic，而本项目 `panic = "abort"`，
+/// 正常情况下根本走不到这里；即便如此也退化为「继续用」，绝不 `unwrap()`
+/// 让它变成一次硬终止。
+fn lock_guard(state: &AppState) -> std::sync::MutexGuard<'_, ()> {
+    state
+        .config_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 type CmdResult<T> = Result<T, String>;
@@ -54,10 +80,12 @@ pub struct Workspace {
     pub config: SyncConfig,
 }
 
-fn env_value(key: &str) -> String {
-    std::env::var(key)
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default()
+/// 直接读 `.env` 文件解析出的映射，而不是进程环境变量。
+///
+/// 桌面端在运行期不再往进程环境里写值（多线程运行时下 `set_var` 是未定义
+/// 行为），因此所有读取都走这里，界面改完设置立即生效、无需重启。
+fn env_value(env: &EnvMap, key: &str) -> String {
+    env_or_map(env, key)
 }
 
 fn config_of(paths: &AppPaths) -> CmdResult<SyncConfig> {
@@ -65,6 +93,7 @@ fn config_of(paths: &AppPaths) -> CmdResult<SyncConfig> {
 }
 
 fn workspace_of(paths: &AppPaths) -> CmdResult<Workspace> {
+    let env = paths.env_map().map_err(fail)?;
     Ok(Workspace {
         base_dir: paths.base_dir.display().to_string(),
         config_path: paths.config_path().display().to_string(),
@@ -72,12 +101,12 @@ fn workspace_of(paths: &AppPaths) -> CmdResult<Workspace> {
         state_path: paths.state_path().display().to_string(),
         log_path: paths.log_path().display().to_string(),
         feishu: FeishuView {
-            app_id: env_value("FEISHU_APP_ID"),
-            base_url: env_value("FEISHU_BASE_URL"),
-            base_app_token: env_value("FEISHU_BASE_APP_TOKEN"),
-            base_table_id: env_value("FEISHU_BASE_TABLE_ID"),
-            base_view_id: env_value("FEISHU_BASE_VIEW_ID"),
-            app_secret_set: !env_value("FEISHU_APP_SECRET").is_empty(),
+            app_id: env_value(&env, "FEISHU_APP_ID"),
+            base_url: env_value(&env, "FEISHU_BASE_URL"),
+            base_app_token: env_value(&env, "FEISHU_BASE_APP_TOKEN"),
+            base_table_id: env_value(&env, "FEISHU_BASE_TABLE_ID"),
+            base_view_id: env_value(&env, "FEISHU_BASE_VIEW_ID"),
+            app_secret_set: !env_value(&env, "FEISHU_APP_SECRET").is_empty(),
         },
         config: config_of(paths)?,
     })
@@ -107,6 +136,7 @@ pub struct FeishuInput {
 
 #[tauri::command]
 pub async fn save_feishu(state: State<'_, AppState>, input: FeishuInput) -> CmdResult<Workspace> {
+    let _guard = lock_guard(&state);
     let paths = &state.paths;
     let mut updates = vec![
         ("FEISHU_APP_ID".to_string(), input.app_id.trim().to_string()),
@@ -136,17 +166,17 @@ pub async fn save_feishu(state: State<'_, AppState>, input: FeishuInput) -> CmdR
         ));
     }
     paths.update_env(&updates).map_err(fail)?;
-    paths.reload_env().map_err(fail)?;
     workspace_of(paths)
 }
 
 #[tauri::command]
-pub async fn test_feishu(_state: State<'_, AppState>) -> CmdResult<Vec<String>> {
-    let target = feishu::FeishuClient::target_from_env().map_err(fail)?;
+pub async fn test_feishu(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+    let env = state.paths.env_map().map_err(fail)?;
+    let target = feishu::FeishuClient::target_from_map(&env).map_err(fail)?;
     if target.app_token.is_empty() {
         return Err("还没填多维表格链接或 App Token".to_string());
     }
-    let client = feishu::FeishuClient::from_env().map_err(fail)?;
+    let client = feishu::FeishuClient::from_map(&env).map_err(fail)?;
 
     let tables = client.list_tables(&target.app_token).await.map_err(fail)?;
     let mut lines = vec![format!(
@@ -202,6 +232,7 @@ pub async fn save_settings(
     state: State<'_, AppState>,
     settings: RuntimeSettings,
 ) -> CmdResult<Workspace> {
+    let _guard = lock_guard(&state);
     let paths = &state.paths;
     let mut config = config_of(paths)?;
     config.settings = settings;
@@ -227,6 +258,7 @@ pub struct SourceInput {
 
 #[tauri::command]
 pub async fn save_source(state: State<'_, AppState>, input: SourceInput) -> CmdResult<Workspace> {
+    let _guard = lock_guard(&state);
     let paths = &state.paths;
     let mut config = config_of(paths)?;
 
@@ -236,11 +268,12 @@ pub async fn save_source(state: State<'_, AppState>, input: SourceInput) -> CmdR
         input.id.trim().to_string()
     };
 
+    // 密码写进 `.env` 后无需回写进程环境：读取端每次都现读文件，
+    // 「改完即生效」的效果不变，又避开了运行期 `set_var` 的未定义行为。
     if !input.password.is_empty() {
         paths
             .update_env(&[(password_env_key(&id), input.password.clone())])
             .map_err(fail)?;
-        paths.reload_env().map_err(fail)?;
     }
 
     let source = DataSource {
@@ -264,6 +297,7 @@ pub async fn save_source(state: State<'_, AppState>, input: SourceInput) -> CmdR
 
 #[tauri::command]
 pub async fn delete_source(state: State<'_, AppState>, id: String) -> CmdResult<Workspace> {
+    let _guard = lock_guard(&state);
     let paths = &state.paths;
     let mut config = config_of(paths)?;
 
@@ -307,15 +341,21 @@ fn source_of(config: &SyncConfig, id: &str) -> CmdResult<DataSource> {
 #[tauri::command]
 pub async fn test_source(state: State<'_, AppState>, id: String) -> CmdResult<Vec<String>> {
     let config = config_of(&state.paths)?;
+    let env = state.paths.env_map().map_err(fail)?;
+    let settings = RuntimeSettings::effective_with(Some(&config.settings), &env);
     let source = source_of(&config, &id)?;
-    let mut client = mssql::connect(&source).await.map_err(fail)?;
-    mssql::ping(&mut client).await.map_err(fail)?;
+    let mut client = mssql::connect_from_env(&source, &env).await.map_err(fail)?;
+    mssql::ping(&mut client, settings.query_timeout)
+        .await
+        .map_err(fail)?;
 
     let mut lines = vec![format!(
         "连接成功：{}:{}/{}（用户 {}）",
         source.server, source.port, source.database, source.user
     )];
-    let tables = mssql::list_tables(&mut client).await.map_err(fail)?;
+    let tables = mssql::list_tables(&mut client, settings.query_timeout)
+        .await
+        .map_err(fail)?;
     lines.push(format!("可访问的表与视图共 {} 个", tables.len()));
     Ok(lines)
 }
@@ -323,9 +363,13 @@ pub async fn test_source(state: State<'_, AppState>, id: String) -> CmdResult<Ve
 #[tauri::command]
 pub async fn list_databases(state: State<'_, AppState>, id: String) -> CmdResult<Vec<String>> {
     let config = config_of(&state.paths)?;
+    let env = state.paths.env_map().map_err(fail)?;
+    let settings = RuntimeSettings::effective_with(Some(&config.settings), &env);
     let source = source_of(&config, &id)?;
-    let mut client = mssql::connect(&source).await.map_err(fail)?;
-    mssql::list_databases(&mut client).await.map_err(fail)
+    let mut client = mssql::connect_from_env(&source, &env).await.map_err(fail)?;
+    mssql::list_databases(&mut client, settings.query_timeout)
+        .await
+        .map_err(fail)
 }
 
 #[derive(Debug, Serialize)]
@@ -338,9 +382,11 @@ pub struct TableOption {
 #[tauri::command]
 pub async fn list_tables(state: State<'_, AppState>, id: String) -> CmdResult<Vec<TableOption>> {
     let config = config_of(&state.paths)?;
+    let env = state.paths.env_map().map_err(fail)?;
+    let settings = RuntimeSettings::effective_with(Some(&config.settings), &env);
     let source = source_of(&config, &id)?;
-    let mut client = mssql::connect(&source).await.map_err(fail)?;
-    Ok(mssql::list_tables(&mut client)
+    let mut client = mssql::connect_from_env(&source, &env).await.map_err(fail)?;
+    Ok(mssql::list_tables(&mut client, settings.query_timeout)
         .await
         .map_err(fail)?
         .into_iter()
@@ -367,18 +413,22 @@ pub async fn list_columns(
     table: String,
 ) -> CmdResult<Vec<ColumnOption>> {
     let config = config_of(&state.paths)?;
+    let env = state.paths.env_map().map_err(fail)?;
+    let settings = RuntimeSettings::effective_with(Some(&config.settings), &env);
     let source = source_of(&config, &id)?;
-    let mut client = mssql::connect(&source).await.map_err(fail)?;
-    Ok(mssql::list_columns(&mut client, &schema, &table)
-        .await
-        .map_err(fail)?
-        .into_iter()
-        .map(|column| ColumnOption {
-            name: column.name,
-            data_type: column.data_type,
-            nullable: column.nullable,
-        })
-        .collect())
+    let mut client = mssql::connect_from_env(&source, &env).await.map_err(fail)?;
+    Ok(
+        mssql::list_columns(&mut client, &schema, &table, settings.query_timeout)
+            .await
+            .map_err(fail)?
+            .into_iter()
+            .map(|column| ColumnOption {
+                name: column.name,
+                data_type: column.data_type,
+                nullable: column.nullable,
+            })
+            .collect(),
+    )
 }
 
 // ------------------------------------------------------------------ 任务
@@ -403,6 +453,7 @@ pub struct JobInput {
 
 #[tauri::command]
 pub async fn save_job(state: State<'_, AppState>, input: JobInput) -> CmdResult<Workspace> {
+    let _guard = lock_guard(&state);
     let paths = &state.paths;
     let mut config = config_of(paths)?;
     if config.sources.iter().all(|item| item.id != input.source_id) {
@@ -421,11 +472,24 @@ pub async fn save_job(state: State<'_, AppState>, input: JobInput) -> CmdResult<
         input.id.trim().to_string()
     };
 
+    // 空 Schema 一律落到 `dbo`，与 Python 版 `validate_job` 的
+    // `job.get("schema") or "dbo"` 一致。两边若不一致，同一个任务在
+    // 两个版本里会算出不同的指纹，增量游标来回失效、查询生成也不会补
+    // 上默认架构。
+    let schema = {
+        let trimmed = input.schema.trim();
+        if trimmed.is_empty() {
+            "dbo".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+
     let job = SyncJob {
         id: id.clone(),
         name: input.name.trim().to_string(),
         source_id: input.source_id.clone(),
-        schema: input.schema.trim().to_string(),
+        schema,
         table: input.table.trim().to_string(),
         enabled: input.enabled,
         columns: input.columns,
@@ -452,6 +516,7 @@ pub async fn save_job(state: State<'_, AppState>, input: JobInput) -> CmdResult<
 
 #[tauri::command]
 pub async fn delete_job(state: State<'_, AppState>, id: String) -> CmdResult<Workspace> {
+    let _guard = lock_guard(&state);
     let paths = &state.paths;
     let mut config = config_of(paths)?;
     config.jobs.retain(|item| item.id != id);
@@ -506,6 +571,7 @@ pub async fn reset_job_state(
     state: State<'_, AppState>,
     id: String,
 ) -> CmdResult<Vec<JobStateView>> {
+    let _guard = lock_guard(&state);
     let paths = &state.paths;
     let state_path = paths.state_path();
     let mut sync_state = SyncState::load(&state_path).map_err(fail)?;

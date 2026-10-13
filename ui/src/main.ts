@@ -65,6 +65,8 @@ interface AppState {
   logs: string[];
   busy: boolean;
   toast: { kind: 'ok' | 'err'; text: string } | null;
+  /** 启动阶段的致命错误（例如缺少桌面运行时）；非空时整个主区只显示这条说明。 */
+  fatal: string | null;
 }
 
 const state: AppState = {
@@ -80,7 +82,14 @@ const state: AppState = {
   logs: [],
   busy: false,
   toast: null,
+  fatal: null,
 };
+
+// run() 的单飞行锁：同一时刻只允许一个操作在跑。
+// 放在模块层而不是 state 上，是为了「点击触发器」能在 render() 之外直接短路，
+// 也不必先把状态写进 UI 再拦截。
+let inFlight = false;
+let inFlightLabel = '';
 
 // -------------------------------------------------------------- 小工具
 
@@ -133,6 +142,18 @@ const VIEWS: Array<{ id: View; label: string }> = [
 ];
 
 function render(): void {
+  if (state.fatal) {
+    // 启动就失败时不要渲染整个外壳：侧边栏和导航都依赖工作区数据，
+    // 直接给一个能读懂的独立面板，比留一个空转的界面更诚实。
+    app.innerHTML = `
+      <div class="fatal" role="alert">
+        <h1>无法启动桌面界面</h1>
+        <p>${escapeHtml(state.fatal)}</p>
+      </div>
+    `;
+    return;
+  }
+
   const config = state.ws?.config;
   const nav = VIEWS.map(
     (view) =>
@@ -145,7 +166,9 @@ function render(): void {
     ? ''
     : `<div class="banner err">没有检测到桌面运行时。请通过桌面应用启动；直接用浏览器打开这一页时无法读写配置。</div>`;
   const toast = state.toast
-    ? `<div class="banner ${state.toast.kind === 'ok' ? 'ok' : 'err'}">${escapeHtml(state.toast.text)}</div>`
+    ? `<div class="banner ${state.toast.kind === 'ok' ? 'ok' : 'err'}" role="${
+        state.toast.kind === 'ok' ? 'status' : 'alert'
+      }" aria-live="${state.toast.kind === 'ok' ? 'polite' : 'assertive'}">${escapeHtml(state.toast.text)}</div>`
     : '';
 
   app.innerHTML = `
@@ -162,7 +185,9 @@ function render(): void {
       ${renderView()}
       ${state.output.length > 0 ? renderOutput() : ''}
     </main>
-    <div class="busy${state.busy ? '' : ' hidden'}">处理中…</div>
+    <div class="busy${state.busy ? '' : ' hidden'}" role="status" aria-live="polite">${
+      state.busy && inFlightLabel ? `处理中：${escapeHtml(inFlightLabel)}` : '处理中…'
+    }</div>
   `;
 }
 
@@ -276,10 +301,10 @@ function renderSources(): string {
           <div class="muted">${escapeHtml(source.server)}:${source.port} / ${escapeHtml(source.database || '(默认库)')} · 用户 ${escapeHtml(source.user || '(Windows 认证)')}</div>
           <div class="muted">关联任务 ${jobCount} 个 · 密码变量 <code>${escapeHtml(source.password_env)}</code></div>
           <div class="actions">
-            <button data-action="edit-source" data-id="${source.id}">编辑</button>
-            <button data-action="test-source" data-id="${source.id}">测试连接</button>
-            <button data-action="scan-tables" data-id="${source.id}">扫描表</button>
-            <button data-action="delete-source" data-id="${source.id}" class="danger">删除</button>
+            <button data-action="edit-source" data-id="${escapeHtml(source.id)}">编辑</button>
+            <button data-action="test-source" data-id="${escapeHtml(source.id)}">测试连接</button>
+            <button data-action="scan-tables" data-id="${escapeHtml(source.id)}">扫描表</button>
+            <button data-action="delete-source" data-id="${escapeHtml(source.id)}" class="danger">删除</button>
           </div>
         </div>`;
           })
@@ -336,7 +361,7 @@ function renderSourceEditor(): string {
         <div class="actions">
           <button type="submit" class="primary">保存</button>
           <button type="button" data-action="cancel-source">取消</button>
-          ${isNew ? '' : `<button type="button" data-action="load-databases" data-id="${draft.id}">列出数据库</button>`}
+          ${isNew ? '' : `<button type="button" data-action="load-databases" data-id="${escapeHtml(draft.id)}">列出数据库</button>`}
         </div>
       </form>
       ${
@@ -370,9 +395,9 @@ function renderJobs(): string {
             job.incremental.enabled ? ` · 增量字段 <code>${escapeHtml(job.incremental.column)}</code>` : ' · 全量'
           }${cursor ? ' · 有增量游标' : ''}</div>
           <div class="actions">
-            <button data-action="edit-job" data-id="${job.id}">编辑</button>
-            <button data-action="reset-job-state" data-id="${job.id}">重置增量游标</button>
-            <button data-action="delete-job" data-id="${job.id}" class="danger">删除</button>
+            <button data-action="edit-job" data-id="${escapeHtml(job.id)}">编辑</button>
+            <button data-action="reset-job-state" data-id="${escapeHtml(job.id)}">重置增量游标</button>
+            <button data-action="delete-job" data-id="${escapeHtml(job.id)}" class="danger">删除</button>
           </div>
         </div>`;
           })
@@ -395,7 +420,7 @@ function renderJobEditor(): string {
   const sourceOptions = config.sources
     .map(
       (source) =>
-        `<option value="${source.id}"${source.id === draft.source_id ? ' selected' : ''}>${escapeHtml(source.name || source.server)}</option>`,
+        `<option value="${escapeHtml(source.id)}"${source.id === draft.source_id ? ' selected' : ''}>${escapeHtml(source.name || source.server)}</option>`,
     )
     .join('');
 
@@ -512,7 +537,7 @@ function renderLog(): string {
       ? '<p class="muted">日志为空，点「刷新」重新读取。</p>'
       : `<pre class="log">${escapeHtml(state.logs.join('\n'))}</pre>`;
   return `
-    <section class="card">
+    <section class="card" role="region" aria-label="运行日志" aria-live="off">
       <div class="card-head"><h1>运行日志</h1><button data-action="refresh-log">刷新</button></div>
       ${body}
     </section>
@@ -533,7 +558,16 @@ function renderOutput(): string {
 
 // ------------------------------------------------------------------ 动作
 
+// 单飞行守卫：执行期间再触发一律忽略，并在状态里说明原因，
+// 避免「快速连点 / 键盘回车」并发发出多个执行请求。
 async function run(label: string, task: () => Promise<void>): Promise<void> {
+  if (inFlight) {
+    state.toast = { kind: 'err', text: `「${inFlightLabel}」还在处理中，请等它结束。` };
+    render();
+    return;
+  }
+  inFlight = true;
+  inFlightLabel = label;
   state.busy = true;
   state.toast = null;
   render();
@@ -542,6 +576,10 @@ async function run(label: string, task: () => Promise<void>): Promise<void> {
   } catch (error) {
     state.toast = { kind: 'err', text: `${label}失败：${describeError(error)}` };
   } finally {
+    // 无论成功、失败还是 task 抛错，都必须在 finally 里解锁，
+    // 否则一次异常就会让界面永久卡在 in-flight 状态。
+    inFlight = false;
+    inFlightLabel = '';
     state.busy = false;
     render();
   }
@@ -759,16 +797,42 @@ async function handleAction(action: string, id: string): Promise<void> {
         if (!draft) return;
         if (!draft.source_id) throw new Error('请先选择数据源');
         if (!draft.table) throw new Error('请先填表名');
-        const columns = await api.listColumns(draft.source_id, draft.schema, draft.table);
-        draft.columns = columns.map((column) => ({
+
+        // 记录发送请求时的目标快照：草稿对象本身，以及它指向的数据源 / 表。
+        // 等待期间用户可能改选数据源、改表名，或直接关面板 / 换任务，
+        // 回来后只要对不上就丢弃这次响应，绝不把 A 的字段套到 B 上。
+        const draftAtSend = draft;
+        const sourceAtSend = draft.source_id;
+        const schemaAtSend = draft.schema;
+        const tableAtSend = draft.table;
+
+        const columns = await api.listColumns(sourceAtSend, schemaAtSend, tableAtSend);
+
+        const stillSameDraft = state.jobDraft === draftAtSend;
+        const formNow = document.querySelector<HTMLFormElement>('form[data-form="job"]');
+        const stillSameTarget =
+          stillSameDraft &&
+          draftAtSend.source_id === sourceAtSend &&
+          draftAtSend.schema === schemaAtSend &&
+          draftAtSend.table === tableAtSend &&
+          (formNow === null ||
+            (inputValue(formNow, 'source_id') === sourceAtSend &&
+              (inputValue(formNow, 'schema') || 'dbo') === schemaAtSend &&
+              inputValue(formNow, 'table') === tableAtSend));
+        if (!stillSameTarget) {
+          // 目标已变，静默丢弃，不触碰 UI。
+          return;
+        }
+
+        draftAtSend.columns = columns.map((column) => ({
           source: column.name,
           target: column.name,
           sql_type: column.data_type,
           nullable: column.nullable,
           included: true,
         }));
-        if (!draft.unique_key) {
-          draft.unique_key = columns.length > 0 ? columns[0].name : '';
+        if (!draftAtSend.unique_key) {
+          draftAtSend.unique_key = columns.length > 0 ? columns[0].name : '';
         }
         state.toast = { kind: 'ok', text: `扫描到 ${columns.length} 个字段` };
       });
@@ -873,6 +937,9 @@ app.addEventListener('submit', (event) => {
 
 async function boot(): Promise<void> {
   if (!desktopRuntimeAvailable()) {
+    state.fatal =
+      '这是桌面应用的界面，需要在 Tauri 桌面应用里打开。当前没有检测到桌面运行时（window.__TAURI__），' +
+      '无法读取配置或调用同步内核；直接用浏览器打开这一页时功能不可用。';
     render();
     return;
   }

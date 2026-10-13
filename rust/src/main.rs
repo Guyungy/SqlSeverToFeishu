@@ -82,10 +82,10 @@ async fn probe_sql(paths: &AppPaths) -> Result<()> {
             source.name, source.server, source.port, source.database
         );
         let mut client = mssql::connect(source).await?;
-        mssql::ping(&mut client).await?;
+        mssql::ping(&mut client, settings.query_timeout).await?;
         println!("      连通性 OK");
 
-        match mssql::list_databases(&mut client).await {
+        match mssql::list_databases(&mut client, settings.query_timeout).await {
             Ok(databases) => println!(
                 "      可访问数据库 {} 个：{}",
                 databases.len(),
@@ -98,7 +98,7 @@ async fn probe_sql(paths: &AppPaths) -> Result<()> {
             Err(error) => println!("      读取数据库列表失败：{error}"),
         }
 
-        let tables = mssql::list_tables(&mut client).await?;
+        let tables = mssql::list_tables(&mut client, settings.query_timeout).await?;
         println!("      表与视图共 {} 个", tables.len());
         for table in tables.iter().take(10) {
             println!("        {} [{}]", table.qualified(), table.kind);
@@ -108,7 +108,13 @@ async fn probe_sql(paths: &AppPaths) -> Result<()> {
         }
 
         if let Some(first) = tables.first() {
-            let columns = mssql::list_columns(&mut client, &first.schema, &first.name).await?;
+            let columns = mssql::list_columns(
+                &mut client,
+                &first.schema,
+                &first.name,
+                settings.query_timeout,
+            )
+            .await?;
             println!(
                 "      {} 有 {} 个字段：{}",
                 first.qualified(),

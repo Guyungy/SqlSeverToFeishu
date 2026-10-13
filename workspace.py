@@ -261,7 +261,11 @@ def validate_source(source: Dict[str, Any]) -> Dict[str, Any]:
     port = int(source.get("port") or 1433)
     if not 1 <= port <= 65535:
         raise ValueError("SQL Server 端口必须在 1-65535 之间")
-    password_key = str(source.get("password_env") or password_env_key(source_id))
+    password_key = _clean_text(
+        source.get("password_env") or password_env_key(source_id), "密码环境变量名", 128
+    )
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", password_key):
+        raise ValueError("密码环境变量名只能包含字母、数字与下划线，且不能以数字开头")
     return {
         "id": source_id,
         "name": _clean_text(source.get("name"), "数据源名称"),

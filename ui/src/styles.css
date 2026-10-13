@@ -485,3 +485,31 @@ pre.log {
 .hidden {
   display: none;
 }
+
+/* ------------------------------------------------------ 启动失败 */
+
+/* #app 是两列网格（侧边栏 + 主区）。启动失败时里面只有一个节点，
+   让它横跨两列并居中，别被挤进 216px 的侧边栏里。 */
+.fatal {
+  grid-column: 1 / -1;
+  align-self: start;
+  justify-self: center;
+  margin: 56px 16px 0;
+  max-width: 560px;
+  padding: 22px 26px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--danger);
+  border-radius: var(--radius);
+}
+
+.fatal h1 {
+  margin: 0 0 10px;
+  font-size: 17px;
+  color: var(--danger);
+}
+
+.fatal p {
+  margin: 0;
+  color: var(--text);
+}

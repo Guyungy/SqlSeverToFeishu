@@ -80,6 +80,18 @@ class WorkspaceConfigTests(unittest.TestCase):
         source = workspace.validate_source({"name": "待选择", "server": "db.local", "database": ""})
         self.assertEqual(source["database"], "master")
 
+    def test_password_env_must_be_a_valid_variable_name(self):
+        # 环境变量名只用于拼接 .env 的键，放开会让配置指向任意变量。
+        for value in ("SQL SOURCE A", "1_BAD", "PASSWORD;DROP", "PASSWORD-X"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                workspace.validate_source({
+                    "name": "订单库", "server": "db.local", "password_env": value,
+                })
+
+    def test_password_env_falls_back_to_a_generated_name(self):
+        source = workspace.validate_source({"name": "订单库", "server": "db.local"})
+        self.assertRegex(source["password_env"], r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 
 class IncrementalTests(unittest.TestCase):
     def test_cursor_round_trip(self):
