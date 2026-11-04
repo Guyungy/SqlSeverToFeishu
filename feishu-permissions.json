@@ -1,0 +1,8 @@
+{
+  "scopes": {
+    "tenant": [
+      "bitable:app"
+    ],
+    "user": []
+  }
+}

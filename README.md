@@ -255,6 +255,19 @@ ssh -N -L 15001:127.0.0.1:5001 用户名@服务器IP
 | --- | --- | --- |
 | 查看、评论、编辑和管理多维表格 | `bitable:app` | 列出数据表、读取字段和记录、自动创建数据表和字段、批量新增及更新记录 |
 
+也可以使用权限清单批量导入。在应用后台“权限管理 → 批量导入/导出权限”中，粘贴仓库内权限清单文件的完整内容，确认新增权限后继续发布应用版本。 [权限清单 JSON](feishu-permissions.json)
+
+```json
+{
+  "scopes": {
+    "tenant": [
+      "bitable:app"
+    ],
+    "user": []
+  }
+}
+```
+
 这项权限覆盖当前同步流程用到的多维表格 API。可在下列官方接口文档的“权限要求”中核对。 [列出记录](https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-record/list) · [新增数据表](https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table/create) · [新增字段](https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-field/create) · [批量新增记录](https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-record/batch_create) · [批量更新记录](https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-record/batch_update)
 
 ### 3. 发布应用版本
