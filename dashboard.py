@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, render_template, request
 
-from multi_sync import feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
+from multi_sync import automatic_job, list_primary_key, feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
 from sync import quote_identifier
 from workspace import (
     BASE_DIR,
@@ -507,17 +507,7 @@ def source_columns_api(source_id: str):
             raise ValueError("缺少数据表名")
         source = get_source(load_config(), source_id)
         columns = list_columns(source, schema, table)
-        with sql_connection(source) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT k.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS t "
-                    "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON "
-                    "t.CONSTRAINT_CATALOG = k.CONSTRAINT_CATALOG AND "
-                    "t.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND t.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
-                    "WHERE t.CONSTRAINT_TYPE = 'PRIMARY KEY' AND t.TABLE_SCHEMA = %s AND t.TABLE_NAME = %s "
-                    "ORDER BY k.ORDINAL_POSITION", (schema, table),
-                )
-                primary_key = [row[0] for row in cursor.fetchall()]
+        primary_key = list_primary_key(source, schema, table)
         return jsonify({"ok": True, "columns": columns, "primary_key": primary_key})
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "读取字段失败")}), 400
@@ -552,6 +542,49 @@ def preview_rows_api(source_id: str):
         return jsonify({"ok": False, "message": safe_error(exc, "读取预览失败")}), 400
 
 
+@app.route("/api/jobs/bulk", methods=["POST"])
+def create_bulk_jobs_api():
+    try:
+        tables = (request.get_json(silent=True) or {}).get("tables")
+        if not isinstance(tables, list) or not tables:
+            raise ValueError("请先读取数据表")
+        if any(not isinstance(table, dict) or any(
+            not isinstance(table.get(key), str) or not table[key]
+            for key in ("source_id", "schema", "name")
+        ) for table in tables):
+            raise ValueError("数据表列表格式错误")
+        errors = []
+        created = 0
+        existing_count = 0
+        generated_count = 0
+        with config_lock:
+            config = load_config()
+            identities = {(job["source_id"], job["schema"], job["table"]) for job in config["jobs"]}
+            for table in tables:
+                try:
+                    identity = (table["source_id"], table["schema"], table["name"])
+                    if identity in identities:
+                        existing_count += 1
+                        continue
+                    source = get_source(config, identity[0])
+                    if not source.get("enabled", True):
+                        raise ValueError("数据源已停用")
+                    job = automatic_job(source, identity[1], identity[2])
+                    # Validate each task before adding it, so errors are isolated by table.
+                    job = validate_config({**config, "jobs": [job]})["jobs"][0]
+                    config["jobs"].append(job)
+                    identities.add(identity)
+                    created += 1
+                    generated_count += int("generated_key" in job)
+                except Exception as exc:
+                    errors.append({"table": table, "message": safe_error(exc, "创建任务失败")})
+            saved = save_config(config)
+        return jsonify({"ok": True, "config": public_config(saved), "created": created,
+                        "existing": existing_count, "generated": generated_count, "errors": errors})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "批量创建任务失败")}), 400
+
+
 @app.route("/api/jobs", methods=["POST"])
 def save_jobs_api():
     try:
@@ -563,7 +596,8 @@ def save_jobs_api():
         for job in validated["jobs"]:
             source = get_source(validated, job["source_id"])
             metadata = {item["name"] for item in list_columns(source, job["schema"], job["table"])}
-            missing = [item["source"] for item in job["columns"] if item["source"] not in metadata]
+            missing = [item["source"] for item in job["columns"] if item["source"] not in metadata
+                       and not ("generated_key" in job and item["source"] == job["unique_key"])]
             if missing:
                 raise ValueError(f"任务 {job['name']} 中字段已不存在: {', '.join(missing)}")
         with config_lock:

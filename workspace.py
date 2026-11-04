@@ -316,6 +316,15 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
     incremental_column = str(incremental.get("column") or "").strip()
     if incremental_enabled and incremental_column not in source_names:
         raise ValueError("增量字段必须包含在已勾选字段中")
+    generated_key = job.get("generated_key")
+    if generated_key is not None:
+        if not isinstance(generated_key, dict) or not isinstance(generated_key.get("columns"), list):
+            raise ValueError("自动行标识配置格式错误")
+        key_columns = generated_key["columns"]
+        if any(not isinstance(name, str) or name not in source_names or name == unique_key for name in key_columns):
+            raise ValueError("自动行标识引用了无效字段")
+        if incremental_enabled:
+            raise ValueError("自动行标识任务使用全量同步")
     target = job.get("target") or {}
     target_mode = target.get("mode") or "auto"
     if target_mode not in {"auto", "existing"}:
@@ -323,7 +332,7 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
     table_id = str(target.get("table_id") or "").strip()
     if target_mode == "existing" and not table_id:
         raise ValueError("选择已有飞书表时必须指定 Table ID")
-    return {
+    result = {
         "id": job_id,
         "name": str(job.get("name") or f"{job.get('schema', 'dbo')}.{job.get('table', '')}").strip(),
         "source_id": source_id,
@@ -340,6 +349,10 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
             "auto_create_fields": bool(target.get("auto_create_fields", True)),
         },
     }
+
+    if generated_key is not None:
+        result["generated_key"] = {"columns": list(generated_key["columns"])}
+    return result
 
 
 def validate_config(data: Dict[str, Any]) -> Dict[str, Any]:

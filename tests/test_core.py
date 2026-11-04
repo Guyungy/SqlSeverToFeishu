@@ -788,5 +788,113 @@ class DefaultDiscoveryTests(unittest.TestCase):
         metadata.assert_not_called()
 
 
+class AutomaticTaskTests(unittest.TestCase):
+    def automatic(self, primary):
+        source = workspace.validate_config(WorkspaceConfigTests().sample())["sources"][0]
+        columns = [{"name": "Id", "sql_type": "int", "nullable": False},
+                   {"name": "Name", "sql_type": "nvarchar", "nullable": True}]
+        with mock.patch.object(multi_sync, "list_columns", return_value=columns), \
+             mock.patch.object(multi_sync, "list_primary_key", return_value=primary):
+            job = multi_sync.automatic_job(source, "dbo", "Orders")
+        job = workspace.validate_job(job, [source["id"]])
+        return source, job
+
+    def test_single_primary_key_selects_all_columns(self):
+        _, job = self.automatic(["Id"])
+        self.assertEqual(job["unique_key"], "Id")
+        self.assertEqual(len(job["columns"]), 2)
+        self.assertNotIn("generated_key", job)
+        self.assertTrue(job["enabled"])
+
+    def test_composite_primary_key_remains_stable_when_other_values_change(self):
+        _, job = self.automatic(["Id", "Name"])
+        rows = [{"Id": 1, "Name": "A", "Extra": "old"}, {"Id": 2, "Name": "A", "Extra": "old"}]
+        multi_sync.add_generated_row_keys(rows, job)
+        updated = [{"Id": 2, "Name": "A", "Extra": "new"}, {"Id": 1, "Name": "A", "Extra": "new"}]
+        multi_sync.add_generated_row_keys(updated, job)
+        self.assertEqual(rows[0][job["unique_key"]], updated[1][job["unique_key"]])
+        self.assertNotEqual(rows[0][job["unique_key"]], rows[1][job["unique_key"]])
+
+    def test_keyless_rows_preserve_nulls_and_duplicates_across_retries(self):
+        _, job = self.automatic([])
+        rows = [{"Id": None, "Name": "A"}, {"Id": None, "Name": "A"}, {"Id": 2, "Name": None}]
+        retry = [dict(row) for row in reversed(rows)]
+        multi_sync.add_generated_row_keys(rows, job)
+        multi_sync.add_generated_row_keys(retry, job)
+        keys = [row[job["unique_key"]] for row in rows]
+        self.assertEqual(len(set(keys)), 3)
+        self.assertEqual(set(keys), {row[job["unique_key"]] for row in retry})
+
+    def test_generated_column_is_not_queried_from_sql(self):
+        source, job = self.automatic([])
+        connection = mock.MagicMock()
+        cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
+        cursor.fetchmany.side_effect = [[{"Id": 1, "Name": "A"}], []]
+        columns = [{"name": "Id"}, {"name": "Name"}]
+        with mock.patch.object(multi_sync, "list_columns", return_value=columns), \
+             mock.patch.object(multi_sync, "sql_connection", return_value=connection):
+            rows, _, incremental = multi_sync.fetch_job_rows(source, job, None)
+        self.assertNotIn(job["unique_key"], cursor.execute.call_args.args[0])
+        self.assertIn(job["unique_key"], rows[0])
+        self.assertFalse(incremental)
+
+    def test_keyless_task_dry_run_handles_duplicate_rows(self):
+        source, job = self.automatic([])
+        config = workspace.validate_config({"sources": [source], "jobs": [job]})
+        connection = mock.MagicMock()
+        cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
+        cursor.fetchmany.side_effect = [[{"Id": None, "Name": "same"}, {"Id": None, "Name": "same"}], []]
+        client = mock.MagicMock()
+        client.list_tables.return_value = []
+        with mock.patch.object(multi_sync, "list_columns", return_value=[{"name": "Id"}, {"name": "Name"}]), \
+             mock.patch.object(multi_sync, "sql_connection", return_value=connection):
+            summary = multi_sync.run_job(client, "app", config, {"jobs": {}}, job, True)
+        self.assertEqual(summary["create"], 2)
+        self.assertEqual(summary["source_rows"], 2)
+        client.batch_create.assert_not_called()
+
+    def test_bulk_reports_failed_table_and_keeps_successful_tasks(self):
+        config = workspace.validate_config(WorkspaceConfigTests().sample())
+        config["jobs"] = []
+        _, job = self.automatic(["Id"])
+        source_id = config["sources"][0]["id"]
+        tables = [{"source_id": source_id, "schema": "dbo", "name": name} for name in ["Orders", "Broken"]]
+        with mock.patch.object(dashboard, "load_config", return_value=config), \
+             mock.patch.object(dashboard, "save_config", side_effect=workspace.validate_config), \
+             mock.patch.object(dashboard, "automatic_job", side_effect=[job, RuntimeError('unavailable')]):
+            response = dashboard.app.test_client().post('/api/jobs/bulk', json={"tables": tables},
+                headers={"Host": "127.0.0.1:5001", "X-CSRF-Token": dashboard.CSRF_TOKEN})
+        data = response.get_json()
+        self.assertEqual(data["created"], 1)
+        self.assertEqual(len(data["errors"]), 1)
+        self.assertEqual(len(data["config"]["jobs"]), 1)
+
+    def test_bulk_creates_all_tasks_once_and_preserves_existing_tasks(self):
+        config = workspace.validate_config(WorkspaceConfigTests().sample())
+        config["jobs"] = []
+        source_id = config["sources"][0]["id"]
+        tables = [{"source_id": source_id, "schema": "dbo", "name": name} for name in ["One", "Two"]]
+        _, template = self.automatic(["Id"])
+        def create(source, schema, table):
+            return {**template, "id": "job_" + table, "table": table, "source_id": source["id"]}
+        def save(value):
+            validated = workspace.validate_config(value)
+            config.update(validated)
+            return validated
+        headers = {"Host": "127.0.0.1:5001", "X-CSRF-Token": dashboard.CSRF_TOKEN}
+        with mock.patch.object(dashboard, "load_config", return_value=config), \
+             mock.patch.object(dashboard, "save_config", side_effect=save), \
+             mock.patch.object(dashboard, "automatic_job", side_effect=create) as automatic:
+            client = dashboard.app.test_client()
+            first = client.post('/api/jobs/bulk', headers=headers, json={"tables": tables}).get_json()
+            second = client.post('/api/jobs/bulk', headers=headers, json={"tables": tables}).get_json()
+        self.assertEqual(first["created"], 2)
+        self.assertEqual(first["errors"], [])
+        self.assertEqual(second["created"], 0)
+        self.assertEqual(second["existing"], 2)
+        self.assertEqual(automatic.call_count, 2)
+        self.assertEqual(len(config["jobs"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

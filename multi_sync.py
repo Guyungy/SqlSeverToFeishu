@@ -84,6 +84,8 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
         "timezone": settings["timezone_offset"],
         "null_policy": settings["null_policy"],
     }
+    if "generated_key" in job:
+        identity["job"]["generated_key"] = job["generated_key"]
     return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -165,6 +167,65 @@ def list_columns(source: Dict[str, Any], schema: str, table: str) -> List[Dict[s
             ]
 
 
+def list_primary_key(source: Dict[str, Any], schema: str, table: str) -> List[str]:
+    with sql_connection(source) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT k.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS t "
+                "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON "
+                "t.CONSTRAINT_CATALOG = k.CONSTRAINT_CATALOG AND "
+                "t.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND t.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
+                "WHERE t.CONSTRAINT_TYPE = 'PRIMARY KEY' AND t.TABLE_SCHEMA = %s AND t.TABLE_NAME = %s "
+                "ORDER BY k.ORDINAL_POSITION", (schema, table),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+
+def automatic_job(source: Dict[str, Any], schema: str, table: str) -> Dict[str, Any]:
+    columns = list_columns(source, schema, table)
+    if not columns:
+        raise ConfigError(f"未找到字段: {schema}.{table}")
+    primary = list_primary_key(source, schema, table)
+    mapped = [{"source": col["name"], "target": col["name"],
+               "sql_type": col["sql_type"], "nullable": col["nullable"]} for col in columns]
+    generated = len(primary) != 1
+    key = primary[0] if not generated else "__sqlfeishu_row_key"
+    names = {col["source"] for col in mapped}
+    while generated and key in names:
+        key += "_"
+    if generated:
+        mapped.append({"source": key, "target": key, "sql_type": "nvarchar", "nullable": False})
+    identity = json.dumps([source["id"], schema, table], ensure_ascii=False)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    target_name = f"{source['name']}_{schema}_{table}"
+    # Keep distinct tables distinct even when their names exceed the target limit.
+    if len(target_name) > 100:
+        target_name = target_name[:74] + "_" + digest
+    job = {
+        "id": f"job_{digest}", "name": f"{source['name']} / {schema}.{table}",
+        "source_id": source["id"], "schema": schema, "table": table, "enabled": True,
+        "columns": mapped, "unique_key": key,
+        "incremental": {"enabled": False, "column": ""},
+        "target": {"mode": "auto", "table_id": "", "table_name": target_name, "auto_create_fields": True},
+    }
+    if generated:
+        job["generated_key"] = {"columns": primary}
+    return job
+
+
+def add_generated_row_keys(rows: List[Dict[str, Any]], job: Dict[str, Any]) -> None:
+    identity_columns = job["generated_key"]["columns"] or [
+        col["source"] for col in job["columns"] if col["source"] != job["unique_key"]
+    ]
+    occurrences: Dict[str, int] = {}
+    for row in rows:
+        identity = json.dumps([(col, row[col]) for col in identity_columns],
+                              ensure_ascii=False, default=str, separators=(",", ":"))
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        occurrences[digest] = occurrences.get(digest, 0) + 1
+        row[job["unique_key"]] = f"{digest}_{occurrences[digest]}"
+
+
 def sql_type_to_feishu(sql_type: str) -> int:
     value = sql_type.lower()
     if value in NUMERIC_TYPES:
@@ -218,7 +279,8 @@ def fetch_job_rows(
     metadata = {item["name"]: item for item in list_columns(source, job["schema"], job["table"])}
     if not metadata:
         raise ConfigError(f"未找到 SQL 表或视图: {job['schema']}.{job['table']}")
-    selected = [item["source"] for item in job["columns"]]
+    selected = [item["source"] for item in job["columns"]
+                if "generated_key" not in job or item["source"] != job["unique_key"]]
     missing = [name for name in selected if name not in metadata]
     if missing:
         raise ConfigError(f"任务 {job['name']} 的 SQL 字段不存在: {', '.join(missing)}")
@@ -240,8 +302,9 @@ def fetch_job_rows(
                 "job_plan", 65,
                 f"{job['name']}：已保存的增量游标与字段 {incremental_column}（{declared_type or '未知类型'}）不匹配，本次改为全量扫描",
             )
-    order_columns = [name for name in (incremental_column, unique_key) if name]
-    query += " ORDER BY " + ", ".join(quote_identifier(name) for name in dict.fromkeys(order_columns))
+    order_columns = [name for name in (incremental_column, unique_key) if name and name in metadata]
+    if order_columns:
+        query += " ORDER BY " + ", ".join(quote_identifier(name) for name in dict.fromkeys(order_columns))
 
     rows: List[Dict[str, Any]] = []
     with sql_connection(source) as conn:
@@ -252,6 +315,8 @@ def fetch_job_rows(
                 if not chunk:
                     break
                 rows.extend(chunk)
+    if "generated_key" in job:
+        add_generated_row_keys(rows, job)
     max_cursor = None
     if incremental_column and rows:
         cursor_values = [row.get(incremental_column) for row in rows if row.get(incremental_column) is not None]
