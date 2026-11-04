@@ -98,11 +98,12 @@
                 <div class="panel-head"><div><p class="kicker">DISCOVERY</p><h2>选择数据库和表</h2></div><button id="scan-tables" class="btn primary">读取数据表</button></div>
                 <div class="inline-form"><label>数据源<select id="builder-source"></select></label><label class="search">筛选表<input id="table-search" placeholder="输入表名"></label></div>
                 <p class="muted">勾选需要同步的表，再逐表配置字段。视图同样支持。</p>
+                <div class="actions wrap"><button id="select-all-tables" class="btn secondary">全选当前筛选表</button><button id="clear-table-selection" class="btn secondary">取消全选</button><button id="configure-selected-tables" class="btn primary">依次配置选中表</button><span id="table-selection-count" class="message"></span></div>
                 <div id="table-list" class="table-list empty">请先选择数据源并读取数据表。</div>
             </div>
 
             <div class="panel" id="job-editor-panel" hidden>
-                <div class="panel-head"><div><p class="kicker">FIELD PICKER</p><h2 id="job-editor-title">配置同步任务</h2></div><button id="select-all-columns" class="btn secondary">全选字段</button></div>
+                <div class="panel-head"><div><p class="kicker">FIELD PICKER</p><h2 id="job-editor-title">配置同步任务</h2></div><div><button id="select-all-columns" class="btn secondary">全选字段</button> <button id="clear-columns" class="btn secondary">取消全选字段</button></div></div>
                 <input id="job-id" type="hidden"><input id="job-schema" type="hidden"><input id="job-table" type="hidden"><input id="job-source-id" type="hidden">
                 <div class="job-settings">
                     <label>任务名称<input id="job-name"></label>
@@ -113,6 +114,7 @@
                 </div>
                 <div class="field-header"><strong>勾选要同步的字段</strong><span>可直接修改右侧飞书字段名</span></div>
                 <div id="column-list" class="column-list"></div>
+                <div class="actions"><button id="preview-rows" class="btn secondary">预览前 10 行</button><span id="preview-message" class="message" aria-live="polite"></span></div><div id="row-preview" style="overflow:auto;max-height:360px"></div>
                 <div class="job-settings bottom">
                     <label>唯一键<select id="unique-key"></select><small>必须非空且唯一</small></label>
                     <label class="toggle-label"><input id="incremental-enabled" type="checkbox"><span>启用增量同步</span><small>首次全量，成功后保存游标</small></label>
@@ -167,6 +169,9 @@
 <script>
 const csrf = document.querySelector('meta[name="csrf-token"]').content;
 const store = { config: {sources: [], jobs: []}, feishu: {}, settings: {}, schedule: {}, settingsDirty: false, states: {}, feishuTables: [], tables: [], columns: [], cursor: 0, running: false };
+const pendingTables = new Map();
+let configurationQueue = [];
+let editorRequest = 0;
 const $ = id => document.getElementById(id);
 async function api(url, options={}) {
     const headers = new Headers(options.headers || {}); headers.set('X-CSRF-Token', csrf);
@@ -260,20 +265,65 @@ $('delete-source').onclick=async()=>{const id=$('source-id').value;if(!confirm('
 
 function renderSourceSelect(){const sel=$('builder-source');const current=sel.value;sel.innerHTML='<option value="">请选择数据源</option>'+store.config.sources.map(s=>`<option value="${s.id}">${escapeHtml(s.name)} / ${escapeHtml(s.database)}</option>`).join('');if(store.config.sources.some(s=>s.id===current))sel.value=current;}
 $('scan-tables').onclick=async()=>{const id=$('builder-source').value;if(!id){$('table-list').textContent='请先选择数据源。';return;} $('table-list').textContent='正在读取表结构...';const d=await api(`/api/sources/${id}/tables`);if(!d.ok){$('table-list').textContent=d.message;return;}store.tables=d.tables||[];renderTables();};
-$('builder-source').onchange=()=>{if(!$('job-editor-panel').hidden){$('job-editor-panel').hidden=true;$('job-source-id').value='';}store.tables=[];$('table-list').className='table-list empty';$('table-list').textContent='已切换数据源，请重新读取数据表。';};
+$('builder-source').onchange=()=>{editorRequest++;pendingTables.clear();configurationQueue=[];updateTableSelection();if(!$('job-editor-panel').hidden){$('job-editor-panel').hidden=true;$('job-source-id').value='';}store.tables=[];$('table-list').className='table-list empty';$('table-list').textContent='已切换数据源，请重新读取数据表。';};
 $('table-search').oninput=renderTables;
-function renderTables(){const q=$('table-search').value.trim().toLowerCase();const sourceId=$('builder-source').value;const items=store.tables.filter(t=>`${t.schema}.${t.name}`.toLowerCase().includes(q));$('table-list').className=items.length?'table-list':'table-list empty';$('table-list').innerHTML=items.length?items.map(t=>{const existing=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===t.schema&&j.table===t.name);return `<div class="table-row"><label><input type="checkbox" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}" ${existing?'checked':''}><span><b>${escapeHtml(t.schema)}.${escapeHtml(t.name)}</b><small>${t.type==='view'?'视图':'数据表'}</small></span></label><button class="btn secondary configure-table" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}">${existing?'编辑字段':'配置字段'}</button></div>`;}).join(''):'没有匹配的数据表。';document.querySelectorAll('.configure-table').forEach(b=>b.onclick=()=>openJobEditor(sourceId,b.dataset.schema,b.dataset.table));document.querySelectorAll('#table-list input[type=checkbox]').forEach(c=>c.onchange=()=>{if(c.checked)openJobEditor(sourceId,c.dataset.schema,c.dataset.table);else removeJobByTable(sourceId,c.dataset.schema,c.dataset.table);});}
+function tableKey(sourceId,schema,table){return JSON.stringify([sourceId,schema,table]);}
+function updateTableSelection(){
+    $('table-selection-count').textContent=`${pendingTables.size} 张表待配置`;
+    $('configure-selected-tables').disabled=pendingTables.size===0;
+    const empty=store.tables.length===0;
+    $('select-all-tables').disabled=empty;
+    $('clear-table-selection').disabled=pendingTables.size===0;
+}
+$('select-all-tables').onclick=()=>{
+    const sourceId=$('builder-source').value;
+    const query=$('table-search').value.trim().toLowerCase();
+    for(const table of store.tables.filter(t=>`${t.schema}.${t.name}`.toLowerCase().includes(query))){
+        if(!store.config.jobs.some(j=>j.source_id===sourceId&&j.schema===table.schema&&j.table===table.name)){
+            pendingTables.set(tableKey(sourceId,table.schema,table.name),{sourceId,schema:table.schema,table:table.name});
+        }
+    }
+    renderTables();updateTableSelection();
+};
+$('clear-table-selection').onclick=()=>{pendingTables.clear();configurationQueue=[];renderTables();updateTableSelection();};
+$('configure-selected-tables').onclick=()=>{configurationQueue=[...pendingTables.values()];openNextSelectedTable();};
+function openNextSelectedTable(){
+    const next=configurationQueue.shift();
+    if(next)openJobEditor(next.sourceId,next.schema,next.table);
+}
+updateTableSelection();
+
+function renderTables(){updateTableSelection();const q=$('table-search').value.trim().toLowerCase();const sourceId=$('builder-source').value;const items=store.tables.filter(t=>`${t.schema}.${t.name}`.toLowerCase().includes(q));$('table-list').className=items.length?'table-list':'table-list empty';$('table-list').innerHTML=items.length?items.map(t=>{const existing=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===t.schema&&j.table===t.name);return `<div class="table-row"><label><input type="checkbox" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}" ${existing||pendingTables.has(tableKey(sourceId,t.schema,t.name))?'checked':''}><span><b>${escapeHtml(t.schema)}.${escapeHtml(t.name)}</b><small>${t.type==='view'?'视图':'数据表'}</small></span></label><button class="btn secondary configure-table" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}">${existing?'编辑字段':'配置字段'}</button></div>`;}).join(''):'没有匹配的数据表。';document.querySelectorAll('.configure-table').forEach(b=>b.onclick=()=>openJobEditor(sourceId,b.dataset.schema,b.dataset.table));document.querySelectorAll('#table-list input[type=checkbox]').forEach(c=>c.onchange=()=>{const key=tableKey(sourceId,c.dataset.schema,c.dataset.table);if(c.checked){pendingTables.set(key,{sourceId,schema:c.dataset.schema,table:c.dataset.table});openJobEditor(sourceId,c.dataset.schema,c.dataset.table);}else{pendingTables.delete(key);removeJobByTable(sourceId,c.dataset.schema,c.dataset.table);}updateTableSelection();});}
 async function removeJobByTable(sourceId,schema,table){const job=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===schema&&j.table===table);if(!job)return;if(!confirm(`取消 ${schema}.${table} 的同步任务？`)){renderTables();return;}store.config.jobs=store.config.jobs.filter(j=>j.id!==job.id);await persistJobs();}
-async function openJobEditor(sourceId,schema,table){$('job-editor-panel').hidden=false;$('job-editor-panel').scrollIntoView({behavior:'smooth'});$('column-list').innerHTML='正在读取字段...';const d=await api(`/api/sources/${sourceId}/columns?schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`);if(!d.ok){$('column-list').textContent=d.message;return;}store.columns=d.columns||[];const existing=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===schema&&j.table===table);$('job-id').value=existing?.id||newId('job');$('job-schema').value=schema;$('job-table').value=table;$('job-source-id').value=sourceId;$('job-source-label').value=`${sourceName(sourceId)} / ${schema}.${table}`;$('job-name').value=existing?.name||`${sourceName(sourceId)} / ${schema}.${table}`;$('target-table-name').value=existing?.target.table_name||`${sourceName(sourceId)}_${table}`;$('target-mode').value=existing?.target.mode||'auto';$('existing-table-wrap').hidden=$('target-mode').value!=='existing';fillExistingTables();$('existing-table').value=existing?.target.table_id||'';$('incremental-enabled').checked=!!existing?.incremental.enabled;$('incremental-column-wrap').hidden=!$('incremental-enabled').checked;$('auto-fields').checked=existing?.target.auto_create_fields!==false;$('job-editor-title').textContent=`配置 ${schema}.${table}`;renderColumns(existing);}
+async function openJobEditor(sourceId,schema,table){const requestId=++editorRequest;$('row-preview').innerHTML='';message('preview-message',true,'');$('job-editor-panel').hidden=false;$('job-editor-panel').scrollIntoView({behavior:'smooth'});$('job-source-id').value='';$('column-list').innerHTML='正在读取字段...';const d=await api(`/api/sources/${sourceId}/columns?schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`);if(requestId!==editorRequest)return;if(!d.ok){$('column-list').textContent=d.message;return;}store.columns=d.columns||[];const existing=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===schema&&j.table===table);$('job-id').value=existing?.id||newId('job');$('job-schema').value=schema;$('job-table').value=table;$('job-source-id').value=sourceId;$('job-source-label').value=`${sourceName(sourceId)} / ${schema}.${table}`;$('job-name').value=existing?.name||`${sourceName(sourceId)} / ${schema}.${table}`;$('target-table-name').value=existing?.target.table_name||`${sourceName(sourceId)}_${table}`;$('target-mode').value=existing?.target.mode||'auto';$('existing-table-wrap').hidden=$('target-mode').value!=='existing';fillExistingTables();$('existing-table').value=existing?.target.table_id||'';$('incremental-enabled').checked=!!existing?.incremental.enabled;$('incremental-column-wrap').hidden=!$('incremental-enabled').checked;$('auto-fields').checked=existing?.target.auto_create_fields!==false;$('job-editor-title').textContent=`配置 ${schema}.${table}`;renderColumns(existing);}
 function renderColumns(existing){const selected=new Map((existing?.columns||[]).map(c=>[c.source,c]));$('column-list').innerHTML=store.columns.map(c=>{const old=selected.get(c.name);return `<div class="column-row"><label class="check"><input type="checkbox" data-column="${escapeHtml(c.name)}" ${old?'checked':''}><span></span></label><div><b>${escapeHtml(c.name)}</b><small>${escapeHtml(c.sql_type)}${c.nullable?' · 可空':''}</small></div><input class="target-name" data-target-for="${escapeHtml(c.name)}" value="${escapeHtml(old?.target||c.name)}" ${old?'':'disabled'}></div>`;}).join('');document.querySelectorAll('[data-column]').forEach(c=>c.onchange=()=>{document.querySelector(`[data-target-for="${CSS.escape(c.dataset.column)}"]`).disabled=!c.checked;syncKeyOptions(existing);});syncKeyOptions(existing);}
 function selectedColumns(){return store.columns.filter(c=>document.querySelector(`[data-column="${CSS.escape(c.name)}"]`)?.checked).map(c=>({source:c.name,target:document.querySelector(`[data-target-for="${CSS.escape(c.name)}"]`).value.trim()||c.name,sql_type:c.sql_type,nullable:c.nullable}));}
 function syncKeyOptions(existing){const cols=selectedColumns();const uk=$('unique-key');const inc=$('incremental-column');const ukValue=uk.value||existing?.unique_key||'';const incValue=inc.value||existing?.incremental.column||'';const options='<option value="">请选择</option>'+cols.map(c=>`<option value="${escapeHtml(c.source)}">${escapeHtml(c.source)}</option>`).join('');uk.innerHTML=options;inc.innerHTML=options;if(cols.some(c=>c.source===ukValue))uk.value=ukValue;if(cols.some(c=>c.source===incValue))inc.value=incValue;}
 $('select-all-columns').onclick=()=>{document.querySelectorAll('[data-column]').forEach(c=>{c.checked=true;document.querySelector(`[data-target-for="${CSS.escape(c.dataset.column)}"]`).disabled=false;});syncKeyOptions();};
+$('clear-columns').onclick=()=>{
+    document.querySelectorAll('[data-column]').forEach(c=>{c.checked=false;});
+    document.querySelectorAll('[data-target-for]').forEach(c=>{c.disabled=true;});
+    syncKeyOptions();
+};
+$('preview-rows').onclick=async()=>{
+    const sourceId=$('job-source-id').value,schema=$('job-schema').value,table=$('job-table').value;
+    if(!sourceId||!table)return;
+    const columns=selectedColumns().map(c=>c.source);
+    if(!columns.length){message('preview-message',false,'请先勾选字段');return;}
+    $('preview-rows').disabled=true;message('preview-message',true,'正在读取...');
+    try{
+        const d=await api(`/api/sources/${encodeURIComponent(sourceId)}/preview`,{method:'POST',body:JSON.stringify({schema,table,columns})});
+        if(sourceId!==$('job-source-id').value||schema!==$('job-schema').value||table!==$('job-table').value)return;
+        if(!d.ok){$('row-preview').innerHTML='';message('preview-message',false,d.message);return;}
+        $('row-preview').innerHTML='<table><thead><tr>'+d.columns.map(c=>`<th>${escapeHtml(c)}</th>`).join('')+'</tr></thead><tbody>'+d.rows.map(row=>'<tr>'+row.map(v=>`<td>${escapeHtml(v===null?'NULL':v)}</td>`).join('')+'</tr>').join('')+'</tbody></table>';
+        message('preview-message',true,`已读取 ${d.rows.length} 行样本（最多 10 行）`);
+    }catch(error){message('preview-message',false,error.message);}finally{$('preview-rows').disabled=false;}
+};
 $('target-mode').onchange=()=>{$('existing-table-wrap').hidden=$('target-mode').value!=='existing';fillExistingTables();};
 $('incremental-enabled').onchange=()=>{$('incremental-column-wrap').hidden=!$('incremental-enabled').checked;};
 function fillExistingTables(){$('existing-table').innerHTML='<option value="">请选择飞书表</option>'+store.feishuTables.map(t=>`<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');}
-$('cancel-job-edit').onclick=()=>{$('job-editor-panel').hidden=true;renderTables();};
-$('save-job').onclick=async()=>{const sourceId=$('job-source-id').value||$('builder-source').value;const columns=selectedColumns();const job={id:$('job-id').value,name:$('job-name').value.trim(),source_id:sourceId,schema:$('job-schema').value,table:$('job-table').value,enabled:true,columns,unique_key:$('unique-key').value,incremental:{enabled:$('incremental-enabled').checked,column:$('incremental-enabled').checked?$('incremental-column').value:''},target:{mode:$('target-mode').value,table_id:$('target-mode').value==='existing'?$('existing-table').value:(store.config.jobs.find(j=>j.id===$('job-id').value)?.target.table_id||''),table_name:$('target-table-name').value.trim(),auto_create_fields:$('auto-fields').checked}};const index=store.config.jobs.findIndex(j=>j.id===job.id);if(index>=0)store.config.jobs[index]=job;else store.config.jobs.push(job);const ok=await persistJobs();message('job-message',ok,ok?'任务已保存':'保存失败');if(ok){$('job-editor-panel').hidden=true;renderTables();}};
+$('cancel-job-edit').onclick=()=>{editorRequest++;configurationQueue=[];$('job-editor-panel').hidden=true;renderTables();};
+$('save-job').onclick=async()=>{const sourceId=$('job-source-id').value||$('builder-source').value;const columns=selectedColumns();const job={id:$('job-id').value,name:$('job-name').value.trim(),source_id:sourceId,schema:$('job-schema').value,table:$('job-table').value,enabled:true,columns,unique_key:$('unique-key').value,incremental:{enabled:$('incremental-enabled').checked,column:$('incremental-enabled').checked?$('incremental-column').value:''},target:{mode:$('target-mode').value,table_id:$('target-mode').value==='existing'?$('existing-table').value:(store.config.jobs.find(j=>j.id===$('job-id').value)?.target.table_id||''),table_name:$('target-table-name').value.trim(),auto_create_fields:$('auto-fields').checked}};const index=store.config.jobs.findIndex(j=>j.id===job.id);if(index>=0)store.config.jobs[index]=job;else store.config.jobs.push(job);const ok=await persistJobs();message('job-message',ok,ok?'任务已保存':'保存失败');if(ok){pendingTables.delete(tableKey(sourceId,job.schema,job.table));$('job-editor-panel').hidden=true;renderTables();openNextSelectedTable();}};
 async function persistJobs(){const d=await api('/api/jobs',{method:'POST',body:JSON.stringify({jobs:store.config.jobs})});if(d.ok){store.config=d.config;renderAll();return true;}alert(d.message);await loadWorkspace();return false;}
 function renderJobs(){const list=$('job-list');list.className=store.config.jobs.length?'job-list':'job-list empty';list.innerHTML=store.config.jobs.length?store.config.jobs.map(j=>{const st=store.states[j.id];return `<article class="job-card"><label class="switch"><input type="checkbox" data-enable="${j.id}" ${j.enabled?'checked':''}><span></span></label><div class="job-main"><b>${escapeHtml(j.name)}</b><small>${escapeHtml(sourceName(j.source_id))} · ${escapeHtml(j.schema)}.${escapeHtml(j.table)} · ${j.columns.length} 个字段</small><div class="tags"><span>${j.incremental.enabled?'增量':'全量扫描'}</span><span>${j.target.table_id?'已绑定飞书表':'自动建表'}</span>${st?.last_success_at?`<span>上次成功 ${escapeHtml(st.last_success_at)}</span>`:''}</div></div><div class="job-actions"><button class="btn secondary" data-edit-job="${j.id}">编辑</button><button class="btn secondary" data-run-job="${j.id}">预检</button>${j.incremental.enabled?`<button class="btn secondary" data-reset-job="${j.id}">重置游标</button>`:''}<button class="btn danger" data-delete-job="${j.id}">删除</button></div></article>`;}).join(''):'还没有任务。勾选上方的数据表开始配置。';list.querySelectorAll('[data-enable]').forEach(x=>x.onchange=()=>{const j=store.config.jobs.find(j=>j.id===x.dataset.enable);j.enabled=x.checked;});list.querySelectorAll('[data-edit-job]').forEach(x=>x.onclick=()=>{const j=store.config.jobs.find(j=>j.id===x.dataset.editJob);$('builder-source').value=j.source_id;openJobEditor(j.source_id,j.schema,j.table);});list.querySelectorAll('[data-run-job]').forEach(x=>x.onclick=()=>startRun(true,x.dataset.runJob));list.querySelectorAll('[data-reset-job]').forEach(x=>x.onclick=async()=>{if(!confirm('重置后该任务下次会执行全量扫描，确认继续？'))return;const d=await api(`/api/jobs/${x.dataset.resetJob}/state`,{method:'DELETE'});alert(d.message);if(d.ok)loadWorkspace();});list.querySelectorAll('[data-delete-job]').forEach(x=>x.onclick=async()=>{if(!confirm('确认删除该同步任务？'))return;store.config.jobs=store.config.jobs.filter(j=>j.id!==x.dataset.deleteJob);await persistJobs();});}
 $('save-job-order').onclick=persistJobs;

@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, render_template, request
 
 from multi_sync import feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
+from sync import quote_identifier
 from workspace import (
     BASE_DIR,
     ENV_PATH,
@@ -458,6 +459,35 @@ def source_columns_api(source_id: str):
         return jsonify({"ok": True, "columns": list_columns(get_source(load_config(), source_id), schema, table)})
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "读取字段失败")}), 400
+
+
+@app.route("/api/sources/<source_id>/preview", methods=["POST"])
+def preview_rows_api(source_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        schema = payload.get("schema", "dbo")
+        table = payload.get("table", "")
+        source = get_source(load_config(), source_id)
+        metadata = {column["name"] for column in list_columns(source, schema, table)}
+        columns = payload.get("columns")
+        if not isinstance(columns, list) or not columns or any(
+            not isinstance(column, str) or column not in metadata for column in columns
+        ):
+            raise ValueError("请勾选有效的数据表字段")
+        query = (
+            "SELECT TOP (10) " + ", ".join(quote_identifier(column) for column in columns)
+            + f" FROM {quote_identifier(schema)}.{quote_identifier(table)}"
+        )
+        with sql_connection(source) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                rows = [
+                    [None if value is None else str(value) for value in row]
+                    for row in cursor.fetchmany(10)
+                ]
+        return jsonify({"ok": True, "columns": columns, "rows": rows})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "读取预览失败")}), 400
 
 
 @app.route("/api/jobs", methods=["POST"])

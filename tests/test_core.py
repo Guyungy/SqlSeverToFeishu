@@ -710,5 +710,35 @@ class RunHistoryTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/run-logs?n=-1").get_json()["log"], "二\n")
 
 
+class DesignerPreviewTests(unittest.TestCase):
+    def test_preview_limits_rows_and_preserves_null(self):
+        client = dashboard.app.test_client()
+        connection = mock.MagicMock()
+        cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
+        cursor.fetchmany.return_value = [(Decimal('12.50'), None)]
+        with mock.patch.object(dashboard, 'load_config', return_value={}), \
+             mock.patch.object(dashboard, 'get_source', return_value={}), \
+             mock.patch.object(dashboard, 'list_columns', return_value=[{'name': '金额'}, {'name': '备注'}]), \
+             mock.patch.object(dashboard, 'sql_connection', return_value=connection):
+            response = client.post('/api/sources/source_a/preview',
+                headers={'Host': '127.0.0.1:5001', 'X-CSRF-Token': dashboard.CSRF_TOKEN},
+                json={'schema': 'dbo', 'table': '订单', 'columns': ['金额', '备注']})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['rows'], [['12.50', None]])
+        cursor.execute.assert_called_once_with('SELECT TOP (10) [金额], [备注] FROM [dbo].[订单]')
+        cursor.fetchmany.assert_called_once_with(10)
+
+    def test_preview_rejects_unknown_fields(self):
+        with mock.patch.object(dashboard, 'load_config', return_value={}), \
+             mock.patch.object(dashboard, 'get_source', return_value={}), \
+             mock.patch.object(dashboard, 'list_columns', return_value=[{'name': 'Id'}]), \
+             mock.patch.object(dashboard, 'sql_connection') as connection:
+            response = dashboard.app.test_client().post('/api/sources/source_a/preview',
+                headers={'Host': '127.0.0.1:5001', 'X-CSRF-Token': dashboard.CSRF_TOKEN},
+                json={'table': 'Orders', 'columns': ['missing']})
+        self.assertEqual(response.status_code, 400)
+        connection.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
