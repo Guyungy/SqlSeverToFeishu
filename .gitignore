@@ -11,6 +11,7 @@ __pycache__/
 sync_config.json
 sync_state.json
 *.log
+*.log.[0-9]*
 sync.log
 dashboard_server.log
 .sync.lock

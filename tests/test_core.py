@@ -1,9 +1,12 @@
 import os
+import io
+import logging
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from unittest import mock
 
 import dashboard
@@ -623,6 +626,88 @@ class SettingsFingerprintTests(unittest.TestCase):
         utc0 = sync.convert_value(naive, 5, 0)
         self.assertEqual(utc8, 1767225600000)
         self.assertEqual(utc0 - utc8, 8 * 60 * 60 * 1000)
+
+
+class RunHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "run_history.log"
+        self.handler = RotatingFileHandler(self.path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        self.logger = logging.Logger("test_run_history", level=logging.INFO)
+        self.logger.addHandler(self.handler)
+        self.patches = [
+            mock.patch.object(dashboard, "RUN_LOG_PATH", self.path),
+            mock.patch.object(dashboard, "run_handler", self.handler),
+            mock.patch.object(dashboard, "run_logger", self.logger),
+        ]
+        for patch in self.patches:
+            patch.start()
+        self.client = dashboard.app.test_client()
+
+    def tearDown(self):
+        for patch in reversed(self.patches):
+            patch.stop()
+        self.handler.close()
+        self.temp.cleanup()
+
+    def run_worker(self, exit_code=0, dry_run=False):
+        manager = dashboard.JobManager()
+        manager.job_id = "run_test"
+        process = mock.Mock()
+        process.stdout = io.StringIO('PROGRESS:job_plan:70:订单：读取 3，新增 2，更新 1\n{"type":"result","ok":true}\n')
+        process.returncode = exit_code
+        with mock.patch.object(dashboard.subprocess, "Popen", return_value=process) as popen:
+            manager._run("run_test", dry_run, "job_orders")
+        self.assertEqual(popen.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8")
+        return manager
+
+    def test_worker_output_and_success_survive_new_manager(self):
+        self.run_worker()
+        self.assertEqual(dashboard.JobManager().snapshot()["lines"], [])
+        response = self.client.get("/api/run-logs?n=1000")
+        data = response.get_json()
+        self.assertTrue(data["ok"])
+        for text in ("run=run_test", "event=start mode=sync job=job_orders", "订单：读取 3", '"type":"result"', "status=success exit_code=0"):
+            self.assertIn(text, data["log"])
+
+    def test_nonzero_exit_and_preflight_are_recorded(self):
+        self.run_worker(exit_code=1, dry_run=True)
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn("mode=dry_run", text)
+        self.assertIn("status=failed exit_code=1", text)
+
+    def test_launch_error_is_recorded(self):
+        manager = dashboard.JobManager()
+        with mock.patch.object(dashboard.subprocess, "Popen", side_effect=OSError("启动失败")), \
+             mock.patch.object(dashboard.logger, "exception"):
+            manager._run("run_failed", False, "")
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn("status=failed", text)
+        self.assertIn("启动失败", text)
+
+    def test_cancel_request_is_recorded(self):
+        manager = dashboard.JobManager()
+        manager.job_id = "run_cancel"
+        manager.process = mock.Mock()
+        manager.process.poll.return_value = None
+        with mock.patch.object(dashboard.os, "name", "nt"):
+            self.assertTrue(manager.cancel()["ok"])
+        self.assertIn("run=run_cancel event=cancel_requested", self.path.read_text(encoding="utf-8"))
+
+    def test_rotated_logs_are_read_in_order_and_tail_is_bounded(self):
+        self.logger.info("旧记录")
+        self.handler.doRollover()
+        self.logger.info("新记录")
+        data = self.client.get("/api/run-logs?n=2").get_json()
+        self.assertEqual(data["log"], "旧记录\n新记录\n")
+        data = self.client.get("/api/run-logs?n=1").get_json()
+        self.assertEqual(data["log"], "新记录\n")
+
+    def test_empty_and_invalid_limit(self):
+        self.assertEqual(self.client.get("/api/run-logs?n=bad").get_json()["log"], "")
+        self.logger.info("一")
+        self.logger.info("二")
+        self.assertEqual(self.client.get("/api/run-logs?n=-1").get_json()["log"], "二\n")
 
 
 if __name__ == "__main__":

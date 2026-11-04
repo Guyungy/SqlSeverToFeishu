@@ -47,6 +47,7 @@ app.config["MAX_CONTENT_LENGTH"] = 512 * 1024
 CSRF_TOKEN = secrets.token_urlsafe(32)
 LOG_PATH = BASE_DIR / "sync.log"
 DASHBOARD_LOG_PATH = BASE_DIR / "dashboard_server.log"
+RUN_LOG_PATH = BASE_DIR / "run_history.log"
 SECRET_MASKS = {"********", "************"}
 config_lock = threading.Lock()
 state_lock = threading.Lock()
@@ -56,6 +57,15 @@ logger.setLevel(logging.INFO)
 handler = RotatingFileHandler(DASHBOARD_LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8")
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
+
+# Only the dashboard writes this file. Worker output is collected through its pipe,
+# so separate sync processes never rotate the same history file concurrently.
+run_logger = logging.getLogger("dashboard.runs")
+run_logger.setLevel(logging.INFO)
+run_logger.propagate = False
+run_handler = RotatingFileHandler(RUN_LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+run_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+run_logger.addHandler(run_handler)
 
 
 @app.before_request
@@ -165,6 +175,8 @@ class JobManager:
         return {"ok": True, "job_id": runtime_id, "mode": self.mode}
 
     def _run(self, runtime_id: str, dry_run: bool, sync_job_id: str) -> None:
+        run_logger.info("run=%s event=start mode=%s job=%s", runtime_id,
+                        "dry_run" if dry_run else "sync", sync_job_id or "all_enabled")
         command = [sys.executable, "-u", str(BASE_DIR / "multi_sync.py")]
         if dry_run:
             command.append("--dry-run")
@@ -175,7 +187,7 @@ class JobManager:
             process = subprocess.Popen(
                 command, cwd=str(BASE_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                env={**os.environ, "PYTHONUNBUFFERED": "1"}, **kwargs,
+                env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}, **kwargs,
             )
             with self.lock:
                 if self.job_id != runtime_id:
@@ -186,14 +198,18 @@ class JobManager:
             if process.stdout is None:
                 raise RuntimeError("无法读取同步进程输出")
             for line in process.stdout:
+                run_logger.info("run=%s output=%s", runtime_id, line.rstrip("\r\n"))
                 self.add_line(line)
             process.wait()
             with self.lock:
                 self.exit_code = process.returncode
                 self.status = "cancelled" if self.cancel_requested else ("success" if process.returncode == 0 else "failed")
                 self.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                run_logger.info("run=%s event=finish status=%s exit_code=%s", runtime_id,
+                                self.status, self.exit_code)
                 self.process = None
         except Exception as exc:
+            run_logger.exception("run=%s event=finish status=failed error=%s", runtime_id, exc)
             logger.exception("同步任务启动失败: %s", exc)
             self.add_line("PROGRESS:error:0:同步任务启动失败，详见 dashboard_server.log")
             with self.lock:
@@ -209,6 +225,7 @@ class JobManager:
                 return {"ok": False, "message": "当前没有正在运行的任务"}
             self.cancel_requested = True
             self.status = "cancelling"
+            run_logger.info("run=%s event=cancel_requested", self.job_id)
             if os.name == "nt":
                 process.terminate()
             else:
@@ -515,10 +532,30 @@ def logs_api():
     return jsonify({"log": "".join(lines)})
 
 
+@app.route("/api/run-logs")
+def run_logs_api():
+    n = min(1000, max(1, request.args.get("n", 200, type=int)))
+    lines = deque(maxlen=n)
+    # Match the writer's lock so rotation cannot move files between reads.
+    run_handler.acquire()
+    try:
+        for suffix in (".3", ".2", ".1", ""):
+            path = RUN_LOG_PATH.with_name(RUN_LOG_PATH.name + suffix)
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as file:
+                    lines.extend(file)
+            except FileNotFoundError:
+                continue
+    finally:
+        run_handler.release()
+    return jsonify({"ok": True, "log": "".join(lines)})
+
+
 if __name__ == "__main__":
     port = int(runtime_settings()["dashboard_port"])
     dashboard_url = f"http://127.0.0.1:{port}"
     print(f"启动面板: {dashboard_url}")
+    run_logger.info("event=dashboard_start pid=%s", os.getpid())
     if os.environ.get("NO_AUTO_BROWSER", "").strip().lower() not in {"1", "true", "yes"}:
         threading.Timer(1.0, webbrowser.open, args=(dashboard_url,)).start()
     scheduler.start()
