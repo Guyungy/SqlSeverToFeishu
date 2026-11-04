@@ -45,7 +45,7 @@
                 </div>
             </div>
             <div class="panel">
-                <div class="panel-head"><div><p class="kicker">ACTIVE JOBS</p><h2>当前任务</h2></div><button class="btn secondary" data-jump="builder">管理任务</button></div>
+                <div class="panel-head"><div><p class="kicker">ACTIVE JOBS</p><h2>当前任务</h2></div><button id="overview-manage-jobs" class="btn secondary" data-jump="builder">查看全部任务</button></div>
                 <div id="overview-jobs" class="empty">还没有同步任务。</div>
             </div>
         </section>
@@ -96,15 +96,19 @@
         <section id="view-builder" class="view">
             <div class="panel">
                 <div class="panel-head"><div><h2>编辑同步计划</h2><p class="panel-description">选择需要同步的表，字段默认全部包含。</p></div><button id="scan-tables" class="btn primary">读取数据库表</button></div>
-                <div class="inline-form"><label>选择数据库<select id="builder-source"></select></label><label class="search">搜索数据表<input id="table-search" type="search" placeholder="表名、Schema 或数据库"></label><label class="compact-filter">选择状态<select id="table-status-filter"><option value="all">全部表</option><option value="selected">已选择</option><option value="unselected">未选择</option></select></label></div>
+                <div class="inline-form"><label>选择数据库<select id="builder-source"></select></label><label class="search">搜索数据表<input id="table-search" type="search" placeholder="搜索表名，多个名称用逗号隔开"></label><label class="compact-filter">选择状态<select id="table-status-filter"><option value="all">全部表</option><option value="selected">已选择</option><option value="unselected">未选择</option></select></label></div>
                 <div class="plan-summary" aria-live="polite"><span>数据库表 <strong id="plan-total">0</strong></span><span>已选择 <strong id="plan-selected">0</strong></span><span>未选择 <strong id="plan-unselected">0</strong></span><span id="plan-state" class="pill neutral">待读取</span></div>
                 <div class="actions wrap plan-toolbar"><button id="select-all-tables" class="btn secondary">全选当前筛选表</button><button id="clear-visible-tables" class="btn secondary">取消当前筛选</button><button id="clear-table-selection" class="btn secondary">取消全部</button><button id="configure-selected-tables" class="btn primary">保存同步计划</button><button id="cancel-plan-save" class="btn danger" hidden>停止保存计划</button><span id="table-selection-count" class="message"></span></div>
                 <p id="plan-change-hint" class="plan-hint">取消的表会保留停用设置。计划变更在下次同步时生效。</p><p id="discovery-message" class="message" aria-live="polite"></p>
+                <p id="table-filter-summary" class="list-scope" aria-live="polite"></p>
                 <div id="table-list" class="table-list empty">请选择数据库并读取数据表，然后调整和保存计划。</div>
+                <div class="list-pagination"><label>每页<select id="table-page-size"><option value="20">20 张表</option><option value="50">50 张表</option><option value="100">100 张表</option></select></label><span id="table-page-info" aria-live="polite"></span><button id="table-prev" class="btn secondary">上一页</button><button id="table-next" class="btn secondary">下一页</button></div>
             </div>
 
+            <dialog id="job-editor-dialog" aria-labelledby="job-editor-title">
             <div class="panel" id="job-editor-panel" hidden>
-                <div class="panel-head"><div><h2 id="job-editor-title">编辑任务</h2><p class="panel-description">保存后在下次同步时使用新设置。</p></div><div><button id="select-all-columns" class="btn secondary">全选字段</button> <button id="clear-columns" class="btn secondary">取消全选字段</button></div></div>
+                <div class="panel-head editor-header"><div><h2 id="job-editor-title">编辑任务</h2><p class="panel-description">保存后返回当前列表位置，下次同步使用新设置。</p></div><button id="close-job-editor" class="btn secondary" aria-label="关闭任务编辑器">关闭</button></div>
+                <fieldset id="job-editor-fields">
                 <input id="job-id" type="hidden"><input id="job-schema" type="hidden"><input id="job-table" type="hidden"><input id="job-source-id" type="hidden">
                 <div class="job-settings">
                     <label>任务名称<input id="job-name"></label><label class="toggle-label"><input id="job-enabled" type="checkbox" checked><span>启用此任务</span><small>关闭后保留配置，跳过同步</small></label>
@@ -112,28 +116,35 @@
                     <label>飞书表名<input id="target-table-name"></label>
                     <label>飞书目标<select id="target-mode"><option value="auto">自动匹配或新建表</option><option value="existing">选择已有表</option></select></label>
                     <label id="existing-table-wrap" hidden>已有飞书表<select id="existing-table"></select></label>
+                    <label>唯一键<select id="unique-key"></select><small>必须非空且唯一</small></label>
                 </div>
+                <div class="field-header"><strong>同步字段</strong><span id="column-selection-count">可修改右侧飞书字段名</span></div>
+                <div class="column-tools"><label>查找字段<input id="column-search" type="search" placeholder="字段名称"></label><button id="select-all-columns" class="btn secondary">全选全部字段</button><button id="clear-columns" class="btn secondary">取消全部字段</button></div>
+                <div id="column-list" class="column-list"></div>
+                <div class="actions"><button id="preview-rows" class="btn secondary">预览前 10 行</button><span id="preview-message" class="message" aria-live="polite"></span></div><div id="row-preview" style="overflow:auto;max-height:360px"></div>
+                <details class="editor-advanced" id="editor-advanced"><summary>分表与增量设置 <span id="editor-advanced-summary"></span></summary>
                 <div class="job-settings bottom">
                     <label class="toggle-label"><input id="split-enabled" type="checkbox" checked><span>启用自动分表</span><small>达到行数阈值后自动新建下一张表</small></label>
                     <label>每张表最多行数<input id="split-row-limit" type="number" min="1" max="40000" value="40000"><small>默认 40000，可按实际容量调低</small></label>
                     <label>分表时间字段<select id="split-column"><option value="">按唯一键排序</option></select><small>新增记录按时间升序分配到分表</small></label>
                     <p class="muted" style="margin:0;align-self:center">已有记录按唯一键定位原分表更新。时间字段更新后仍会定位到原记录。</p>
                 </div>
-                <div class="field-header"><strong>勾选要同步的字段</strong><span id="column-selection-count">可修改右侧飞书字段名</span></div>
-                <div id="column-list" class="column-list"></div>
-                <div class="actions"><button id="preview-rows" class="btn secondary">预览前 10 行</button><span id="preview-message" class="message" aria-live="polite"></span></div><div id="row-preview" style="overflow:auto;max-height:360px"></div>
                 <div class="job-settings bottom">
-                    <label>唯一键<select id="unique-key"></select><small>必须非空且唯一</small></label>
+
                     <label class="toggle-label"><input id="incremental-enabled" type="checkbox"><span>启用增量同步</span><small>首次全量，成功后保存游标</small></label>
                     <label id="incremental-column-wrap" hidden>增量字段<select id="incremental-column"></select><small>推荐更新时间或递增 ID</small></label>
                     <label class="toggle-label"><input id="auto-fields" type="checkbox" checked><span>自动补建飞书字段</span><small>已有表缺字段时自动创建</small></label>
                 </div>
-                <div class="actions"><button id="save-job" class="btn primary">保存同步任务</button><button id="cancel-job-edit" class="btn secondary">取消</button><span id="job-message" class="message" aria-live="polite"></span></div>
+                </details>
+                </fieldset>
+                <div class="actions editor-footer"><span id="job-message" class="message" aria-live="polite"></span><button id="cancel-job-edit" class="btn secondary">取消</button><button id="save-job" class="btn primary">保存修改</button></div>
             </div>
+            </dialog>
 
             <div class="panel">
                 <div class="panel-head"><div><h2>已保存的任务</h2><p class="panel-description">可编辑字段、目标表和增量设置。启停开关自动保存。</p></div><span id="job-result-count" class="pill neutral">0 个任务</span></div><div class="job-filters"><label>搜索任务<input id="job-search" type="search" placeholder="任务、表名或数据库"></label><label>运行状态<select id="job-status-filter"><option value="all">全部任务</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></label></div>
                 <div id="job-list" class="job-list empty">还没有任务。请先在上方保存同步计划。</div>
+                <div class="list-pagination"><label>每页<select id="job-page-size"><option value="20">20 个任务</option><option value="50">50 个任务</option><option value="100">100 个任务</option></select></label><span id="job-page-info" aria-live="polite"></span><button id="job-prev" class="btn secondary">上一页</button><button id="job-next" class="btn secondary">下一页</button></div>
             </div>
         </section>
 
@@ -182,6 +193,9 @@ let editorRequest = 0;
 let discoveryRequest = 0;
 let planSaving = false;
 let planCancelRequested = false;
+const listPages = {table:1, job:1};
+let editorSnapshot = '';
+let editorSaving = false;
 const $ = id => document.getElementById(id);
 async function api(url, options={}) {
     const headers = new Headers(options.headers || {}); headers.set('X-CSRF-Token', csrf);
@@ -214,7 +228,7 @@ function renderAll(){
     $('global-status').textContent=`${store.config.sources.length} 个数据源 · ${store.config.jobs.filter(j=>j.enabled).length} 个启用任务`;
     renderSources(); renderSourceSelect(); renderJobs(); renderOverview();
 }
-function renderOverview(){ const jobs=store.config.jobs; $('overview-jobs').className=jobs.length?'mini-jobs':'empty'; $('overview-jobs').innerHTML=jobs.length?jobs.map(j=>`<div><span class="dot ${j.enabled?'on':''}"></span><b>${escapeHtml(j.name)}</b><span>${escapeHtml(sourceName(j.source_id))} · ${escapeHtml(j.schema)}.${escapeHtml(j.table)}</span><em>${j.incremental.enabled?'增量':'全量扫描'}</em></div>`).join(''):'还没有同步任务。'; }
+function renderOverview(){ const jobs=store.config.jobs.slice(0,10);$('overview-manage-jobs').textContent=`查看全部 ${store.config.jobs.length} 个任务`; $('overview-jobs').className=jobs.length?'mini-jobs':'empty'; $('overview-jobs').innerHTML=jobs.length?jobs.map(j=>`<div><span class="dot ${j.enabled?'on':''}"></span><b>${escapeHtml(j.name)}</b><span>${escapeHtml(sourceName(j.source_id))} · ${escapeHtml(j.schema)}.${escapeHtml(j.table)}</span><em>${j.incremental.enabled?'增量':'全量扫描'}</em></div>`).join(''):'还没有同步任务。'; }
 function sourceName(id){ return store.config.sources.find(s=>s.id===id)?.name||id; }
 
 function feishuPayload(){return {app_id:$('fs-app-id').value.trim(),app_secret:$('fs-secret').value,base_url:$('fs-url').value.trim(),app_token:$('fs-token').value.trim()};}
@@ -280,6 +294,7 @@ $('scan-tables').onclick=async()=>{
     const sourceId=$('builder-source').value;
     const requestId=++discoveryRequest;
     if(!sourceId){$('scan-tables').disabled=false;store.tables=[];pendingTables.clear();renderTables();message('discovery-message',false,'请选择要同步的数据库');return;}
+    const previousSource=store.tables[0]?.source_id;
     store.tables=[];pendingTables.clear();renderTables();
     $('scan-tables').disabled=true;
     message('discovery-message',true,'正在读取所选数据库的全部表...');
@@ -288,6 +303,8 @@ $('scan-tables').onclick=async()=>{
         if(requestId!==discoveryRequest||sourceId!==$('builder-source').value)return;
         if(!data.ok){message('discovery-message',false,data.message);return;}
         store.config=data.config;store.tables=data.tables||[];
+        listPages.table=1;
+        if(previousSource!==sourceId){$('table-search').value='';$('table-status-filter').value='all';}
         pendingTables.clear();
         renderAll();
         restoreTablePlan();
@@ -301,8 +318,28 @@ $('scan-tables').onclick=async()=>{
     finally{if(requestId===discoveryRequest)$('scan-tables').disabled=false;}
 };
 $('builder-source').onchange=async()=>{editorRequest++;$('job-editor-panel').hidden=true;await $('scan-tables').onclick();};
-$('table-search').oninput=renderTables;
-$('table-status-filter').onchange=renderTables;
+$('table-search').oninput=()=>{listPages.table=1;renderTables();};
+$('table-status-filter').onchange=()=>{listPages.table=1;renderTables();};
+function matchesSearch(text, query){
+    const terms=query.toLowerCase().split(/[,，\n]+/).map(term=>term.trim()).filter(Boolean);
+    return !terms.length||terms.some(term=>text.toLowerCase().includes(term));
+}
+function pageItems(items, prefix){
+    const size=Number($(prefix+'-page-size').value)||20;
+    const totalPages=Math.max(1,Math.ceil(items.length/size));
+    listPages[prefix]=Math.min(Math.max(1,listPages[prefix]),totalPages);
+    const start=(listPages[prefix]-1)*size;
+    $(prefix+'-page-info').textContent=`第 ${listPages[prefix]}/${totalPages} 页，共 ${items.length} 项`;
+    $(prefix+'-prev').disabled=listPages[prefix]===1;
+    $(prefix+'-next').disabled=listPages[prefix]===totalPages;
+    return items.slice(start,start+size);
+}
+for(const prefix of ['table','job']){
+    const render=prefix==='table'?renderTables:renderJobs;
+    $(prefix+'-prev').onclick=()=>{listPages[prefix]--;render();};
+    $(prefix+'-next').onclick=()=>{listPages[prefix]++;render();};
+    $(prefix+'-page-size').onchange=()=>{listPages[prefix]=1;render();};
+}
 function tableKey(sourceId,schema,table){return JSON.stringify([sourceId,schema,table]);}
 function hasPlanChanges(){
     return store.tables.some(table=>{
@@ -323,7 +360,10 @@ function updateTableSelection(){
     $('plan-unselected').textContent=total-selected;
     $('plan-state').textContent=planSaving?'保存中':!total?'待读取':dirty?'有未保存更改':'已保存';
     $('plan-state').className=`pill ${dirty?'warning':total?'good':'neutral'}`;
-    $('table-selection-count').textContent=`已选择 ${selected}/${total} 张表`;
+    $('table-selection-count').textContent=`全库已选 ${selected}/${total} 张表`;
+    const filtered=visibleTables();
+    const selectedFiltered=filtered.filter(t=>pendingTables.has(tableKey(t.source_id,t.schema,t.name))).length;
+    $('table-filter-summary').textContent=`筛选结果 ${filtered.length} 张，已选 ${selectedFiltered} 张。批量选择作用于全部筛选结果，跨页保留。`;
     $('plan-change-hint').textContent=store.running?'当前任务运行中，保存的计划在下次同步时生效。':
         dirty?'选择已调整，请点击“保存同步计划”使更改生效。':'取消的表会保留停用设置。计划变更在下次同步时生效。';
     $('configure-selected-tables').disabled=!total||planSaving;
@@ -336,7 +376,7 @@ function visibleTables(){
     const query=$('table-search').value.trim().toLowerCase();
     const status=$('table-status-filter').value;
     return store.tables.filter(t=>(!sourceId||t.source_id===sourceId)&&
-        `${sourceName(t.source_id)}.${t.schema}.${t.name}`.toLowerCase().includes(query)).filter(t=>{
+        matchesSearch(`${sourceName(t.source_id)}.${t.schema}.${t.name}`,query)).filter(t=>{
             const selected=pendingTables.has(tableKey(t.source_id,t.schema,t.name));
             return status==='selected'?selected:status==='unselected'?!selected:true;
         });
@@ -403,13 +443,16 @@ updateTableSelection();
 function renderTables(){
     updateTableSelection();
     const items=visibleTables();
+    const page=pageItems(items,'table');
+    const scrollTop=$('table-list').scrollTop;
     $('table-list').className=items.length?'table-list':'table-list empty';
-    $('table-list').innerHTML=items.length?items.map(t=>{
+    $('table-list').innerHTML=items.length?page.map(t=>{
         const sourceId=t.source_id;
         const existing=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===t.schema&&j.table===t.name);
         const selected=pendingTables.has(tableKey(sourceId,t.schema,t.name));
         return `<div class="table-row${selected?' is-selected':''}"><label><input type="checkbox" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}" ${pendingTables.has(tableKey(sourceId,t.schema,t.name))?'checked':''} ${planSaving?'disabled':''}><span><b>${escapeHtml(t.schema)}.${escapeHtml(t.name)}</b><small>${escapeHtml(sourceName(sourceId))} · ${t.type==='view'?'视图':'数据表'}</small></span></label><button class="btn secondary configure-table" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}">${existing?'编辑任务':'配置与预览'}</button></div>`;
     }).join(''):'没有匹配的数据表。';
+    $('table-list').scrollTop=scrollTop;
     document.querySelectorAll('.configure-table').forEach(b=>b.onclick=()=>openJobEditor(b.dataset.source,b.dataset.schema,b.dataset.table));
     document.querySelectorAll('#table-list input[type=checkbox]').forEach(c=>c.onchange=()=>{
         const sourceId=c.dataset.source;
@@ -419,14 +462,84 @@ function renderTables(){
         renderTables();
     });
 }
-async function openJobEditor(sourceId,schema,table){const requestId=++editorRequest;$('row-preview').innerHTML='';message('preview-message',true,'');$('job-editor-panel').hidden=false;$('job-editor-panel').scrollIntoView({behavior:'smooth'});$('job-source-id').value='';$('column-list').innerHTML='正在读取字段...';const d=await api(`/api/sources/${sourceId}/columns?schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`);if(requestId!==editorRequest)return;if(!d.ok){$('column-list').textContent=d.message;return;}store.columns=d.columns||[];store.defaultSplitColumn=d.split_column||'';const existing=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===schema&&j.table===table);if(existing?.generated_key){store.columns.push({name:existing.unique_key,sql_type:'nvarchar',nullable:false});}$('job-id').value=existing?.id||newId('job');$('job-schema').value=schema;$('job-table').value=table;$('job-source-id').value=sourceId;$('job-source-label').value=`${sourceName(sourceId)} / ${schema}.${table}`;$('job-enabled').checked=existing?.enabled!==false;$('split-enabled').checked=existing?.split?.enabled!==false;$('split-row-limit').value=existing?.split?.row_limit||40000;$('split-column').innerHTML='';$('job-name').value=existing?.name||`${sourceName(sourceId)} / ${schema}.${table}`;$('target-table-name').value=existing?.target.table_name||`${sourceName(sourceId)}_${schema}_${table}`;$('target-mode').value=existing?.target.mode||'auto';$('existing-table-wrap').hidden=$('target-mode').value!=='existing';fillExistingTables();$('existing-table').value=existing?.target.table_id||'';$('incremental-enabled').checked=!!existing?.incremental.enabled;$('incremental-column-wrap').hidden=!$('incremental-enabled').checked;$('auto-fields').checked=existing?.target.auto_create_fields!==false;$('job-editor-title').textContent=`配置 ${schema}.${table}`;$('unique-key').value='';$('incremental-column').value='';renderColumns(existing);
-if(!existing){
-    const primary=d.primary_key||[];
-    if(primary.length===1)$('unique-key').value=primary[0];
-    message('job-message',primary.length===1,primary.length===1?'已默认选择全部字段，并识别主键':
-        '已默认选择全部字段。此表没有单字段主键，请指定非空且唯一的字段后保存。');
-}}
-function renderColumns(existing){const selected=new Map((existing?.columns||[]).map(c=>[c.source,c]));$('column-list').innerHTML=store.columns.map(c=>{const old=selected.get(c.name);return `<div class="column-row"><label class="check"><input type="checkbox" data-column="${escapeHtml(c.name)}" ${!existing||old?'checked':''}><span></span></label><div><b>${escapeHtml(c.name)}</b><small>${escapeHtml(c.sql_type)}${c.nullable?' · 可空':''}</small></div><input class="target-name" data-target-for="${escapeHtml(c.name)}" value="${escapeHtml(old?.target||c.name)}" ${!existing||old?'':'disabled'}></div>`;}).join('');document.querySelectorAll('[data-column]').forEach(c=>c.onchange=()=>{document.querySelector(`[data-target-for="${CSS.escape(c.dataset.column)}"]`).disabled=!c.checked;syncKeyOptions(existing);});syncKeyOptions(existing);}
+function editorFormState(){
+    return JSON.stringify([...$('job-editor-panel').querySelectorAll('input:not([type=search]),select')].map(input=>
+        [input.id||input.dataset.column||input.dataset.targetFor,input.type==='checkbox'?input.checked:input.value]));
+}
+function closeJobEditor(force=false){
+    if(editorSaving)return;
+    if(!force&&editorSnapshot&&editorFormState()!==editorSnapshot&&
+       !confirm('任务有未保存的修改，确定放弃修改并关闭吗？'))return;
+    editorRequest++;
+    editorSnapshot='';
+    $('job-editor-dialog').close();
+    $('job-editor-panel').hidden=true;
+}
+$('close-job-editor').onclick=()=>closeJobEditor();
+$('cancel-job-edit').onclick=()=>closeJobEditor();
+$('job-editor-dialog').addEventListener('cancel',event=>{event.preventDefault();closeJobEditor();});
+async function openJobEditor(sourceId,schema,table){
+    const requestId=++editorRequest;
+    editorSnapshot='';
+    $('job-source-id').value='';
+    $('row-preview').innerHTML='';
+    $('column-search').value='';
+    $('editor-advanced').open=false;
+    message('preview-message',true,'');
+    message('job-message',true,'正在读取任务配置...');
+    $('job-editor-title').textContent=`编辑 ${schema}.${table}`;
+    $('job-editor-panel').hidden=false;
+    $('save-job').disabled=true;
+    $('job-editor-fields').hidden=true;
+    if(!$('job-editor-dialog').open)$('job-editor-dialog').showModal();
+    try{
+        const data=await api(`/api/sources/${sourceId}/columns?schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`);
+        if(requestId!==editorRequest)return;
+        if(!data.ok)throw new Error(data.message);
+        store.columns=data.columns||[];
+        store.defaultSplitColumn=data.split_column||'';
+        const existing=store.config.jobs.find(job=>job.source_id===sourceId&&job.schema===schema&&job.table===table);
+        if(existing?.generated_key)store.columns.push({name:existing.unique_key,sql_type:'nvarchar',nullable:false});
+        $('job-id').value=existing?.id||newId('job');
+        $('job-schema').value=schema;
+        $('job-table').value=table;
+        $('job-source-id').value=sourceId;
+        $('job-source-label').value=`${sourceName(sourceId)} / ${schema}.${table}`;
+        const inCurrentPlan=store.tables.some(item=>item.source_id===sourceId&&item.schema===schema&&item.name===table);
+        $('job-enabled').checked=inCurrentPlan?pendingTables.has(tableKey(sourceId,schema,table)):existing?.enabled!==false;
+        $('job-name').value=existing?.name||`${sourceName(sourceId)} / ${schema}.${table}`;
+        $('target-table-name').value=existing?.target.table_name||`${sourceName(sourceId)}_${schema}_${table}`;
+        $('target-mode').value=existing?.target.mode||'auto';
+        $('existing-table-wrap').hidden=$('target-mode').value!=='existing';
+        fillExistingTables();
+        $('existing-table').value=existing?.target.table_id||'';
+        $('split-enabled').checked=existing?.split?.enabled!==false;
+        $('split-row-limit').value=existing?.split?.row_limit||40000;
+        $('split-column').innerHTML='';
+        $('incremental-enabled').checked=!!existing?.incremental.enabled;
+        $('incremental-column-wrap').hidden=!$('incremental-enabled').checked;
+        $('auto-fields').checked=existing?.target.auto_create_fields!==false;
+        updateAdvancedSummary();
+        $('unique-key').value='';
+        $('incremental-column').value='';
+        renderColumns(existing);
+        if(!existing&&(data.primary_key||[]).length===1)$('unique-key').value=data.primary_key[0];
+        message('job-message',true,existing?'已读取保存的配置，可直接修改。':'字段默认全部选中，请确认唯一键后保存。');
+        editorSnapshot=editorFormState();
+        $('job-editor-fields').hidden=false;
+        $('save-job').disabled=false;
+    }catch(error){if(requestId===editorRequest)message('job-message',false,error.message);}
+}
+function updateAdvancedSummary(){
+    $('editor-advanced-summary').textContent=`${$('split-enabled').checked?'每表 '+$('split-row-limit').value+' 行':'关闭分表'} · ${$('incremental-enabled').checked?'增量同步':'全量同步'}`;
+}
+for(const id of ['split-enabled','split-row-limit','incremental-enabled'])$(id).addEventListener('input',updateAdvancedSummary);
+function filterColumns(){
+    const query=$('column-search').value;
+    document.querySelectorAll('#column-list .column-row').forEach(row=>{row.hidden=!matchesSearch(row.dataset.columnName,query);});
+}
+$('column-search').oninput=filterColumns;
+function renderColumns(existing){const selected=new Map((existing?.columns||[]).map(c=>[c.source,c]));$('column-list').innerHTML=store.columns.map(c=>{const old=selected.get(c.name);return `<div class="column-row" data-column-name="${escapeHtml(c.name)}"><label class="check"><input type="checkbox" aria-label="同步字段 ${escapeHtml(c.name)}" data-column="${escapeHtml(c.name)}" ${!existing||old?'checked':''}><span></span></label><div><b>${escapeHtml(c.name)}</b><small>${escapeHtml(c.sql_type)}${c.nullable?' · 可空':''}</small></div><input class="target-name" aria-label="飞书字段名 ${escapeHtml(c.name)}" data-target-for="${escapeHtml(c.name)}" value="${escapeHtml(old?.target||c.name)}" ${!existing||old?'':'disabled'}></div>`;}).join('');document.querySelectorAll('[data-column]').forEach(c=>c.onchange=()=>{document.querySelector(`[data-target-for="${CSS.escape(c.dataset.column)}"]`).disabled=!c.checked;syncKeyOptions(existing);});syncKeyOptions(existing);}
 function selectedColumns(){return store.columns.filter(c=>document.querySelector(`[data-column="${CSS.escape(c.name)}"]`)?.checked).map(c=>({source:c.name,target:document.querySelector(`[data-target-for="${CSS.escape(c.name)}"]`).value.trim()||c.name,sql_type:c.sql_type,nullable:c.nullable}));}
 function syncSplitOptions(columns,existing){
     const select=$('split-column');
@@ -460,12 +573,101 @@ $('preview-rows').onclick=async()=>{
 $('target-mode').onchange=()=>{$('existing-table-wrap').hidden=$('target-mode').value!=='existing';fillExistingTables();};
 $('incremental-enabled').onchange=()=>{$('incremental-column-wrap').hidden=!$('incremental-enabled').checked;};
 function fillExistingTables(){$('existing-table').innerHTML='<option value="">请选择飞书表</option>'+store.feishuTables.map(t=>`<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');}
-$('cancel-job-edit').onclick=()=>{editorRequest++;$('job-editor-panel').hidden=true;renderTables();};
-$('save-job').onclick=async()=>{const sourceId=$('job-source-id').value;if(!sourceId)return;const columns=selectedColumns();const job={id:$('job-id').value,name:$('job-name').value.trim(),source_id:sourceId,schema:$('job-schema').value,table:$('job-table').value,enabled:$('job-enabled').checked,columns,unique_key:$('unique-key').value,split:{enabled:$('split-enabled').checked,row_limit:Number($('split-row-limit').value),column:$('split-column').value},incremental:{enabled:$('incremental-enabled').checked,column:$('incremental-enabled').checked?$('incremental-column').value:''},target:{mode:$('target-mode').value,table_id:$('target-mode').value==='existing'?$('existing-table').value:(store.config.jobs.find(j=>j.id===$('job-id').value)?.target.table_id||''),table_name:$('target-table-name').value.trim(),auto_create_fields:$('auto-fields').checked}};const previous=store.config.jobs.find(j=>j.id===job.id);if(previous?.generated_key&&previous.unique_key===job.unique_key)job.generated_key=previous.generated_key;const index=store.config.jobs.findIndex(j=>j.id===job.id);if(index>=0)store.config.jobs[index]=job;else store.config.jobs.push(job);const ok=await persistJobs();message('job-message',ok,ok?'任务已保存':'保存失败');if(ok){updateSavedTablePlan(job);$('job-editor-panel').hidden=true;renderTables();}};
+$('save-job').onclick=async()=>{
+    const sourceId=$('job-source-id').value;
+    if(!sourceId||editorSaving)return;
+    if(!$('unique-key').value){message('job-message',false,'请选择唯一键后保存。');$('unique-key').focus();return;}
+    if(!$('split-row-limit').checkValidity()){$('editor-advanced').open=true;$('split-row-limit').reportValidity();return;}
+    const previous=store.config.jobs.find(job=>job.id===$('job-id').value);
+    const job={
+        id:$('job-id').value,name:$('job-name').value.trim(),source_id:sourceId,
+        schema:$('job-schema').value,table:$('job-table').value,enabled:$('job-enabled').checked,
+        columns:selectedColumns(),unique_key:$('unique-key').value,
+        split:{enabled:$('split-enabled').checked,row_limit:Number($('split-row-limit').value),column:$('split-column').value},
+        incremental:{enabled:$('incremental-enabled').checked,column:$('incremental-enabled').checked?$('incremental-column').value:''},
+        target:{mode:$('target-mode').value,table_id:$('target-mode').value==='existing'?$('existing-table').value:(previous?.target.table_id||''),
+            table_name:$('target-table-name').value.trim(),auto_create_fields:$('auto-fields').checked}
+    };
+    if(previous?.generated_key&&previous.unique_key===job.unique_key)job.generated_key=previous.generated_key;
+    const jobs=store.config.jobs.map(item=>item.id===job.id?job:item);
+    if(!previous)jobs.push(job);
+    editorSaving=true;
+    $('job-editor-fields').disabled=true;
+    $('cancel-job-edit').disabled=true;
+    $('close-job-editor').disabled=true;
+    $('save-job').disabled=true;
+    $('save-job').textContent='正在保存...';
+    try{
+        const data=await api('/api/jobs',{method:'POST',body:JSON.stringify({jobs})});
+        if(!data.ok)throw new Error(data.message);
+        store.config=data.config;
+        renderAll();
+        updateSavedTablePlan(job);
+        renderTables();
+        editorSaving=false;
+        closeJobEditor(true);
+        message('discovery-message',true,`已保存 ${job.name||job.table}，下次同步时生效。`);
+    }catch(error){message('job-message',false,`保存失败，修改已保留。${error.message}`);}
+    finally{editorSaving=false;$('job-editor-fields').disabled=false;$('cancel-job-edit').disabled=false;$('close-job-editor').disabled=false;$('save-job').disabled=false;$('save-job').textContent='保存修改';}
+};
 async function persistJobs(){const d=await api('/api/jobs',{method:'POST',body:JSON.stringify({jobs:store.config.jobs})});if(d.ok){store.config=d.config;renderAll();return true;}alert(d.message);await loadWorkspace();return false;}
-function renderJobs(){const list=$('job-list');const query=$('job-search').value.trim().toLowerCase();const status=$('job-status-filter').value;const jobs=store.config.jobs.filter(j=>`${j.name} ${j.schema}.${j.table} ${sourceName(j.source_id)}`.toLowerCase().includes(query)&&(status==='enabled'?j.enabled:status==='disabled'?!j.enabled:true));$('job-result-count').textContent=`${jobs.length}/${store.config.jobs.length} 个任务`;list.className=jobs.length?'job-list':'job-list empty';list.innerHTML=jobs.length?jobs.map(j=>{const st=store.states[j.id];return `<article class="job-card"><label class="switch"><input type="checkbox" data-enable="${j.id}" ${j.enabled?'checked':''} aria-label="启用 ${escapeHtml(j.name)}"><span>${j.enabled?'启用':'停用'}</span></label><div class="job-main"><b>${escapeHtml(j.name)}</b><small>${escapeHtml(sourceName(j.source_id))} · ${escapeHtml(j.schema)}.${escapeHtml(j.table)} · ${j.columns.length} 个字段</small><div class="tags"><span>${j.incremental.enabled?'增量':'全量扫描'}</span>${j.split?.enabled?`<span>分表上限 ${j.split.row_limit} 行${j.split.column?' · '+escapeHtml(j.split.column):''}</span>`:''}<span>${j.target.table_id?'已绑定飞书表':'自动建表'}</span>${st?.last_success_at?`<span>上次成功 ${escapeHtml(st.last_success_at)}</span>`:''}</div></div><div class="job-actions"><button class="btn secondary" data-edit-job="${j.id}">编辑</button><button class="btn secondary" data-run-job="${j.id}">预检</button>${j.incremental.enabled?`<button class="btn secondary" data-reset-job="${j.id}">重置游标</button>`:''}<button class="btn danger" data-delete-job="${j.id}">删除</button></div></article>`;}).join(''):(store.config.jobs.length?'没有匹配的任务，请调整搜索或状态筛选。':'还没有任务。请先在上方保存同步计划。');list.querySelectorAll('[data-enable]').forEach(x=>x.onchange=async()=>{const j=store.config.jobs.find(j=>j.id===x.dataset.enable);j.enabled=x.checked;if(await persistJobs())updateSavedTablePlan(j);renderTables();});list.querySelectorAll('[data-edit-job]').forEach(x=>x.onclick=()=>{const j=store.config.jobs.find(j=>j.id===x.dataset.editJob);openJobEditor(j.source_id,j.schema,j.table);});list.querySelectorAll('[data-run-job]').forEach(x=>x.onclick=()=>startRun(true,x.dataset.runJob));list.querySelectorAll('[data-reset-job]').forEach(x=>x.onclick=async()=>{if(!confirm('重置后该任务下次会执行全量扫描，确认继续？'))return;const d=await api(`/api/jobs/${x.dataset.resetJob}/state`,{method:'DELETE'});alert(d.message);if(d.ok)loadWorkspace();});list.querySelectorAll('[data-delete-job]').forEach(x=>x.onclick=async()=>{if(!confirm('确认删除该同步任务？'))return;store.config.jobs=store.config.jobs.filter(j=>j.id!==x.dataset.deleteJob);await persistJobs();});}
-$('job-search').oninput=renderJobs;
-$('job-status-filter').onchange=renderJobs;
+function renderJobs(){
+    const list=$('job-list');
+    const query=$('job-search').value.trim();
+    const status=$('job-status-filter').value;
+    const jobs=store.config.jobs.filter(job=>
+        matchesSearch(`${job.name} ${job.schema}.${job.table} ${sourceName(job.source_id)}`,query)&&
+        (status==='enabled'?job.enabled:status==='disabled'?!job.enabled:true));
+    $('job-result-count').textContent=`${jobs.length}/${store.config.jobs.length} 个任务`;
+    const page=pageItems(jobs,'job');
+    const scrollTop=list.scrollTop;
+    list.className=jobs.length?'job-list':'job-list empty';
+    list.innerHTML=jobs.length?page.map(job=>{
+        const state=store.states[job.id];
+        return `<article class="job-card">
+            <label class="switch"><input type="checkbox" data-enable="${job.id}" ${job.enabled?'checked':''} aria-label="启用 ${escapeHtml(job.name)}"><span>${job.enabled?'启用':'停用'}</span></label>
+            <div class="job-main"><b>${escapeHtml(job.name)}</b>
+                <small>${escapeHtml(sourceName(job.source_id))} · ${escapeHtml(job.schema)}.${escapeHtml(job.table)} · ${job.columns.length} 个字段</small>
+                <div class="tags"><span>${job.incremental.enabled?'增量':'全量扫描'}</span>
+                    ${job.split?.enabled?`<span>分表上限 ${job.split.row_limit} 行${job.split.column?' · '+escapeHtml(job.split.column):''}</span>`:''}
+                    <span>${job.target.table_id?'已绑定飞书表':'自动建表'}</span>
+                    ${state?.last_success_at?`<span>上次成功 ${escapeHtml(state.last_success_at)}</span>`:''}
+                </div>
+            </div>
+            <div class="job-actions">
+                <button class="btn secondary" data-edit-job="${job.id}">编辑</button>
+                <button class="btn secondary" data-run-job="${job.id}">预检</button>
+                ${job.incremental.enabled?`<button class="btn secondary" data-reset-job="${job.id}">重置游标</button>`:''}
+                <button class="btn danger" data-delete-job="${job.id}">删除</button>
+            </div>
+        </article>`;
+    }).join(''):(store.config.jobs.length?'没有匹配的任务，请调整搜索或状态筛选。':'还没有任务。请先在上方保存同步计划。');
+    list.scrollTop=scrollTop;
+    list.querySelectorAll('[data-enable]').forEach(input=>input.onchange=async()=>{
+        const job=store.config.jobs.find(item=>item.id===input.dataset.enable);
+        job.enabled=input.checked;
+        if(await persistJobs())updateSavedTablePlan(job);
+        renderTables();
+    });
+    list.querySelectorAll('[data-edit-job]').forEach(button=>button.onclick=()=>{
+        const job=store.config.jobs.find(item=>item.id===button.dataset.editJob);
+        openJobEditor(job.source_id,job.schema,job.table);
+    });
+    list.querySelectorAll('[data-run-job]').forEach(button=>button.onclick=()=>startRun(true,button.dataset.runJob));
+    list.querySelectorAll('[data-reset-job]').forEach(button=>button.onclick=async()=>{
+        if(!confirm('重置后该任务下次会执行全量扫描，确认继续？'))return;
+        const data=await api(`/api/jobs/${button.dataset.resetJob}/state`,{method:'DELETE'});
+        alert(data.message);
+        if(data.ok)loadWorkspace();
+    });
+    list.querySelectorAll('[data-delete-job]').forEach(button=>button.onclick=async()=>{
+        if(!confirm('确认删除该同步任务？'))return;
+        store.config.jobs=store.config.jobs.filter(job=>job.id!==button.dataset.deleteJob);
+        await persistJobs();
+    });
+}
+$('job-search').oninput=()=>{listPages.job=1;renderJobs();};
+$('job-status-filter').onchange=()=>{listPages.job=1;renderJobs();};
 
 $('load-run-history').onclick=async()=>{const output=$('run-history');try{const d=await api('/api/run-logs?n=1000');if(!d.ok)throw new Error(d.message||'读取历史日志失败');output.textContent=d.log||'暂无历史运行日志';output.scrollTop=output.scrollHeight;}catch(error){output.textContent=error.message||'读取历史日志失败';}};
 function applyRunStatus(status){

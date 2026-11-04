@@ -1,0 +1,116 @@
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const path = require('node:path');
+
+function uiContext() {
+    const elements = new Map();
+    const element = id => {
+        if (!elements.has(id)) elements.set(id, {
+            id, value: '', innerHTML: '', textContent: '', checked: false, disabled: false,
+            scrollTop: 0, hidden: false, dataset: {}, open: false,
+            addEventListener() {}, querySelectorAll() {return [];},
+            showModal() {this.open = true;}, close() {this.open = false;},
+            checkValidity() {return true;}, reportValidity() {return true;}, focus() {},
+        });
+        return elements.get(id);
+    };
+    const document = {
+        getElementById: element,
+        querySelectorAll() {return [];},
+        querySelector() {return {content:'test'};},
+    };
+    const context = vm.createContext({document, Headers, CSS:{escape:value=>value}, confirm:()=>true});
+    const html = fs.readFileSync(path.join(__dirname, '../templates/index.html'), 'utf8');
+    const source = html.split('<script>')[1].split('</script>')[0].replace(/loadWorkspace\(\);\s*$/, '');
+    vm.runInContext(source, context);
+    return {context, element, run: code => vm.runInContext(code, context)};
+}
+
+test('selection remains global across pages and multiple-name search', () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[{id:'a',name:'客户库'}],jobs:[]};
+        store.tables=Array.from({length:210},(_,index)=>({source_id:'a',schema:'dbo',name:'Table'+index}));
+        $('builder-source').value='a';
+        restoreTablePlan();
+        renderTables();
+    `);
+    assert.equal((ui.element('table-list').innerHTML.match(/class="table-row/g)||[]).length, 20);
+    ui.element('table-next').onclick();
+    assert.match(ui.element('table-page-info').textContent, /第 2\/11 页/);
+    assert.equal(ui.run('pendingTables.size'), 210);
+    ui.element('table-search').value='Table100,Table209';
+    ui.element('table-search').oninput();
+    assert.equal(ui.run('visibleTables().length'), 2);
+    ui.element('clear-visible-tables').onclick();
+    assert.equal(ui.run('pendingTables.size'), 208);
+    assert.equal(ui.run('pendingTables.has(tableKey("a","dbo","Table100"))'), false);
+    ui.element('table-search').value='';
+    ui.element('table-search').oninput();
+    assert.equal(ui.run('pendingTables.size'), 208);
+});
+
+test('saving drawer preserves order, page and pending table selections', async () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[{id:'a',name:'客户库'}],jobs:Array.from({length:45},(_,i)=>({
+            id:'job'+i,source_id:'a',schema:'dbo',table:'Table'+i,name:'Task'+i,enabled:true,
+            columns:[{source:'Id',target:'Id',sql_type:'int'}],unique_key:'Id',
+            incremental:{enabled:false,column:''},target:{mode:'auto',table_id:'',table_name:'Target'+i,auto_create_fields:true}
+        }))};
+        store.tables=[];
+        listPages.job=2;
+        renderAll=()=>renderJobs();
+        selectedColumns=()=>[{source:'Id',target:'Id',sql_type:'int'}];
+        $('job-id').value='job25';$('job-source-id').value='a';
+        $('job-schema').value='dbo';$('job-table').value='Table25';
+        $('job-name').value='编辑后的任务';$('job-enabled').checked=true;
+        $('unique-key').value='Id';$('split-row-limit').value='40000';
+        $('target-mode').value='auto';$('target-table-name').value='Target25';
+        $('job-editor-dialog').open=true;
+        api=async(url, options)=>({ok:true,config:{...store.config,jobs:JSON.parse(options.body).jobs}});
+    `);
+    await ui.element('save-job').onclick();
+    assert.equal(ui.run('store.config.jobs[25].id'), 'job25');
+    assert.equal(ui.run('store.config.jobs[25].name'), '编辑后的任务');
+    assert.equal(ui.run('listPages.job'), 2);
+    assert.equal(ui.element('job-editor-dialog').open, false);
+});
+
+test('failed drawer save retains input and saved configuration for retry', async () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[],jobs:[{id:'job',target:{table_id:''},name:'原任务'}]};
+        selectedColumns=()=>[{source:'Id',target:'Id',sql_type:'int'}];
+        $('job-id').value='job';$('job-source-id').value='a';$('job-name').value='未保存的修改';
+        $('unique-key').value='Id';$('target-mode').value='auto';
+        $('split-row-limit').value='40000';$('job-editor-dialog').open=true;
+        api=async()=>{throw new Error('network disconnected');};
+    `);
+    await ui.element('save-job').onclick();
+    assert.equal(ui.element('job-name').value, '未保存的修改');
+    assert.equal(ui.run('store.config.jobs[0].name'), '原任务');
+    assert.equal(ui.element('job-editor-dialog').open, true);
+    assert.equal(ui.element('save-job').disabled, false);
+    assert.equal(ui.element('job-editor-fields').disabled, false);
+    assert.match(ui.element('job-message').textContent, /修改已保留/);
+});
+
+
+test('opening an excluded table for editing keeps the current plan selection', async () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[{id:'a',name:'库'}],jobs:[{id:'job',source_id:'a',schema:'dbo',table:'Orders',
+            enabled:true,columns:[{source:'Id',target:'Id',sql_type:'int'}],unique_key:'Id',
+            incremental:{enabled:false},target:{mode:'auto',table_name:'Orders'}}]};
+        store.tables=[{source_id:'a',schema:'dbo',name:'Orders'}];
+        pendingTables.clear();
+        renderColumns=()=>{};
+        api=async()=>({ok:true,columns:[{name:'Id',sql_type:'int'}],primary_key:['Id']});
+    `);
+    await ui.run('openJobEditor("a","dbo","Orders")');
+    assert.equal(ui.element('job-enabled').checked, false);
+    assert.equal(ui.element('job-editor-dialog').open, true);
+});

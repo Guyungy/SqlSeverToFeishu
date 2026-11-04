@@ -45,3 +45,40 @@
     #view-builder .table-list{max-height:480px}
     .job-filters{flex-direction:column}
 }
+
+/* Keep large-list navigation independent from the task editor. */
+.list-scope{font-size:12px;color:var(--muted);margin:12px 0 0}
+.list-pagination{display:flex;align-items:center;gap:10px;padding-top:14px;margin-top:14px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}
+.list-pagination label{display:flex;align-items:center;gap:8px;font-size:12px}
+.list-pagination select{width:auto;padding:7px 26px 7px 9px}
+.list-pagination span{margin-left:auto;font-variant-numeric:tabular-nums}
+#job-editor-dialog{position:fixed;inset:0 0 0 auto;margin:0;border:0;padding:0;width:min(760px,100vw);height:100dvh;max-height:100dvh;max-width:100vw;background:#fff;box-shadow:-12px 0 40px rgba(20,39,70,.16);overflow:auto;color:var(--ink)}
+#job-editor-dialog::backdrop{background:rgba(18,30,50,.38)}
+#job-editor-dialog .panel{margin:0;padding:0 24px;border:0;border-radius:0;box-shadow:none}
+#job-editor-dialog .editor-header{position:sticky;top:0;background:#fff;z-index:5;margin:0 -24px 20px;padding:20px 24px;border-bottom:1px solid var(--line)}
+#job-editor-dialog .editor-footer{position:sticky;bottom:0;background:#fff;z-index:5;margin:24px -24px 0;padding:16px 24px;box-shadow:0 -5px 18px rgba(20,39,70,.04);flex-wrap:wrap}
+#job-editor-dialog .editor-footer .message{flex:1;min-width:180px}
+#job-editor-dialog .column-list{grid-template-columns:1fr;max-height:360px;overflow:auto;padding:2px}
+#job-editor-dialog .column-tools{display:flex;align-items:end;gap:8px;margin-bottom:12px}
+#job-editor-dialog .column-tools label{flex:1}
+#job-editor-dialog .column-tools button{font-size:12px;padding:10px;white-space:nowrap}
+#job-editor-dialog .column-row{grid-template-columns:26px minmax(100px,1fr) minmax(130px,1fr)}
+#job-editor-dialog .field-header{gap:12px;flex-wrap:wrap;font-size:13px}
+#job-editor-dialog .job-settings{padding:14px;gap:14px;background:#f7f9fc}
+body:has(#job-editor-dialog[open]){overflow:hidden}
+@media(max-width:720px){
+    .list-pagination{flex-wrap:wrap;gap:8px}
+    .list-pagination span{font-size:12px}
+    #job-editor-dialog .panel{padding:0 16px}
+    #job-editor-dialog .editor-header{margin:0 -16px 16px;padding:16px}
+    #job-editor-dialog .editor-footer{margin:20px -16px 0;padding:14px 16px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    #job-editor-dialog .editor-footer .message{grid-column:1/-1;min-width:0}
+    #job-editor-dialog .column-tools{flex-wrap:wrap}
+    #job-editor-dialog .column-tools label{flex-basis:100%}
+    #job-editor-dialog .column-row{grid-template-columns:24px 1fr}
+    #job-editor-dialog .column-row .target-name{grid-column:2}
+}
+#job-editor-fields{border:0;padding:0;margin:0;min-width:0}
+.editor-advanced{margin-top:18px;border-top:1px solid var(--line);padding-top:16px}
+.editor-advanced summary{cursor:pointer;font-weight:600;color:var(--ink);padding:4px 0}
+.editor-advanced summary span{font-size:12px;font-weight:400;color:var(--muted);margin-left:10px}
