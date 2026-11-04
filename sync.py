@@ -77,7 +77,7 @@ def _clean_identifier_part(part: str) -> str:
         raise ConfigError("SQL 标识符为空或过长")
     if any(token in value for token in (";", "--", "/*", "*/", "'", '"', "\x00")):
         raise ConfigError(f"SQL 标识符包含不安全字符: {part}")
-    if re.search(r"[\r\n\t()]", value):
+    if re.search(r"[\r\n\t]", value):
         raise ConfigError(f"SQL 标识符格式不正确: {part}")
     return value
 
@@ -85,6 +85,8 @@ def _clean_identifier_part(part: str) -> str:
 def parse_table_name(table_name: str) -> Tuple[str, str]:
     """Accept only table or schema.table, returning unquoted parts."""
     raw = (table_name or "").strip()
+    if re.search(r"\(\s*\)$", raw):
+        raise ConfigError("数据表名不能是函数调用")
     parts = raw.split(".")
     if len(parts) == 1:
         return "dbo", _clean_identifier_part(parts[0])

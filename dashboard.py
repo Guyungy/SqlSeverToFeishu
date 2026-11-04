@@ -462,7 +462,11 @@ def test_source_api(source_id: str):
             with conn.cursor() as cursor:
                 cursor.execute("SELECT DB_NAME(), @@SERVERNAME")
                 database, server = cursor.fetchone()
-        return jsonify({"ok": True, "message": f"连接成功：{server or source['server']} / {database}"})
+                cursor.execute("SELECT CAST(N'中文编码校验' AS NVARCHAR(50))")
+                sample = cursor.fetchone()[0]
+                if sample != "中文编码校验":
+                    raise ValueError("数据库连接成功，但中文读取校验失败，请检查 SQL Server 客户端字符集配置")
+        return jsonify({"ok": True, "message": f"连接成功：{server or source['server']} / {database}，中文读取校验通过"})
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "SQL Server 连接失败")}), 400
 
