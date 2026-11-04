@@ -13,6 +13,7 @@ import time
 import uuid
 import webbrowser
 from collections import deque
+from functools import wraps
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Optional
@@ -24,6 +25,7 @@ from flask import Flask, abort, jsonify, render_template, request
 from multi_sync import automatic_job, list_primary_key, feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
 from sync import quote_identifier
 from workspace import (
+    config_edit_lock,
     BASE_DIR,
     ENV_PATH,
     SETTINGS_SPEC,
@@ -44,7 +46,7 @@ from workspace import (
 
 load_dotenv(ENV_PATH, override=True)
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 512 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 CSRF_TOKEN = secrets.token_urlsafe(32)
 LOG_PATH = BASE_DIR / "sync.log"
 DASHBOARD_LOG_PATH = BASE_DIR / "dashboard_server.log"
@@ -89,6 +91,14 @@ def security_headers(response):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def edit_config(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        with config_edit_lock():
+            return function(*args, **kwargs)
+    return guarded
 
 
 def safe_error(exc: Exception, fallback: str) -> str:
@@ -195,7 +205,10 @@ class JobManager:
                     process.terminate()
                     return
                 self.process = process
-                self.status = "running"
+                cancelled = self.cancel_requested
+                self.status = "cancelling" if cancelled else "running"
+            if cancelled:
+                self._stop_process(process)
             if process.stdout is None:
                 raise RuntimeError("无法读取同步进程输出")
             for line in process.stdout:
@@ -219,19 +232,35 @@ class JobManager:
                 self.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
                 self.process = None
 
+    def _stop_process(self, process) -> None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
+        threading.Thread(target=self._finish_stop, args=(process,), daemon=True).start()
+
+    def _finish_stop(self, process) -> None:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
     def cancel(self) -> Dict[str, Any]:
         with self.lock:
-            process = self.process
-            if not process or process.poll() is not None:
+            if self.status not in {"starting", "running", "cancelling"} and not self.process:
                 return {"ok": False, "message": "当前没有正在运行的任务"}
+            process = self.process
+            if process and process.poll() is not None:
+                return {"ok": False, "message": "任务已结束"}
             self.cancel_requested = True
             self.status = "cancelling"
             run_logger.info("run=%s event=cancel_requested", self.job_id)
-            if os.name == "nt":
-                process.terminate()
-            else:
-                os.killpg(process.pid, signal.SIGTERM)
-            return {"ok": True, "message": "已发送停止请求"}
+        if process:
+            self._stop_process(process)
+        return {"ok": True, "message": "正在停止任务，未响应的进程将在 5 秒后强制结束"}
 
     def snapshot(self, after: int = 0) -> Dict[str, Any]:
         with self.lock:
@@ -348,6 +377,7 @@ def workspace_api():
 
 
 @app.route("/api/settings", methods=["POST"])
+@edit_config
 def save_settings_api():
     try:
         payload = request.get_json(silent=True) or {}
@@ -382,6 +412,7 @@ def test_feishu_api():
 
 
 @app.route("/api/sources", methods=["POST"])
+@edit_config
 def save_source_api():
     try:
         payload = request.get_json(silent=True) or {}
@@ -391,6 +422,8 @@ def save_source_api():
         existing = next((item for item in config["sources"] if item["id"] == source_id), None)
         source_data["id"] = source_id
         source_data["password_env"] = existing["password_env"] if existing else password_env_key(source_id)
+        if existing and "excluded_tables" in existing:
+            source_data["excluded_tables"] = existing["excluded_tables"]
         source = validate_source(source_data)
         password = str(payload.get("password") or "")
         if password and password not in SECRET_MASKS:
@@ -407,6 +440,7 @@ def save_source_api():
 
 
 @app.route("/api/sources/<source_id>", methods=["DELETE"])
+@edit_config
 def delete_source_api(source_id: str):
     try:
         config = load_config()
@@ -510,6 +544,7 @@ def preview_rows_api(source_id: str):
 
 
 @app.route("/api/jobs/bulk", methods=["POST"])
+@edit_config
 def create_bulk_jobs_api():
     try:
         tables = (request.get_json(silent=True) or {}).get("tables")
@@ -526,21 +561,32 @@ def create_bulk_jobs_api():
         generated_count = 0
         with config_lock:
             config = load_config()
-            identities = {(job["source_id"], job["schema"], job["table"]) for job in config["jobs"]}
+            identities = {(job["source_id"], job["schema"], job["table"]): job for job in config["jobs"]}
             for table in tables:
                 try:
                     identity = (table["source_id"], table["schema"], table["name"])
+                    source = get_source(config, identity[0])
+                    enabled = table.get("enabled", True)
+                    if not isinstance(enabled, bool):
+                        raise ValueError("启用状态必须是布尔值")
+                    excluded = [item for item in source.get("excluded_tables", [])
+                                if (item["schema"], item["table"]) != identity[1:]]
+                    if not enabled:
+                        excluded.append({"schema": identity[1], "table": identity[2]})
+                    source["excluded_tables"] = excluded
                     if identity in identities:
+                        identities[identity]["enabled"] = enabled
                         existing_count += 1
                         continue
-                    source = get_source(config, identity[0])
+                    if not enabled:
+                        continue
                     if not source.get("enabled", True):
                         raise ValueError("数据源已停用")
                     job = automatic_job(source, identity[1], identity[2])
                     # Validate each task before adding it, so errors are isolated by table.
                     job = validate_config({**config, "jobs": [job]})["jobs"][0]
                     config["jobs"].append(job)
-                    identities.add(identity)
+                    identities[identity] = job
                     created += 1
                     generated_count += int("generated_key" in job)
                 except Exception as exc:
@@ -553,6 +599,7 @@ def create_bulk_jobs_api():
 
 
 @app.route("/api/jobs", methods=["POST"])
+@edit_config
 def save_jobs_api():
     try:
         raw_jobs = (request.get_json(silent=True) or {}).get("jobs")
@@ -560,7 +607,12 @@ def save_jobs_api():
             raise ValueError("任务列表格式错误")
         config = load_config()
         validated = validate_config({**config, "jobs": raw_jobs})
+        previous_jobs = {job["id"]: job for job in config["jobs"]}
         for job in validated["jobs"]:
+            previous = previous_jobs.get(job["id"])
+            if previous and all(previous.get(key) == job.get(key) for key in
+                                ("source_id", "schema", "table", "columns", "unique_key", "generated_key")):
+                continue
             source = get_source(validated, job["source_id"])
             metadata = {item["name"] for item in list_columns(source, job["schema"], job["table"])}
             missing = [item["source"] for item in job["columns"] if item["source"] not in metadata

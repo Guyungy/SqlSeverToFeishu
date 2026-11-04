@@ -3,14 +3,18 @@
 """Multi-source, selectable-table, incremental SQL Server to Feishu sync engine."""
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import sys
+import signal
+import sqlite3
+import tempfile
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Any, Dict, List, Optional, Sequence, Tuple
 
 import pymssql
 from dotenv import load_dotenv
@@ -27,6 +31,7 @@ from sync import (
     sync_lock,
 )
 from workspace import (
+    config_edit_lock,
     ENV_PATH,
     get_source,
     load_config,
@@ -213,11 +218,13 @@ def automatic_job(source: Dict[str, Any], schema: str, table: str) -> Dict[str, 
     return job
 
 
-def add_generated_row_keys(rows: List[Dict[str, Any]], job: Dict[str, Any]) -> None:
+def add_generated_row_keys(rows: List[Dict[str, Any]], job: Dict[str, Any],
+                           occurrences: Optional[Dict[str, int]] = None) -> None:
     identity_columns = job["generated_key"]["columns"] or [
         col["source"] for col in job["columns"] if col["source"] != job["unique_key"]
     ]
-    occurrences: Dict[str, int] = {}
+    if occurrences is None:
+        occurrences = {}
     for row in rows:
         identity = json.dumps([(col, row[col]) for col in identity_columns],
                               ensure_ascii=False, default=str, separators=(",", ":"))
@@ -274,7 +281,8 @@ def _encode_cursor(value: Any) -> Dict[str, Any]:
 
 
 def fetch_job_rows(
-    source: Dict[str, Any], job: Dict[str, Any], job_state: Optional[Dict[str, Any]]
+    source: Dict[str, Any], job: Dict[str, Any], job_state: Optional[Dict[str, Any]],
+    row_sink: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Any], bool]:
     metadata = {item["name"]: item for item in list_columns(source, job["schema"], job["table"])}
     if not metadata:
@@ -307,6 +315,9 @@ def fetch_job_rows(
         query += " ORDER BY " + ", ".join(quote_identifier(name) for name in dict.fromkeys(order_columns))
 
     rows: List[Dict[str, Any]] = []
+    max_cursor = None
+    count = 0
+    occurrences: Dict[str, int] = {}
     with sql_connection(source) as conn:
         with conn.cursor(as_dict=True) as cursor:
             cursor.execute(query, params)
@@ -314,14 +325,19 @@ def fetch_job_rows(
                 chunk = cursor.fetchmany(1000)
                 if not chunk:
                     break
-                rows.extend(chunk)
-    if "generated_key" in job:
-        add_generated_row_keys(rows, job)
-    max_cursor = None
-    if incremental_column and rows:
-        cursor_values = [row.get(incremental_column) for row in rows if row.get(incremental_column) is not None]
-        if cursor_values:
-            max_cursor = max(cursor_values)
+                if "generated_key" in job:
+                    add_generated_row_keys(chunk, job, occurrences)
+                if incremental_column:
+                    values = [row[incremental_column] for row in chunk if row.get(incremental_column) is not None]
+                    if values:
+                        chunk_max = max(values)
+                        max_cursor = chunk_max if max_cursor is None else max(max_cursor, chunk_max)
+                if row_sink is not None:
+                    row_sink(chunk)
+                else:
+                    rows.extend(chunk)
+                count += len(chunk)
+                progress("sql_read", 50, f"{job['name']}：已读取 {count} 行")
     return rows, max_cursor, incremental_run
 
 
@@ -454,6 +470,21 @@ def create_field(
     )
 
 
+def save_target_binding(job: Dict[str, Any], table_id: str) -> None:
+    # Running workers retain their execution snapshot. Only merge the discovered
+    # table binding back, so a plan edited in the dashboard remains intact.
+    with config_edit_lock():
+        latest = load_config()
+        current = next((item for item in latest["jobs"] if item["id"] == job["id"]), None)
+        if current is None or any(current.get(key) != job.get(key) for key in ("source_id", "schema", "table")):
+            return
+        if any(current["target"].get(key) != job["target"].get(key)
+               for key in ("mode", "table_name", "table_id")):
+            return
+        current["target"]["table_id"] = table_id
+        save_config(latest)
+
+
 def ensure_target(
     client: FeishuClient,
     app_token: str,
@@ -476,8 +507,8 @@ def ensure_target(
             table_id = matched[0]["table_id"]
             action = "bind_existing"
             if not dry_run and job["target"].get("table_id") != table_id:
+                save_target_binding(job, table_id)
                 job["target"]["table_id"] = table_id
-                save_config(config)
         elif dry_run:
             field_types = {
                 column["target"]: column_field_type(column, job["unique_key"]) for column in job["columns"]
@@ -485,8 +516,8 @@ def ensure_target(
             return None, field_types, "create"
         else:
             table_id = create_table(client, app_token, job)
+            save_target_binding(job, table_id)
             job["target"]["table_id"] = table_id
-            save_config(config)
             action = "created"
 
     fields = client.list_fields(app_token, table_id)
@@ -541,61 +572,77 @@ def run_job(
             f"{job['name']}：数据源、字段、唯一键、增量字段或目标飞书表已变更，本次自动执行全量重新扫描",
         )
         job_state = {}
-    rows, max_cursor, incremental_run = fetch_job_rows(source, job, job_state or None)
     unique_column = next(item for item in job["columns"] if item["source"] == job["unique_key"])
-    unique_field_type = field_types.get(
-        unique_column["target"], column_field_type(unique_column, job["unique_key"])
-    )
-    keys = validate_row_keys(
-        rows, job["unique_key"], job["name"], unique_field_type, settings["timezone_offset"]
-    )
+    unique_field_type = field_types[unique_column["target"]]
+    with tempfile.TemporaryDirectory(prefix="sqlfeishu-") as staging_dir:
+        with contextlib.closing(sqlite3.connect(os.path.join(staging_dir, "records.sqlite"))) as staging:
+            staging.execute("CREATE TABLE source_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL)")
+            staging.execute("CREATE TABLE target_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL)")
+            staging.execute("CREATE TABLE operations (kind TEXT, record TEXT NOT NULL)")
+            counts = {"source_rows": 0, "create": 0, "update": 0, "skip": 0}
 
-    existing: Dict[str, Dict[str, Any]] = {}
-    if table_id:
-        records = client.list_records(app_token, table_id, [item["target"] for item in job["columns"]])
-        unique_target = unique_column["target"]
-        existing = target_record_map(records, unique_target, field_types[unique_target])
+            def stage_rows(chunk):
+                keys = validate_row_keys(chunk, job["unique_key"], job["name"], unique_field_type,
+                                         settings["timezone_offset"])
+                for row, key in zip(chunk, keys):
+                    record = build_record(row, job["columns"], field_types, settings)
+                    try:
+                        staging.execute("INSERT INTO source_rows VALUES (?, ?)",
+                                        (key, json.dumps(record, ensure_ascii=False)))
+                    except sqlite3.IntegrityError as exc:
+                        raise ConfigError(f"任务 {job['name']} 的 SQL 结果存在重复唯一键: {key}") from exc
+                counts["source_rows"] += len(chunk)
+                staging.commit()
 
-    creates: List[Dict[str, Any]] = []
-    updates: List[Dict[str, Any]] = []
-    skipped = 0
-    for row, key in zip(rows, keys):
-        record = build_record(row, job["columns"], field_types, settings)
-        current = existing.get(key)
-        if current:
-            if _records_equal(record["fields"], current.get("fields") or {}):
-                skipped += 1
-            else:
-                record["record_id"] = current["record_id"]
-                updates.append(record)
-        else:
-            creates.append(record)
-
-    summary = {
-        "job_id": job["id"],
-        "job_name": job["name"],
-        "source_rows": len(rows),
-        "create": len(creates),
-        "update": len(updates),
-        "skip": skipped,
-        "incremental": incremental_run,
-        "cursor_reset": cursor_reset,
-        "target_action": target_action,
-        "table_id": table_id or "",
-    }
-    progress(
-        "job_plan", 70,
-        f"{job['name']}：读取 {len(rows)}，新增 {len(creates)}，更新 {len(updates)}，跳过 {skipped}"
-        + ("（已重置增量游标）" if cursor_reset else ""),
-    )
-    if dry_run:
-        return summary
-    if not table_id:
-        raise RuntimeError("正式同步时飞书目标表未创建")
-    for start in range(0, len(creates), BATCH_SIZE):
-        client.batch_create(app_token, table_id, creates[start:start + BATCH_SIZE])
-    for start in range(0, len(updates), BATCH_SIZE):
-        client.batch_update(app_token, table_id, updates[start:start + BATCH_SIZE])
+            _, max_cursor, incremental_run = fetch_job_rows(source, job, job_state or None, row_sink=stage_rows)
+            if table_id:
+                for record in client.iter_records(app_token, table_id, [col["target"] for col in job["columns"]]):
+                    raw = (record.get("fields") or {}).get(unique_column["target"])
+                    if raw is None or raw == "":
+                        continue
+                    key = normalize_business_key(raw, unique_field_type)
+                    try:
+                        staging.execute("INSERT INTO target_rows VALUES (?, ?)",
+                                        (key, json.dumps(record, ensure_ascii=False)))
+                    except sqlite3.IntegrityError as exc:
+                        raise ConfigError(f"飞书目标表存在重复唯一键: {key}") from exc
+            staging.commit()
+            for key, payload in staging.execute("SELECT key, record FROM source_rows"):
+                record = json.loads(payload)
+                current = staging.execute("SELECT record FROM target_rows WHERE key = ?", (key,)).fetchone()
+                kind = "create"
+                if current:
+                    current = json.loads(current[0])
+                    if _records_equal(record["fields"], current.get("fields") or {}):
+                        counts["skip"] += 1
+                        continue
+                    kind = "update"
+                    record["record_id"] = current["record_id"]
+                counts[kind] += 1
+                staging.execute("INSERT INTO operations VALUES (?, ?)",
+                                (kind, json.dumps(record, ensure_ascii=False)))
+            staging.commit()
+            summary = {
+                "job_id": job["id"], "job_name": job["name"], **counts,
+                "incremental": incremental_run, "cursor_reset": cursor_reset,
+                "target_action": target_action, "table_id": table_id or "",
+            }
+            progress("job_plan", 70, f"{job['name']}：读取 {counts['source_rows']}，新增 {counts['create']}，"
+                     f"更新 {counts['update']}，跳过 {counts['skip']}")
+            if dry_run:
+                return summary
+            if not table_id:
+                raise RuntimeError("正式同步时飞书目标表未创建")
+            for kind, write in (("create", client.batch_create), ("update", client.batch_update)):
+                operations = staging.execute("SELECT record FROM operations WHERE kind = ?", (kind,))
+                written = 0
+                while True:
+                    batch = operations.fetchmany(BATCH_SIZE)
+                    if not batch:
+                        break
+                    write(app_token, table_id, [json.loads(item[0]) for item in batch])
+                    written += len(batch)
+                    progress("feishu_write", 85, f"{job['name']}：{kind} 已写入 {written}/{counts[kind]} 条")
     entry: Dict[str, Any] = {
         "last_success_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "table_id": table_id,
@@ -641,6 +688,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--job-id")
     args = parser.parse_args()
+    if os.name != "nt":
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(130))
     try:
         run(dry_run=args.dry_run, job_id=args.job_id)
         return 0

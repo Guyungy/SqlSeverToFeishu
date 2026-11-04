@@ -43,3 +43,6 @@ ui/dist/
 .sync_config.json.*
 .sync_state.json.*
 *.json.tmp
+
+# Dashboard/worker configuration coordination
+sync_config.json.lock

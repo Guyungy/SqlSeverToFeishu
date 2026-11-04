@@ -372,7 +372,12 @@ class FeishuClient:
     def list_records(
         self, app_token: str, table_id: str, field_names: Sequence[str]
     ) -> List[Dict[str, Any]]:
-        items: List[Dict[str, Any]] = []
+        return list(self.iter_records(app_token, table_id, field_names))
+
+    def iter_records(
+        self, app_token: str, table_id: str, field_names: Sequence[str]
+    ) -> Iterable[Dict[str, Any]]:
+        count = 0
         page_token = None
         while True:
             params: Dict[str, Any] = {
@@ -385,10 +390,12 @@ class FeishuClient:
                 "GET", f"/bitable/v1/apps/{app_token}/tables/{table_id}/records", params=params
             )
             page = data.get("data", {})
-            items.extend(page.get("items") or [])
-            progress("feishu_check", min(70, 55 + len(items) // 500), f"已读取飞书现有记录 {len(items)} 条")
+            items = page.get("items") or []
+            count += len(items)
+            yield from items
+            progress("feishu_check", min(70, 55 + count // 500), f"已读取飞书现有记录 {count} 条")
             if not page.get("has_more"):
-                return items
+                return
             page_token = page.get("page_token")
             if not page_token:
                 raise FeishuAPIError("飞书记录分页响应缺少 page_token")
@@ -522,14 +529,44 @@ def _records_equal(source_fields: Dict[str, Any], target_fields: Dict[str, Any])
     return all(target_fields.get(name) == value for name, value in source_fields.items())
 
 
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+    # Windows os.kill(pid, 0) is not a process-existence probe.
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        if ctypes.get_last_error() == 87:
+            return False
+        raise PermissionError("无法检查同步进程")
+    try:
+        code = wintypes.DWORD()
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+            raise PermissionError("无法读取同步进程状态")
+        return code.value == 259
+    finally:
+        kernel.CloseHandle(handle)
+
+
 @contextlib.contextmanager
 def sync_lock():
     if LOCK_PATH.exists():
         try:
             pid = int(LOCK_PATH.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)
-            raise RuntimeError(f"已有同步任务正在运行（PID {pid}）")
-        except ProcessLookupError:
+            if process_is_running(pid):
+                raise RuntimeError(f"已有同步任务正在运行（PID {pid}）")
             LOCK_PATH.unlink(missing_ok=True)
         except (ValueError, PermissionError):
             raise RuntimeError("检测到同步锁文件，请确认没有其他同步任务后删除 .sync.lock")

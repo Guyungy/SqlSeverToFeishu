@@ -3,6 +3,10 @@
 """Configuration and state storage for multi-source synchronization."""
 
 import json
+import errno
+import contextlib
+import threading
+import time
 import os
 import re
 import tempfile
@@ -16,6 +20,43 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 CONFIG_PATH = BASE_DIR / "sync_config.json"
 STATE_PATH = BASE_DIR / "sync_state.json"
+
+
+_config_thread_lock = threading.RLock()
+
+
+@contextlib.contextmanager
+def config_edit_lock():
+    """Serialize dashboard and worker read-modify-write operations."""
+    with _config_thread_lock:
+        lock_path = CONFIG_PATH.with_suffix(".json.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as lock_file:
+            if os.name == "nt":
+                import msvcrt
+                if lock_file.tell() == 0:
+                    lock_file.write(b"0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                            raise
+                        time.sleep(0.1)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def atomic_json_write(path: Path, data: Dict[str, Any]) -> None:
@@ -44,7 +85,8 @@ def update_env(updates: Dict[str, Any]) -> None:
         current[key] = str(value or "")
     fd, temp_name = tempfile.mkstemp(prefix=".env.", dir=str(BASE_DIR), text=True)
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as file:
             for key in sorted(current):
                 file.write(f"{key}={_quote_env(current[key])}\n")
@@ -266,7 +308,7 @@ def validate_source(source: Dict[str, Any]) -> Dict[str, Any]:
     )
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", password_key):
         raise ValueError("密码环境变量名只能包含字母、数字与下划线，且不能以数字开头")
-    return {
+    result = {
         "id": source_id,
         "name": _clean_text(source.get("name"), "数据源名称"),
         "server": _clean_text(source.get("server"), "SQL Server 地址", 255),
@@ -276,6 +318,15 @@ def validate_source(source: Dict[str, Any]) -> Dict[str, Any]:
         "password_env": password_key,
         "enabled": bool(source.get("enabled", True)),
     }
+
+    excluded = source.get("excluded_tables", [])
+    if not isinstance(excluded, list) or any(not isinstance(item, dict) for item in excluded):
+        raise ValueError("排除的数据表配置格式错误")
+    if excluded:
+        result["excluded_tables"] = [{"schema": _clean_sql_identifier(item.get("schema"), "Schema"),
+                                      "table": _clean_sql_identifier(item.get("table"), "数据表")}
+                                     for item in excluded]
+    return result
 
 
 def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, Any]:
