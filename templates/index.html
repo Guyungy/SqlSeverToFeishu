@@ -95,12 +95,12 @@
 
         <section id="view-builder" class="view">
             <div class="panel">
-                <div class="panel-head"><div><p class="kicker">DISCOVERY</p><h2>全部数据库与数据表</h2></div><button id="scan-tables" class="btn primary">一键新建全部表任务</button></div>
-                <div class="inline-form"><label>数据源<select id="builder-source"></select></label><label class="search">筛选表<input id="table-search" placeholder="输入表名"></label></div>
-                <p class="muted">一键发现全部业务数据库，并为全部表和视图直接建立同步任务，自动包含全部字段。已有任务会保留。</p>
+                <div class="panel-head"><div><p class="kicker">DISCOVERY</p><h2>所选数据库的全部数据表</h2></div><button id="scan-tables" class="btn primary">刷新并建立全部表任务</button></div>
+                <div class="inline-form"><label>选择数据库<select id="builder-source"></select></label><label class="search">筛选表<input id="table-search" placeholder="输入表名"></label></div>
+                <p class="muted">选择数据库后，自动为库内全部表和视图建立同步任务，包含全部字段。已有任务会保留，可直接进入预检与同步。</p>
                 <div class="actions wrap"><button id="select-all-tables" class="btn secondary">全选当前筛选表</button><button id="clear-table-selection" class="btn secondary">取消全选</button><button id="configure-selected-tables" class="btn primary">批量新建任务</button><span id="table-selection-count" class="message"></span></div>
                 <p id="discovery-message" class="message" aria-live="polite"></p>
-                <div id="table-list" class="table-list empty">请先配置 SQL Server 连接，再读取全部数据库。</div>
+                <div id="table-list" class="table-list empty">保存数据源并选择数据库后，自动建立全部表任务。</div>
             </div>
 
             <div class="panel" id="job-editor-panel" hidden>
@@ -260,35 +260,37 @@ function editSource(s=blankSource()){$('source-id').value=s.id||'';$('source-nam
 $('new-source').onclick=()=>editSource();
 function renderSources(){const list=$('source-list');list.className=store.config.sources.length?'source-list':'source-list empty';list.innerHTML=store.config.sources.length?store.config.sources.map(s=>`<button class="source-card" data-id="${s.id}"><span><b>${escapeHtml(s.name)}</b><small>${escapeHtml(s.server)}:${s.port}</small></span><em>${escapeHtml(s.database)}</em></button>`).join(''):'暂无数据源。';list.querySelectorAll('[data-id]').forEach(el=>el.onclick=()=>editSource(store.config.sources.find(s=>s.id===el.dataset.id)));}
 function sourcePayload(){return {id:$('source-id').value,name:$('source-name').value.trim(),server:$('source-server').value.trim(),port:Number($('source-port').value),database:$('source-database').value.trim(),user:$('source-user').value.trim(),enabled:true};}
-$('save-source').onclick=async()=>{message('source-message',true,'保存中...');const d=await api('/api/sources',{method:'POST',body:JSON.stringify({source:sourcePayload(),password:$('source-password').value})});message('source-message',d.ok,d.message);if(d.ok){store.config=d.config;renderAll();editSource(store.config.sources.find(s=>s.id===d.source_id));}};
+$('save-source').onclick=async()=>{message('source-message',true,'保存中...');const d=await api('/api/sources',{method:'POST',body:JSON.stringify({source:sourcePayload(),password:$('source-password').value})});message('source-message',d.ok,d.message);if(d.ok){store.config=d.config;renderAll();editSource(store.config.sources.find(s=>s.id===d.source_id));$('builder-source').value=d.source_id;nav('builder');await $('scan-tables').onclick();}};
 $('test-source').onclick=async()=>{const id=$('source-id').value;message('source-message',true,'测试中...');const d=await api(`/api/sources/${id}/test`,{method:'POST',body:'{}'});message('source-message',d.ok,d.message);};
 $('load-databases').onclick=async()=>{const id=$('source-id').value;message('source-message',true,'识别中...');const d=await api(`/api/sources/${id}/databases`);message('source-message',d.ok,d.ok?`识别到 ${d.databases.length} 个数据库`:d.message);if(d.ok){$('database-options').innerHTML=d.databases.map(x=>`<option value="${escapeHtml(x)}">`).join('');}};
 $('delete-source').onclick=async()=>{const id=$('source-id').value;if(!confirm('确认删除此数据源？'))return;const d=await api(`/api/sources/${id}`,{method:'DELETE'});message('source-message',d.ok,d.message);if(d.ok){store.config=d.config;renderAll();editSource();}};
 
-function renderSourceSelect(){const sel=$('builder-source');const current=sel.value;sel.innerHTML='<option value="">全部数据库</option>'+store.config.sources.map(s=>`<option value="${s.id}">${escapeHtml(s.name)} / ${escapeHtml(s.database)}</option>`).join('');if(store.config.sources.some(s=>s.id===current))sel.value=current;}
+function renderSourceSelect(){const sel=$('builder-source');const current=sel.value;sel.innerHTML='<option value="">请选择数据库</option>'+store.config.sources.map(s=>`<option value="${s.id}">${escapeHtml(s.name)} / ${escapeHtml(s.database)}</option>`).join('');if(store.config.sources.some(s=>s.id===current))sel.value=current;}
 $('scan-tables').onclick=async()=>{
+    const sourceId=$('builder-source').value;
     const requestId=++discoveryRequest;
+    if(!sourceId){$('scan-tables').disabled=false;store.tables=[];pendingTables.clear();renderTables();message('discovery-message',false,'请选择要同步的数据库');return;}
+    store.tables=[];pendingTables.clear();renderTables();
     $('scan-tables').disabled=true;
-    message('discovery-message',true,'正在发现全部业务数据库和数据表...');
+    message('discovery-message',true,'正在读取所选数据库的全部表...');
     try{
-        const data=await api('/api/discovery',{method:'POST',body:'{}'});
-        if(requestId!==discoveryRequest)return;
+        const data=await api('/api/discovery',{method:'POST',body:JSON.stringify({source_id:sourceId})});
+        if(requestId!==discoveryRequest||sourceId!==$('builder-source').value)return;
         if(!data.ok){message('discovery-message',false,data.message);return;}
         store.config=data.config;store.tables=data.tables||[];
         pendingTables.clear();
-        $('builder-source').value='';
         renderAll();
         addPendingTables(store.tables);
         renderTables();
         message('discovery-message',!(data.errors||[]).length,
-            `已读取 ${new Set(store.tables.map(t=>t.source_id)).size} 个数据库、${store.tables.length} 张表，默认全部选中。`+
+            `已读取所选数据库 ${store.tables.length} 张表。`+
             (data.errors||[]).join('；'));
         if(store.tables.length)await createTableJobs(store.tables);
         if((data.errors||[]).length)message('discovery-message',false,$('discovery-message').textContent+'；数据库读取失败 '+data.errors.join('；'));
     }catch(error){message('discovery-message',false,error.message);}
-    finally{$('scan-tables').disabled=false;}
+    finally{if(requestId===discoveryRequest)$('scan-tables').disabled=false;}
 };
-$('builder-source').onchange=()=>{renderTables();};
+$('builder-source').onchange=async()=>{editorRequest++;$('job-editor-panel').hidden=true;await $('scan-tables').onclick();};
 $('table-search').oninput=renderTables;
 function tableKey(sourceId,schema,table){return JSON.stringify([sourceId,schema,table]);}
 function updateTableSelection(){
@@ -316,10 +318,13 @@ $('select-all-tables').onclick=()=>{addPendingTables(visibleTables());renderTabl
 $('clear-table-selection').onclick=()=>{pendingTables.clear();renderTables();updateTableSelection();};
 $('configure-selected-tables').onclick=()=>createTableJobs([...pendingTables.values()].map(t=>({source_id:t.sourceId,schema:t.schema,name:t.table})));
 async function createTableJobs(tables){
+    const requestId=discoveryRequest;
+    const sourceId=$('builder-source').value;
     $('configure-selected-tables').disabled=true;
     message('discovery-message',true,'正在为全部表建立任务...');
     try{
         const data=await api('/api/jobs/bulk',{method:'POST',body:JSON.stringify({tables})});
+        if(requestId!==discoveryRequest||sourceId!==$('builder-source').value)return;
         if(!data.ok){message('discovery-message',false,data.message);return;}
         store.config=data.config;
         for(const job of store.config.jobs)pendingTables.delete(tableKey(job.source_id,job.schema,job.table));

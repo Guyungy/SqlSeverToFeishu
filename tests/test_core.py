@@ -741,48 +741,47 @@ class DesignerPreviewTests(unittest.TestCase):
 
 
 class DefaultDiscoveryTests(unittest.TestCase):
-    def discover(self, config, databases, tables):
+    def discover(self, config, source_id, tables):
         with mock.patch.object(dashboard, 'load_config', return_value=config), \
-             mock.patch.object(dashboard, 'save_config', side_effect=workspace.validate_config), \
-             mock.patch.object(dashboard, 'list_databases', return_value=databases) as catalog, \
+             mock.patch.object(dashboard, 'list_databases') as catalog, \
              mock.patch.object(dashboard, 'list_tables', side_effect=tables) as metadata:
-            response = dashboard.app.test_client().post('/api/discovery', json={},
+            response = dashboard.app.test_client().post('/api/discovery', json={"source_id": source_id},
                 headers={'Host': '127.0.0.1:5001', 'X-CSRF-Token': dashboard.CSRF_TOKEN})
         return response, catalog, metadata
 
-    def test_all_databases_and_tables_are_discovered_idempotently(self):
+    def test_only_selected_database_is_scanned_and_all_tables_are_returned(self):
         config = workspace.validate_config(WorkspaceConfigTests().sample())
         source = config['sources'][0]
-        source['database'] = 'Orders'
-        table = {'schema': 'dbo', 'name': 'Orders', 'type': 'table'}
-        response, _, metadata = self.discover(config, ['Orders', 'Archive'], [[table], [table]])
+        config['sources'].append({**source, 'id': 'other', 'database': 'Other'})
+        tables = [{'schema': 'dbo', 'name': 'Orders', 'type': 'table'},
+                  {'schema': 'report', 'name': 'Summary', 'type': 'view'}]
+        response, catalog, metadata = self.discover(config, source['id'], [tables])
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(len(data['tables']), 2)
-        self.assertEqual(metadata.call_count, 2)
-        self.assertEqual({s['database'] for s in config['sources']}, {'Orders', 'Archive'})
-        self.assertTrue(all(s['password_env'] == source['password_env'] for s in config['sources']))
+        self.assertEqual({t['source_id'] for t in data['tables']}, {source['id']})
+        metadata.assert_called_once_with(source)
+        catalog.assert_not_called()
+        self.assertEqual(len(config['sources']), 2)
         self.assertTrue(all('password_env' not in s for s in data['config']['sources']))
-        ids = [s['id'] for s in config['sources']]
-        response, _, metadata = self.discover(config, ['Orders', 'Archive'], [[table], [table]])
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(metadata.call_count, 2)
-        self.assertEqual(ids, [s['id'] for s in config['sources']])
 
-    def test_failed_database_is_reported_and_other_databases_remain_visible(self):
+    def test_database_error_is_reported(self):
         config = workspace.validate_config(WorkspaceConfigTests().sample())
-        config['sources'][0]['database'] = 'Orders'
-        table = {'schema': 'dbo', 'name': 'Orders', 'type': 'table'}
-        response, _, _ = self.discover(config, ['Orders', 'Archive'], [[table], RuntimeError('unavailable')])
-        data = response.get_json()
-        self.assertEqual(len(data['tables']), 1)
-        self.assertEqual(len(data['errors']), 1)
-        self.assertEqual(len(config['sources']), 1)
+        response, _, _ = self.discover(config, config['sources'][0]['id'], [RuntimeError('unavailable')])
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()['ok'])
 
     def test_disabled_connections_are_not_scanned(self):
         config = workspace.validate_config(WorkspaceConfigTests().sample())
         config['sources'][0]['enabled'] = False
-        response, catalog, metadata = self.discover(config, [], [])
+        response, catalog, metadata = self.discover(config, config['sources'][0]['id'], [])
+        self.assertEqual(response.status_code, 400)
+        catalog.assert_not_called()
+        metadata.assert_not_called()
+
+    def test_selection_is_required(self):
+        config = workspace.validate_config(WorkspaceConfigTests().sample())
+        response, catalog, metadata = self.discover(config, '', [])
         self.assertEqual(response.status_code, 400)
         catalog.assert_not_called()
         metadata.assert_not_called()
