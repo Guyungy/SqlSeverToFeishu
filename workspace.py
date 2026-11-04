@@ -329,6 +329,15 @@ def validate_source(source: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def default_split_column(columns: List[Dict[str, Any]]) -> str:
+    dates = [col["source"] for col in columns if col["sql_type"] in
+             {"date", "datetime", "datetime2", "datetimeoffset", "smalldatetime"}]
+    preferred = ("创建时间", "创建日期", "createdat", "createtime", "createdtime",
+                 "更新时间", "更新日期", "updatedat", "updatetime", "modifiedat")
+    normalized = {name.lower().replace("_", ""): name for name in dates}
+    return next((normalized[name] for name in preferred if name in normalized), dates[0] if dates else "")
+
+
 def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, Any]:
     job_id = _clean_text(job.get("id") or new_id("job"), "同步任务 ID", 64)
     if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
@@ -376,6 +385,17 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
             raise ValueError("自动行标识引用了无效字段")
         if incremental_enabled:
             raise ValueError("自动行标识任务使用全量同步")
+    split = job.get("split") or {}
+    if not isinstance(split, dict):
+        raise ValueError("自动分表配置格式错误")
+    row_limit = split.get("row_limit", 40000)
+    if isinstance(row_limit, bool) or not isinstance(row_limit, int) or not 1 <= row_limit <= 40000:
+        raise ValueError("每张分表行数应为 1 至 40000 的整数")
+    split_column = str(split.get("column", default_split_column(clean_columns)) or "")
+    if split_column and not any(item["source"] == split_column and item["sql_type"] in
+                                {"date", "datetime", "datetime2", "datetimeoffset", "smalldatetime"}
+                                for item in clean_columns):
+        raise ValueError("分表时间字段必须是已勾选的日期字段")
     target = job.get("target") or {}
     target_mode = target.get("mode") or "auto"
     if target_mode not in {"auto", "existing"}:
@@ -392,6 +412,7 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
         "enabled": bool(job.get("enabled", True)),
         "columns": clean_columns,
         "unique_key": unique_key,
+        "split": {"enabled": bool(split.get("enabled", True)), "row_limit": row_limit, "column": split_column},
         "incremental": {"enabled": incremental_enabled, "column": incremental_column},
         "target": {
             "mode": target_mode,

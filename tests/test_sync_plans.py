@@ -99,6 +99,7 @@ class LargeSyncTests(unittest.TestCase):
         state = {'jobs': {}}
         job = config['jobs'][0]
         client = mock.Mock()
+        client.list_tables.return_value = []
         client.iter_records.return_value = iter(records)
         if fail_write:
             client.batch_create.side_effect = RuntimeError('write failed')
@@ -140,6 +141,7 @@ class LargeSyncTests(unittest.TestCase):
     def test_duplicates_between_batches_fail_before_any_record_write(self):
         config = config_fixture()
         client = mock.Mock()
+        client.list_tables.return_value = []
         def fetch(source, job, state, row_sink=None):
             row_sink([{'Id': 1}])
             row_sink([{'Id': 1}])

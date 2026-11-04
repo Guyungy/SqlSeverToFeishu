@@ -7,6 +7,8 @@ import contextlib
 import hashlib
 import json
 import os
+import re
+import copy
 import sys
 import signal
 import sqlite3
@@ -32,6 +34,7 @@ from sync import (
 )
 from workspace import (
     config_edit_lock,
+    default_split_column,
     ENV_PATH,
     get_source,
     load_config,
@@ -82,9 +85,9 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
     """
     settings = settings or runtime_settings()
     identity = {
-        "version": 2,
+        "version": 3,
         "source": {key: source.get(key) for key in ("id", "server", "port", "database", "user")},
-        "job": {key: job.get(key) for key in ("schema", "table", "columns", "unique_key", "incremental")},
+        "job": {key: job.get(key) for key in ("schema", "table", "columns", "unique_key", "incremental", "split")},
         "app_token": app_token, "table_id": table_id, "field_types": field_types,
         "timezone": settings["timezone_offset"],
         "null_policy": settings["null_policy"],
@@ -206,10 +209,12 @@ def automatic_job(source: Dict[str, Any], schema: str, table: str) -> Dict[str, 
     # Keep distinct tables distinct even when their names exceed the target limit.
     if len(target_name) > 100:
         target_name = target_name[:74] + "_" + digest
+    split_column = default_split_column(mapped)
     job = {
         "id": f"job_{digest}", "name": f"{source['name']} / {schema}.{table}",
         "source_id": source["id"], "schema": schema, "table": table, "enabled": True,
         "columns": mapped, "unique_key": key,
+        "split": {"enabled": True, "row_limit": 40000, "column": split_column},
         "incremental": {"enabled": False, "column": ""},
         "target": {"mode": "auto", "table_id": "", "table_name": target_name, "auto_create_fields": True},
     }
@@ -231,6 +236,25 @@ def add_generated_row_keys(rows: List[Dict[str, Any]], job: Dict[str, Any],
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         occurrences[digest] = occurrences.get(digest, 0) + 1
         row[job["unique_key"]] = f"{digest}_{occurrences[digest]}"
+
+
+SQL_TEXT_TYPES = {"char", "varchar", "text", "nchar", "nvarchar", "ntext"}
+
+
+def sql_column_expression(column: Dict[str, Any]) -> str:
+    name = quote_identifier(column["name"])
+    if column.get("sql_type", "").lower() in SQL_TEXT_TYPES:
+        return f"CAST({name} AS NVARCHAR(MAX)) AS {name}"
+    return name
+
+
+def decode_sql_value(value: Any, column: Dict[str, Any]) -> Any:
+    if isinstance(value, bytes) and column.get("sql_type", "").lower() in SQL_TEXT_TYPES:
+        try:
+            return value.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"字段 {column['name']} 返回了无法按 UTF-8 解码的文本，请运行数据源中文连接测试") from exc
+    return value
 
 
 def sql_type_to_feishu(sql_type: str) -> int:
@@ -295,7 +319,7 @@ def fetch_job_rows(
     unique_key = job["unique_key"]
     incremental = job["incremental"]
     incremental_column = incremental.get("column") if incremental.get("enabled") else ""
-    query = f"SELECT {', '.join(quote_identifier(name) for name in selected)} FROM {_qualified_table(job)}"
+    query = f"SELECT {', '.join(sql_column_expression(metadata[name]) for name in selected)} FROM {_qualified_table(job)}"
     params: Tuple[Any, ...] = ()
     incremental_run = bool(incremental_column and job_state and job_state.get("cursor"))
     if incremental_run:
@@ -319,12 +343,19 @@ def fetch_job_rows(
     count = 0
     occurrences: Dict[str, int] = {}
     with sql_connection(source) as conn:
-        with conn.cursor(as_dict=True) as cursor:
+        with conn.cursor() as cursor:
+            cursor.execute("SET TEXTSIZE 2147483647")
             cursor.execute(query, params)
             while True:
-                chunk = cursor.fetchmany(1000)
-                if not chunk:
+                values = cursor.fetchmany(1000)
+                if not values:
                     break
+                chunk = []
+                for values_row in values:
+                    if len(values_row) != len(selected):
+                        raise ConfigError(f"任务 {job['name']} 返回的列数与所选字段数不一致")
+                    row = {name: decode_sql_value(value, metadata[name]) for name, value in zip(selected, values_row)}
+                    chunk.append(row)
                 if "generated_key" in job:
                     add_generated_row_keys(chunk, job, occurrences)
                 if incremental_column:
@@ -426,13 +457,14 @@ def _table_id_from_response(data: Dict[str, Any]) -> str:
 
 
 def create_table(
-    client: FeishuClient, app_token: str, job: Dict[str, Any]
+    client: FeishuClient, app_token: str, job: Dict[str, Any],
+    expected_types: Optional[Dict[str, int]] = None,
 ) -> str:
     unique_key = job["unique_key"]
     ordered = sorted(job["columns"], key=lambda item: item["source"] != unique_key)
     fields = []
     for column in ordered:
-        field_type = column_field_type(column, unique_key)
+        field_type = (expected_types or {}).get(column["target"], column_field_type(column, unique_key))
         field: Dict[str, Any] = {"field_name": column["target"], "type": field_type}
         if field_type == 5:
             field["property"] = {"date_formatter": "yyyy-MM-dd HH:mm"}
@@ -456,9 +488,10 @@ def create_table(
 
 
 def create_field(
-    client: FeishuClient, app_token: str, table_id: str, column: Dict[str, Any], unique_key: str
+    client: FeishuClient, app_token: str, table_id: str, column: Dict[str, Any], unique_key: str,
+    expected_type: Optional[int] = None,
 ) -> None:
-    field_type = column_field_type(column, unique_key)
+    field_type = expected_type if expected_type is not None else column_field_type(column, unique_key)
     payload: Dict[str, Any] = {"field_name": column["target"], "type": field_type}
     if field_type == 5:
         payload["property"] = {"date_formatter": "yyyy-MM-dd HH:mm"}
@@ -491,6 +524,7 @@ def ensure_target(
     config: Dict[str, Any],
     job: Dict[str, Any],
     dry_run: bool,
+    expected_types: Optional[Dict[str, int]] = None,
 ) -> Tuple[Optional[str], Dict[str, int], str]:
     table_id = job["target"].get("table_id") or ""
     action = "existing"
@@ -511,11 +545,11 @@ def ensure_target(
                 job["target"]["table_id"] = table_id
         elif dry_run:
             field_types = {
-                column["target"]: column_field_type(column, job["unique_key"]) for column in job["columns"]
+                column["target"]: (expected_types or {}).get(column["target"], column_field_type(column, job["unique_key"])) for column in job["columns"]
             }
             return None, field_types, "create"
         else:
-            table_id = create_table(client, app_token, job)
+            table_id = create_table(client, app_token, job, expected_types)
             save_target_binding(job, table_id)
             job["target"]["table_id"] = table_id
             action = "created"
@@ -528,10 +562,10 @@ def ensure_target(
     if missing and dry_run:
         action = "add_fields"
         for column in missing:
-            field_types[column["target"]] = column_field_type(column, job["unique_key"])
+            field_types[column["target"]] = (expected_types or {}).get(column["target"], column_field_type(column, job["unique_key"]))
     elif missing:
         for column in missing:
-            create_field(client, app_token, table_id, column, job["unique_key"])
+            create_field(client, app_token, table_id, column, job["unique_key"], (expected_types or {}).get(column["target"]))
         fields = client.list_fields(app_token, table_id)
         field_types = {str(item.get("field_name")): int(item.get("type", 1)) for item in fields}
         action = "fields_created" if action == "existing" else action
@@ -548,6 +582,40 @@ def build_record(row: Dict[str, Any], columns: Sequence[Dict[str, Any]], field_t
             continue
         fields[column["target"]] = convert_value(value, field_types[column["target"]])
     return {"fields": fields}
+
+
+def partition_name(job: Dict[str, Any], number: int) -> str:
+    suffix = "__" + hashlib.sha256(job["id"].encode("utf-8")).hexdigest()[:8] + "_"
+    return job["target"]["table_name"][:83] + suffix + f"{number:06d}"
+
+
+def partition_job(job: Dict[str, Any], partition: Dict[str, Any]) -> Dict[str, Any]:
+    result = copy.deepcopy(job)
+    result["target"].update(mode="auto", table_id=partition["table_id"] or "", table_name=partition["table_name"])
+    return result
+
+
+def sync_partitions(client, app_token, config, job, table_id, field_types, dry_run):
+    partitions = [{"number": 1, "table_id": table_id, "table_name": job["target"]["table_name"], "rows": 0}]
+    prefix = partition_name(job, 2)[:-6]
+    numbers = set()
+    for table in client.list_tables(app_token):
+        name = table.get("name", "")
+        if not name.startswith(prefix) or not re.fullmatch(r"[0-9]{6}", name[len(prefix):]):
+            continue
+        number = int(name[len(prefix):])
+        if number < 2:
+            continue
+        if number in numbers:
+            raise ConfigError(f"存在重复分表序号: {name}")
+        numbers.add(number)
+        partition = {"number": number, "table_id": table["table_id"], "table_name": name, "rows": 0}
+        _, types, _ = ensure_target(client, app_token, config, partition_job(job, partition), dry_run,
+                                     expected_types=field_types)
+        if any(types[col["target"]] != field_types[col["target"]] for col in job["columns"]):
+            raise ConfigError(f"分表 {name} 的字段类型与主表不一致")
+        partitions.append(partition)
+    return sorted(partitions, key=lambda part: part["number"])
 
 
 def run_job(
@@ -574,11 +642,15 @@ def run_job(
         job_state = {}
     unique_column = next(item for item in job["columns"] if item["source"] == job["unique_key"])
     unique_field_type = field_types[unique_column["target"]]
+    split = job.get("split", {"enabled": True, "row_limit": 40000, "column": ""})
+    split_column = split.get("column") if split.get("enabled") else ""
+    partitions = sync_partitions(client, app_token, config, job, table_id, field_types, dry_run)
+    partition_map = {part["number"]: part for part in partitions}
     with tempfile.TemporaryDirectory(prefix="sqlfeishu-") as staging_dir:
         with contextlib.closing(sqlite3.connect(os.path.join(staging_dir, "records.sqlite"))) as staging:
-            staging.execute("CREATE TABLE source_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL)")
-            staging.execute("CREATE TABLE target_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL)")
-            staging.execute("CREATE TABLE operations (kind TEXT, record TEXT NOT NULL)")
+            staging.execute("CREATE TABLE source_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL, sort_value INTEGER)")
+            staging.execute("CREATE TABLE target_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL, partition INTEGER)")
+            staging.execute("CREATE TABLE operations (kind TEXT, record TEXT NOT NULL, partition INTEGER)")
             counts = {"source_rows": 0, "create": 0, "update": 0, "skip": 0}
 
             def stage_rows(chunk):
@@ -587,66 +659,93 @@ def run_job(
                 for row, key in zip(chunk, keys):
                     record = build_record(row, job["columns"], field_types, settings)
                     try:
-                        staging.execute("INSERT INTO source_rows VALUES (?, ?)",
-                                        (key, json.dumps(record, ensure_ascii=False)))
+                        sort_value = 0
+                        if split_column:
+                            sort_value = convert_value(row[split_column], 5, settings["timezone_offset"])
+                            if sort_value is None:
+                                sort_value = 9223372036854775807
+                        staging.execute("INSERT INTO source_rows VALUES (?, ?, ?)",
+                                        (key, json.dumps(record, ensure_ascii=False), sort_value))
                     except sqlite3.IntegrityError as exc:
                         raise ConfigError(f"任务 {job['name']} 的 SQL 结果存在重复唯一键: {key}") from exc
                 counts["source_rows"] += len(chunk)
                 staging.commit()
 
             _, max_cursor, incremental_run = fetch_job_rows(source, job, job_state or None, row_sink=stage_rows)
-            if table_id:
-                for record in client.iter_records(app_token, table_id, [col["target"] for col in job["columns"]]):
+            for partition in partitions:
+                if not partition["table_id"]:
+                    continue
+                for record in client.iter_records(app_token, partition["table_id"], [col["target"] for col in job["columns"]]):
+                    partition["rows"] += 1
                     raw = (record.get("fields") or {}).get(unique_column["target"])
                     if raw is None or raw == "":
                         continue
                     key = normalize_business_key(raw, unique_field_type)
                     try:
-                        staging.execute("INSERT INTO target_rows VALUES (?, ?)",
-                                        (key, json.dumps(record, ensure_ascii=False)))
+                        staging.execute("INSERT INTO target_rows VALUES (?, ?, ?)",
+                                        (key, json.dumps(record, ensure_ascii=False), partition["number"]))
                     except sqlite3.IntegrityError as exc:
-                        raise ConfigError(f"飞书目标表存在重复唯一键: {key}") from exc
+                        raise ConfigError(f"飞书目标表或分表存在重复唯一键: {key}") from exc
             staging.commit()
-            for key, payload in staging.execute("SELECT key, record FROM source_rows"):
+            for key, payload in staging.execute("SELECT key, record FROM source_rows ORDER BY sort_value, key"):
                 record = json.loads(payload)
-                current = staging.execute("SELECT record FROM target_rows WHERE key = ?", (key,)).fetchone()
+                current = staging.execute("SELECT record, partition FROM target_rows WHERE key = ?", (key,)).fetchone()
                 kind = "create"
+                destination = partitions[-1]
                 if current:
+                    destination = partition_map[current[1]]
                     current = json.loads(current[0])
                     if _records_equal(record["fields"], current.get("fields") or {}):
                         counts["skip"] += 1
                         continue
                     kind = "update"
                     record["record_id"] = current["record_id"]
+                if kind == "create":
+                    if split.get("enabled") and destination["rows"] >= split["row_limit"]:
+                        number = destination["number"] + 1
+                        destination = {"number": number, "table_id": None,
+                                       "table_name": partition_name(job, number), "rows": 0}
+                        partitions.append(destination)
+                        partition_map[number] = destination
+                    destination["rows"] += 1
                 counts[kind] += 1
-                staging.execute("INSERT INTO operations VALUES (?, ?)",
-                                (kind, json.dumps(record, ensure_ascii=False)))
+                staging.execute("INSERT INTO operations VALUES (?, ?, ?)",
+                                (kind, json.dumps(record, ensure_ascii=False), destination["number"]))
             staging.commit()
             summary = {
                 "job_id": job["id"], "job_name": job["name"], **counts,
                 "incremental": incremental_run, "cursor_reset": cursor_reset,
                 "target_action": target_action, "table_id": table_id or "",
+                "partitions": partitions, "split_column": split_column or "",
             }
             progress("job_plan", 70, f"{job['name']}：读取 {counts['source_rows']}，新增 {counts['create']}，"
-                     f"更新 {counts['update']}，跳过 {counts['skip']}")
+                     f"更新 {counts['update']}，跳过 {counts['skip']}，目标表 {len(partitions)} 张")
             if dry_run:
                 return summary
             if not table_id:
                 raise RuntimeError("正式同步时飞书目标表未创建")
-            for kind, write in (("create", client.batch_create), ("update", client.batch_update)):
-                operations = staging.execute("SELECT record FROM operations WHERE kind = ?", (kind,))
-                written = 0
-                while True:
-                    batch = operations.fetchmany(BATCH_SIZE)
-                    if not batch:
-                        break
-                    write(app_token, table_id, [json.loads(item[0]) for item in batch])
-                    written += len(batch)
-                    progress("feishu_write", 85, f"{job['name']}：{kind} 已写入 {written}/{counts[kind]} 条")
+            for partition in partitions:
+                if not partition["table_id"]:
+                    partition["table_id"], types, _ = ensure_target(
+                        client, app_token, config, partition_job(job, partition), False, expected_types=field_types)
+                    if any(types[col["target"]] != field_types[col["target"]] for col in job["columns"]):
+                        raise ConfigError(f"分表 {partition['table_name']} 的字段类型与主表不一致")
+                for kind, write in (("create", client.batch_create), ("update", client.batch_update)):
+                    operations = staging.execute("SELECT record FROM operations WHERE kind = ? AND partition = ?",
+                                                 (kind, partition["number"]))
+                    written = 0
+                    while True:
+                        batch = operations.fetchmany(BATCH_SIZE)
+                        if not batch:
+                            break
+                        write(app_token, partition["table_id"], [json.loads(item[0]) for item in batch])
+                        written += len(batch)
+                        progress("feishu_write", 85, f"{partition['table_name']}：{kind} 已写入 {written} 条")
     entry: Dict[str, Any] = {
         "last_success_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "table_id": table_id,
         "fingerprint": fingerprint,
+        "partitions": partitions,
     }
     if max_cursor is not None:
         entry["cursor"] = _encode_cursor(max_cursor)

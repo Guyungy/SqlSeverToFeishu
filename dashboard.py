@@ -22,10 +22,11 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, render_template, request
 
-from multi_sync import automatic_job, list_primary_key, feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
+from multi_sync import sql_column_expression, decode_sql_value, automatic_job, list_primary_key, feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
 from sync import quote_identifier
 from workspace import (
     config_edit_lock,
+    default_split_column,
     BASE_DIR,
     ENV_PATH,
     SETTINGS_SPEC,
@@ -513,7 +514,8 @@ def source_columns_api(source_id: str):
         source = get_source(load_config(), source_id)
         columns = list_columns(source, schema, table)
         primary_key = list_primary_key(source, schema, table)
-        return jsonify({"ok": True, "columns": columns, "primary_key": primary_key})
+        return jsonify({"ok": True, "columns": columns, "primary_key": primary_key,
+                        "split_column": default_split_column([{**col, "source": col["name"]} for col in columns])})
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "读取字段失败")}), 400
 
@@ -525,21 +527,23 @@ def preview_rows_api(source_id: str):
         schema = payload.get("schema", "dbo")
         table = payload.get("table", "")
         source = get_source(load_config(), source_id)
-        metadata = {column["name"] for column in list_columns(source, schema, table)}
+        metadata = {column["name"]: column for column in list_columns(source, schema, table)}
         columns = payload.get("columns")
         if not isinstance(columns, list) or not columns or any(
             not isinstance(column, str) or column not in metadata for column in columns
         ):
             raise ValueError("请勾选有效的数据表字段")
         query = (
-            "SELECT TOP (10) " + ", ".join(quote_identifier(column) for column in columns)
+            "SELECT TOP (10) " + ", ".join(sql_column_expression(metadata[column]) for column in columns)
             + f" FROM {quote_identifier(schema)}.{quote_identifier(table)}"
         )
         with sql_connection(source) as conn:
             with conn.cursor() as cursor:
+                cursor.execute("SET TEXTSIZE 2147483647")
                 cursor.execute(query)
                 rows = [
-                    [None if value is None else str(value) for value in row]
+                    [None if value is None else str(decode_sql_value(value, metadata[name]))
+                     for name, value in zip(columns, row)]
                     for row in cursor.fetchmany(10)
                 ]
         return jsonify({"ok": True, "columns": columns, "rows": rows})

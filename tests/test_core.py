@@ -349,7 +349,7 @@ class FingerprintAndCursorTests(unittest.TestCase):
 
         boundary = datetime(2026, 1, 1, 8, 0)
         state = {"cursor": multi_sync._encode_cursor(boundary)}
-        batches = [[{"OrderId": 3, "Amount": Decimal("5"), "UpdatedAt": datetime(2026, 2, 1, 9, 0)}]]
+        batches = [[(3, Decimal("5"), datetime(2026, 2, 1, 9, 0))]]
         with mock.patch.object(multi_sync, "list_columns", lambda s, sc, t: columns), \
              mock.patch.object(multi_sync, "sql_connection", lambda source, database=None: FakeConn(batches)):
             rows, max_cursor, incremental_run = multi_sync.fetch_job_rows(self.source(), job, state)
@@ -725,7 +725,7 @@ class DesignerPreviewTests(unittest.TestCase):
                 json={'schema': 'dbo', 'table': '订单', 'columns': ['金额', '备注']})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()['rows'], [['12.50', None]])
-        cursor.execute.assert_called_once_with('SELECT TOP (10) [金额], [备注] FROM [dbo].[订单]')
+        cursor.execute.assert_any_call('SELECT TOP (10) [金额], [备注] FROM [dbo].[订单]')
         cursor.fetchmany.assert_called_once_with(10)
 
     def test_preview_rejects_unknown_fields(self):
@@ -828,7 +828,7 @@ class AutomaticTaskTests(unittest.TestCase):
         source, job = self.automatic([])
         connection = mock.MagicMock()
         cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
-        cursor.fetchmany.side_effect = [[{"Id": 1, "Name": "A"}], []]
+        cursor.fetchmany.side_effect = [[(1, "A")], []]
         columns = [{"name": "Id"}, {"name": "Name"}]
         with mock.patch.object(multi_sync, "list_columns", return_value=columns), \
              mock.patch.object(multi_sync, "sql_connection", return_value=connection):
@@ -842,7 +842,7 @@ class AutomaticTaskTests(unittest.TestCase):
         config = workspace.validate_config({"sources": [source], "jobs": [job]})
         connection = mock.MagicMock()
         cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
-        cursor.fetchmany.side_effect = [[{"Id": None, "Name": "same"}, {"Id": None, "Name": "same"}], []]
+        cursor.fetchmany.side_effect = [[(None, "same"), (None, "same")], []]
         client = mock.MagicMock()
         client.list_tables.return_value = []
         with mock.patch.object(multi_sync, "list_columns", return_value=[{"name": "Id"}, {"name": "Name"}]), \

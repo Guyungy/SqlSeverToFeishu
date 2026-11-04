@@ -28,8 +28,9 @@ class UnicodeSyncTests(unittest.TestCase):
                     {'name': '金额(元)', 'sql_type': 'decimal', 'nullable': True}]
         connection = mock.MagicMock()
         cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
-        cursor.fetchmany.side_effect = [[{'订单号': '单据甲', '产品名称(中文)': '中文商品，型号甲', '金额(元)': Decimal('12.50')}], []]
+        cursor.fetchmany.side_effect = [[('单据甲', '中文商品，型号甲', Decimal('12.50'))], []]
         client = mock.Mock()
+        client.list_tables.return_value = []
         client.iter_records.return_value = iter([])
         with mock.patch.object(multi_sync, 'list_columns', return_value=metadata), \
              mock.patch.object(multi_sync, 'list_primary_key', return_value=['订单号']), \
@@ -41,12 +42,43 @@ class UnicodeSyncTests(unittest.TestCase):
             summary = multi_sync.run_job(client, 'app', config, {'jobs': {}}, config['jobs'][0], False)
         query = cursor.execute.call_args.args[0]
         self.assertIn('[业务].[订单表(历史)]', query)
-        self.assertIn('[产品名称(中文)]', query)
+        self.assertIn('CAST([产品名称(中文)] AS NVARCHAR(MAX)) AS [产品名称(中文)]', query)
+        connection.__enter__.return_value.cursor.assert_called_once_with()
         self.assertEqual(summary['create'], 1)
         fields = client.batch_create.call_args.args[2][0]['fields']
         self.assertEqual(fields['订单号'], '单据甲')
         self.assertEqual(fields['产品名称(中文)'], '中文商品，型号甲')
         self.assertEqual(fields['金额(元)'], 12.5)
+
+    def test_text_projection_preserves_full_length_and_numeric_types(self):
+        for sql_type in ('char', 'varchar', 'text', 'nchar', 'nvarchar', 'ntext'):
+            with self.subTest(sql_type=sql_type):
+                self.assertEqual(multi_sync.sql_column_expression({'name': '说明', 'sql_type': sql_type}),
+                                 'CAST([说明] AS NVARCHAR(MAX)) AS [说明]')
+        self.assertEqual(multi_sync.sql_column_expression({'name': '金额', 'sql_type': 'decimal'}), '[金额]')
+
+    def test_invalid_text_bytes_raise_instead_of_silently_replacing_chinese(self):
+        column = {'name': '说明', 'sql_type': 'varchar'}
+        self.assertEqual(multi_sync.decode_sql_value('中文'.encode('utf-8'), column), '中文')
+        with self.assertRaisesRegex(sync.ConfigError, '无法按 UTF-8 解码'):
+            multi_sync.decode_sql_value('中文'.encode('gbk'), column)
+        self.assertIsNone(multi_sync.decode_sql_value(None, column))
+        self.assertEqual(multi_sync.decode_sql_value('', column), '')
+
+    def test_preview_uses_unicode_projection_and_decodes_text(self):
+        connection = mock.MagicMock()
+        cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
+        cursor.fetchmany.return_value = [('中文内容'.encode('utf-8'),)]
+        with mock.patch.object(dashboard, 'load_config', return_value={'sources': [self.source()]}), \
+             mock.patch.object(dashboard, 'list_columns', return_value=[{'name': '说明', 'sql_type': 'text'}]), \
+             mock.patch.object(dashboard, 'sql_connection', return_value=connection):
+            response = dashboard.app.test_client().post('/api/sources/source_cn/preview',
+                json={'schema': 'dbo', 'table': '订单', 'columns': ['说明']},
+                headers={'Host': '127.0.0.1:5001', 'X-CSRF-Token': dashboard.CSRF_TOKEN})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['rows'], [['中文内容']])
+        cursor.execute.assert_any_call('SET TEXTSIZE 2147483647')
+        self.assertIn('CAST([说明] AS NVARCHAR(MAX)) AS [说明]', cursor.execute.call_args.args[0])
 
     def test_database_connection_check_reports_chinese_success(self):
         response = self.check_connection('中文编码校验')
