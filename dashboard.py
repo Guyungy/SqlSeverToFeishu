@@ -3,6 +3,7 @@
 """Local dashboard for multi-database SQL Server to Feishu synchronization."""
 
 import logging
+import hashlib
 import os
 import secrets
 import signal
@@ -441,6 +442,54 @@ def source_databases_api(source_id: str):
         return jsonify({"ok": False, "message": safe_error(exc, "读取数据库列表失败")}), 400
 
 
+@app.route("/api/discovery", methods=["POST"])
+def discover_all_tables_api():
+    try:
+        tables = []
+        errors = []
+        with config_lock:
+            config = load_config()
+            seeds = [source for source in config["sources"] if source.get("enabled", True)]
+            if not seeds:
+                raise ValueError("请先配置 SQL Server 连接")
+            visited = set()
+            for seed in seeds:
+                try:
+                    databases = list_databases(seed)
+                except Exception as exc:
+                    errors.append(f"{seed['name']}: {safe_error(exc, '读取数据库列表失败')}")
+                    databases = []
+                # Explicitly configured databases can be accessible without catalog visibility.
+                if seed["database"].lower() not in {"master", "model", "msdb", "tempdb"}:
+                    databases = list(dict.fromkeys([*databases, seed["database"]]))
+                for database in databases:
+                    identity = (seed["server"], seed["port"], seed["user"], database)
+                    if identity in visited:
+                        continue
+                    visited.add(identity)
+                    source = next((item for item in config["sources"] if (
+                        item["server"], item["port"], item["user"], item["database"]
+                    ) == identity), None)
+                    if source is not None and not source.get("enabled", True):
+                        continue
+                    if source is None:
+                        digest = hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:24]
+                        source = validate_source({**seed, "id": f"source_{digest}",
+                                                  "name": f"{seed['name']} / {database}", "database": database})
+                    try:
+                        discovered = list_tables(source)
+                    except Exception as exc:
+                        errors.append(f"{source['name']}: {safe_error(exc, '读取数据表失败')}")
+                        continue
+                    if not any(item["id"] == source["id"] for item in config["sources"]):
+                        config["sources"].append(source)
+                    tables.extend({**table, "source_id": source["id"]} for table in discovered)
+            saved = save_config(config)
+        return jsonify({"ok": True, "config": public_config(saved), "tables": tables, "errors": errors})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "自动发现数据库失败")}), 400
+
+
 @app.route("/api/sources/<source_id>/tables")
 def source_tables_api(source_id: str):
     try:
@@ -456,7 +505,20 @@ def source_columns_api(source_id: str):
         table = request.args.get("table", "")
         if not table:
             raise ValueError("缺少数据表名")
-        return jsonify({"ok": True, "columns": list_columns(get_source(load_config(), source_id), schema, table)})
+        source = get_source(load_config(), source_id)
+        columns = list_columns(source, schema, table)
+        with sql_connection(source) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT k.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS t "
+                    "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON "
+                    "t.CONSTRAINT_CATALOG = k.CONSTRAINT_CATALOG AND "
+                    "t.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND t.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
+                    "WHERE t.CONSTRAINT_TYPE = 'PRIMARY KEY' AND t.TABLE_SCHEMA = %s AND t.TABLE_NAME = %s "
+                    "ORDER BY k.ORDINAL_POSITION", (schema, table),
+                )
+                primary_key = [row[0] for row in cursor.fetchall()]
+        return jsonify({"ok": True, "columns": columns, "primary_key": primary_key})
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "读取字段失败")}), 400
 
