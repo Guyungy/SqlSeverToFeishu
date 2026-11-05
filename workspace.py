@@ -115,7 +115,7 @@ def password_env_key(source_id: str) -> str:
 # 运行设置：界面可配，落盘在 sync_config.json 的 settings 段。
 # env_key 仅作向后兼容的兜底（老用户写在 .env 里的值仍然生效）。
 # env_first=True 表示该键在环境变量里显式给出时优先（端口属于启动参数，
-# 命令行 `DASHBOARD_PORT=5099 ./start.sh` 的意图强于界面里保存的值）。
+# 命令行 `DASHBOARD_PORT=5099 .venv/bin/python dashboard.py` 的意图强于界面里保存的值）。
 SETTINGS_SPEC: Dict[str, Dict[str, Any]] = {
     "query_timeout": {"env_key": "DB_QUERY_TIMEOUT", "default": 60, "env_first": False},
     "null_policy": {"env_key": "SYNC_NULL_POLICY", "default": "skip", "env_first": False},

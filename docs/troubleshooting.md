@@ -46,7 +46,7 @@ Get-Content .\run_history.log -Tail 100 -Wait
 <details>
 <summary><b>提示“未检测到 Python”或版本不足</b></summary>
 
-安装 Python 3.10 或更高版本。Windows 安装时请勾选 `Add Python to PATH`，然后重新双击一键启动文件。
+安装 Python 3.10 或更高版本。Windows 安装时勾选 `Add Python to PATH`，重新打开终端，再按[安装步骤](deployment.md#命令行完整安装流程)创建虚拟环境并运行 `dashboard.py`。如果没有 `py` 命令，可将 `py -3` 替换为 `python`。
 
 </details>
 

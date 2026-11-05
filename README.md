@@ -47,7 +47,7 @@ python3 -m venv .venv
 .venv/bin/python dashboard.py
 ```
 
-Ubuntu 缺少虚拟环境支持时，先执行 `sudo apt install -y python3-full python3-pip`。无桌面服务器、脚本启动等方式见[部署指南](docs/deployment.md)。
+Ubuntu 缺少虚拟环境支持时，先执行 `sudo apt install -y python3-full python3-pip`。无桌面服务器等部署方式见[部署指南](docs/deployment.md)。
 
 </details>
 

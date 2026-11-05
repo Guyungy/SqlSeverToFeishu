@@ -115,8 +115,6 @@ SqlSeverToFeishu/
 ├── templates/ + static/      中文管理页面
 ├── docs/                     部署、操作、权限和排障文档
 ├── tests/                    Python 与界面回归测试
-├── 一键启动.bat              Windows 小白入口
-├── 一键启动.command          macOS 小白入口
 ├── rust/                     Rust 同步内核
 ├── src-tauri/                Tauri 桌面应用
 └── ui/                       TypeScript 桌面界面

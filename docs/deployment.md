@@ -51,46 +51,9 @@ python3 -m venv .venv
 .venv/bin/python dashboard.py
 ```
 
-已完成 Git 下载时，从 `cd SqlSeverToFeishu` 开始执行。启动成功后，打开 [本机管理页面](http://127.0.0.1:5001)。再次启动只需进入原项目目录，执行对应系统最后一行启动命令。也可以使用下方的一键脚本。
-
-## Windows
-
-双击 **`一键启动.bat`**。
-
-- 第一次运行：自动创建独立环境并安装依赖；
-- 以后运行：直接启动，不会重复安装；
-- 启动成功：自动打开中文管理页面。
-
-## macOS
-
-双击 **`一键启动.command`**。
-
-如果系统阻止打开，请右键该文件并选择“打开”。以后仍然双击同一个文件即可。
-
-## Linux
-
-Ubuntu 先安装 Python 和虚拟环境支持，并确认 `python3 --version` 至少为 3.10：
-
-```bash
-sudo apt update
-sudo apt install -y python3-full python3-pip
-python3 --version
-```
-
-进入 Git 获取或解压后的项目目录，执行以下命令。
-
-```bash
-chmod +x install.sh start.sh
-AUTO_START=1 ./install.sh
-```
+启动成功后，打开 [本机管理页面](http://127.0.0.1:5001)。以后启动时，进入原项目目录，执行对应系统的最后一行命令即可，无需重复创建虚拟环境。
 
 Windows、macOS、Linux 各自创建自己的 `.venv`。跨系统复制项目时，请排除 `.venv`，在目标系统重新安装依赖。项目目录需要当前运行用户有写入权限，用于保存配置、游标和日志。
-
-以后运行：
-
-```bash
-./start.sh
-```
 
 > [!IMPORTANT]
 > 启动窗口不能关闭，关闭后本地服务和定时同步都会停止。浏览器没有自动打开时，请访问 <http://127.0.0.1:5001>。
@@ -100,7 +63,7 @@ Windows、macOS、Linux 各自创建自己的 `.venv`。跨系统复制项目时
 在服务器的项目目录启动，关闭自动打开浏览器：
 
 ```bash
-NO_AUTO_BROWSER=1 ./start.sh
+NO_AUTO_BROWSER=1 .venv/bin/python dashboard.py
 ```
 
 在自己电脑另开终端建立 SSH 隧道，将 `用户名`、`服务器IP` 替换为实际值：
@@ -144,10 +107,9 @@ macOS 或 Linux 执行以下命令。
 
 ## 当前跨平台验证状态
 
-- Python 网页版已有 Windows 和 macOS/Linux 启动脚本；Ubuntu 尚未完成实机运行验收。
+- Python 网页版统一使用虚拟环境中的 Python 启动；Windows 和 Ubuntu 尚未完成实机运行验收。
 - 保存密钥已增加 Windows 文件权限兼容处理，仍需 Windows 实机验证。
 - Windows 同步锁已改用只读进程状态查询，停止任务覆盖启动阶段并增加超时强制停止，仍需 Windows 实机验证。
-- Windows 启动脚本还存在 Python 路径空格、安装器状态码判断和已有虚拟环境恢复问题。
 - 新增的计划调整、大数据暂存和停止流程已通过本地自动化测试，客户真实数据库及 Windows/Ubuntu 实机验收仍待完成。桌面版功能进度见[开发与同步原理](development.md)。
 
 ---
