@@ -114,3 +114,67 @@ test('opening an excluded table for editing keeps the current plan selection', a
     assert.equal(ui.element('job-enabled').checked, false);
     assert.equal(ui.element('job-editor-dialog').open, true);
 });
+
+test('batch incremental uses all filtered pages and keeps unsaved table choices', async () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[{id:'a',name:'库'}],jobs:Array.from({length:45},(_,i)=>({
+            id:'job'+i,source_id:'a',schema:'dbo',table:'Orders'+i,name:'Orders'+i,enabled:true,
+            columns:[{source:'Id',sql_type:'int'}],incremental:{enabled:false,column:''},target:{table_id:''}
+        }))};
+        $('job-search').value='Orders';$('job-status-filter').value='all';
+        listPages.job=2;
+        pendingTables.set('unsaved',true);
+        renderAll=()=>renderJobs();
+        api=async(url, options)=>{
+            globalThis.savedBatch=JSON.parse(options.body);
+            return {ok:true,config:store.config,updated:Array(45).fill({}),skipped:[]};
+        };
+        renderJobs();
+    `);
+    ui.element('configure-incremental').onclick();
+    assert.equal(ui.run('incrementalBatchIds.length'), 45);
+    assert.equal(ui.element('incremental-dialog').open, true);
+    ui.element('incremental-batch-mode').value='auto';
+    await ui.element('save-incremental-batch').onclick();
+    assert.equal(ui.run('savedBatch.job_ids.length'), 45);
+    assert.equal(ui.run('listPages.job'), 2);
+    assert.equal(ui.run('pendingTables.has("unsaved")'), true);
+    assert.match(ui.element('incremental-batch-results').textContent, /已配置 45 个任务/);
+});
+
+test('filtered sync and new-only sync submit exact enabled scopes', async () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[{id:'a',name:'库'}],jobs:[
+            {id:'old',name:'Orders old',schema:'dbo',table:'Old',source_id:'a',enabled:true},
+            {id:'new',name:'Orders new',schema:'dbo',table:'New',source_id:'a',enabled:true},
+            {id:'off',name:'Orders off',schema:'dbo',table:'Off',source_id:'a',enabled:false}
+        ]};
+        store.states={old:{last_success_at:'2026-11-04'}};
+        $('job-search').value='Orders';$('job-status-filter').value='all';
+        globalThis.calls=[];
+        startRun=async(dry,id,ids)=>calls.push({dry,id,ids});
+    `);
+    await ui.element('run-filtered-jobs').onclick();
+    await ui.element('run-new-jobs').onclick();
+    assert.deepEqual(JSON.parse(ui.run('JSON.stringify(calls[0].ids)')), ['old','new']);
+    assert.deepEqual(JSON.parse(ui.run('JSON.stringify(calls[1].ids)')), ['new']);
+});
+
+test('batch failure keeps dialog and selection for retry', async () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[],jobs:[]};
+        incrementalBatchIds=['job'];
+        $('incremental-dialog').open=true;
+        $('incremental-batch-mode').value='column';$('incremental-batch-column').value='UpdatedAt';
+        api=async()=>{throw new Error('network disconnected');};
+    `);
+    await ui.element('save-incremental-batch').onclick();
+    assert.equal(ui.element('incremental-dialog').open, true);
+    assert.equal(ui.element('incremental-batch-column').value, 'UpdatedAt');
+    assert.equal(ui.element('save-incremental-batch').disabled, false);
+    assert.equal(ui.run('incrementalBatchIds[0]'), 'job');
+    assert.match(ui.element('incremental-batch-results').textContent, /network disconnected/);
+});

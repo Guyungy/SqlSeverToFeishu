@@ -82,3 +82,9 @@ body:has(#job-editor-dialog[open]){overflow:hidden}
 .editor-advanced{margin-top:18px;border-top:1px solid var(--line);padding-top:16px}
 .editor-advanced summary{cursor:pointer;font-weight:600;color:var(--ink);padding:4px 0}
 .editor-advanced summary span{font-size:12px;font-weight:400;color:var(--muted);margin-left:10px}
+.job-bulk-actions{margin:0 0 16px;padding:12px 0;flex-wrap:wrap}
+#incremental-dialog{width:min(640px,calc(100vw - 24px));border:0;border-radius:14px;padding:0;color:var(--ink);max-height:85dvh;overflow:auto}
+#incremental-dialog::backdrop{background:rgba(18,30,50,.38)}
+#incremental-dialog .panel{margin:0;border:0;box-shadow:none}
+#incremental-batch-column-wrap{margin-top:14px}
+#incremental-batch-results{white-space:pre-wrap;line-height:1.8;overflow-wrap:anywhere}

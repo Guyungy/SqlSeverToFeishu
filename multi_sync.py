@@ -158,7 +158,9 @@ def list_columns(source: Dict[str, Any], schema: str, table: str) -> List[Dict[s
     with sql_connection(source) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, ORDINAL_POSITION "
+                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, ORDINAL_POSITION, "
+                "COLUMNPROPERTY(OBJECT_ID(QUOTENAME(TABLE_SCHEMA)+N'.'+QUOTENAME(TABLE_NAME)), COLUMN_NAME, 'IsIdentity'), "
+                "IDENT_INCR(QUOTENAME(TABLE_SCHEMA)+N'.'+QUOTENAME(TABLE_NAME)) "
                 "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
                 "ORDER BY ORDINAL_POSITION",
                 (schema, table),
@@ -169,6 +171,8 @@ def list_columns(source: Dict[str, Any], schema: str, table: str) -> List[Dict[s
                     "sql_type": str(row[1]).lower(),
                     "nullable": row[2] == "YES",
                     "ordinal": int(row[3]),
+                    "is_identity": bool(row[4]),
+                    "identity_increment": float(row[5] or 0),
                     "feishu_type": sql_type_to_feishu(str(row[1]).lower()),
                 }
                 for row in cursor.fetchall()
@@ -187,6 +191,21 @@ def list_primary_key(source: Dict[str, Any], schema: str, table: str) -> List[st
                 "ORDER BY k.ORDINAL_POSITION", (schema, table),
             )
             return [row[0] for row in cursor.fetchall()]
+
+
+def default_incremental_column(columns: List[Dict[str, Any]], unique_key: str) -> str:
+    names = {str(col.get("source", col.get("name", ""))).lower().replace("_", "").replace(" ", ""):
+             col for col in columns if col.get("sql_type") in DATE_TYPES}
+    for preferred in ("更新时间", "修改时间", "最后修改时间", "更新日期", "最后更新时间",
+                      "updatedat", "updatedtime", "updatetime", "updatedate", "lastupdated",
+                      "modifiedat", "modifiedtime", "modifytime", "modifydate", "lastmodified", "lastupdatetime", "lastupdatedat"):
+        if preferred in names:
+            return names[preferred].get("source", names[preferred].get("name", ""))
+    for column in columns:
+        name = column.get("source", column.get("name", ""))
+        if name == unique_key and column.get("sql_type") in {"int", "bigint", "smallint", "tinyint"} and column.get("is_identity") and column.get("identity_increment", 0) > 0:
+            return name
+    return ""
 
 
 def automatic_job(source: Dict[str, Any], schema: str, table: str) -> Dict[str, Any]:
@@ -210,12 +229,13 @@ def automatic_job(source: Dict[str, Any], schema: str, table: str) -> Dict[str, 
     if len(target_name) > 100:
         target_name = target_name[:74] + "_" + digest
     split_column = default_split_column(mapped)
+    incremental_column = default_incremental_column(columns, key) if (not generated or primary) else ""
     job = {
         "id": f"job_{digest}", "name": f"{source['name']} / {schema}.{table}",
         "source_id": source["id"], "schema": schema, "table": table, "enabled": True,
         "columns": mapped, "unique_key": key,
         "split": {"enabled": True, "row_limit": 40000, "column": split_column},
-        "incremental": {"enabled": False, "column": ""},
+        "incremental": {"enabled": bool(incremental_column), "column": incremental_column},
         "target": {"mode": "auto", "table_id": "", "table_name": target_name, "auto_create_fields": True},
     }
     if generated:
@@ -595,15 +615,23 @@ def partition_job(job: Dict[str, Any], partition: Dict[str, Any]) -> Dict[str, A
     return result
 
 
-def sync_partitions(client, app_token, config, job, table_id, field_types, dry_run):
+def sync_partitions(client, app_token, config, job, table_id, field_types, dry_run, known_partitions=()):
     partitions = [{"number": 1, "table_id": table_id, "table_name": job["target"]["table_name"], "rows": 0}]
     prefix = partition_name(job, 2)[:-6]
     numbers = set()
-    for table in client.list_tables(app_token):
+    known_ids = {part["table_id"]: part["number"] for part in known_partitions
+                 if part.get("table_id") and isinstance(part.get("number"), int) and part["number"] > 1}
+    tables = client.list_tables(app_token)
+    for table in tables:
+        if table.get("table_id") == table_id:
+            partitions[0]["table_name"] = table["name"]
+    for table in tables:
         name = table.get("name", "")
-        if not name.startswith(prefix) or not re.fullmatch(r"[0-9]{6}", name[len(prefix):]):
-            continue
-        number = int(name[len(prefix):])
+        number = known_ids.get(table.get("table_id"))
+        if number is None:
+            if not name.startswith(prefix) or not re.fullmatch(r"[0-9]{6}", name[len(prefix):]):
+                continue
+            number = int(name[len(prefix):])
         if number < 2:
             continue
         if number in numbers:
@@ -644,7 +672,9 @@ def run_job(
     unique_field_type = field_types[unique_column["target"]]
     split = job.get("split", {"enabled": True, "row_limit": 40000, "column": ""})
     split_column = split.get("column") if split.get("enabled") else ""
-    partitions = sync_partitions(client, app_token, config, job, table_id, field_types, dry_run)
+    previous_state = state["jobs"].get(job["id"]) or {}
+    known_partitions = previous_state.get("partitions", []) if previous_state.get("table_id") == table_id else []
+    partitions = sync_partitions(client, app_token, config, job, table_id, field_types, dry_run, known_partitions)
     partition_map = {part["number"]: part for part in partitions}
     with tempfile.TemporaryDirectory(prefix="sqlfeishu-") as staging_dir:
         with contextlib.closing(sqlite3.connect(os.path.join(staging_dir, "records.sqlite"))) as staging:
@@ -672,11 +702,30 @@ def run_job(
                 staging.commit()
 
             _, max_cursor, incremental_run = fetch_job_rows(source, job, job_state or None, row_sink=stage_rows)
+            lookup_mode = "full"
+            if not counts["source_rows"]:
+                lookup_mode = "empty"
+            # Text keys are trimmed by our comparison rules. An exact API filter
+            # cannot find legacy values with surrounding spaces, so retain the
+            # full comparison for those fields to avoid duplicate inserts.
+            elif incremental_run and unique_field_type == 2 and counts["source_rows"] <= 1000:
+                lookup_mode = "keys"
             for partition in partitions:
-                if not partition["table_id"]:
+                if not partition["table_id"] or lookup_mode == "empty":
                     continue
-                for record in client.iter_records(app_token, partition["table_id"], [col["target"] for col in job["columns"]]):
-                    partition["rows"] += 1
+                total = client.record_count(app_token, partition["table_id"], unique_column["target"]) if lookup_mode == "keys" else None
+                count_known = type(total) is int and total >= 0
+                if count_known:
+                    partition["rows"] = total
+                    keys = [item[0] for item in staging.execute("SELECT key FROM source_rows")]
+                    records = client.iter_records_by_keys(app_token, partition["table_id"],
+                        [col["target"] for col in job["columns"]], unique_column["target"], keys)
+                    progress("feishu_check", 65, f"{partition['table_name']}：按唯一键核对 {len(keys)} 行增量，现有 {total} 行")
+                else:
+                    records = client.iter_records(app_token, partition["table_id"], [col["target"] for col in job["columns"]])
+                for record in records:
+                    if not count_known:
+                        partition["rows"] += 1
                     raw = (record.get("fields") or {}).get(unique_column["target"])
                     if raw is None or raw == "":
                         continue
@@ -686,6 +735,10 @@ def run_job(
                                         (key, json.dumps(record, ensure_ascii=False), partition["number"]))
                     except sqlite3.IntegrityError as exc:
                         raise ConfigError(f"飞书目标表或分表存在重复唯一键: {key}") from exc
+            if lookup_mode == "empty":
+                previous_counts = {part["table_id"]: part.get("rows", 0) for part in known_partitions}
+                for partition in partitions:
+                    partition["rows"] = previous_counts.get(partition["table_id"], 0)
             staging.commit()
             for key, payload in staging.execute("SELECT key, record FROM source_rows ORDER BY sort_value, key"):
                 record = json.loads(payload)
@@ -716,7 +769,7 @@ def run_job(
                 "job_id": job["id"], "job_name": job["name"], **counts,
                 "incremental": incremental_run, "cursor_reset": cursor_reset,
                 "target_action": target_action, "table_id": table_id or "",
-                "partitions": partitions, "split_column": split_column or "",
+                "partitions": partitions, "split_column": split_column or "", "lookup_mode": lookup_mode,
             }
             progress("job_plan", 70, f"{job['name']}：读取 {counts['source_rows']}，新增 {counts['create']}，"
                      f"更新 {counts['update']}，跳过 {counts['skip']}，目标表 {len(partitions)} 张")
@@ -749,18 +802,25 @@ def run_job(
     }
     if max_cursor is not None:
         entry["cursor"] = _encode_cursor(max_cursor)
+    elif incremental_run and job_state.get("cursor"):
+        entry["cursor"] = job_state["cursor"]
     state["jobs"][job["id"]] = entry
     save_state(state)
     return summary
 
 
-def run(dry_run: bool = False, job_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def run(dry_run: bool = False, job_id: Optional[str] = None, job_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     configure_logging()
+    if job_ids is not None and (not job_ids or job_id):
+        raise ConfigError("请选择明确且非空的任务范围")
     config = load_config()
     state = load_state()
     jobs = [job for job in config["jobs"] if job.get("enabled")]
-    if job_id:
-        jobs = [job for job in jobs if job["id"] == job_id]
+    selected_ids = set(job_ids or ([job_id] if job_id else []))
+    if selected_ids:
+        jobs = [job for job in jobs if job["id"] in selected_ids]
+        if {job["id"] for job in jobs} != selected_ids:
+            raise ConfigError("选择的任务不存在或已停用，请刷新任务列表")
     if not jobs:
         raise ConfigError("没有启用的同步任务，请先在管理后台勾选表和字段")
     client = feishu_client()
@@ -785,12 +845,12 @@ def run(dry_run: bool = False, job_id: Optional[str] = None) -> List[Dict[str, A
 def main() -> int:
     parser = argparse.ArgumentParser(description="多数据库增量同步到飞书多维表格")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--job-id")
+    parser.add_argument("--job-id", action="append")
     args = parser.parse_args()
     if os.name != "nt":
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(130))
     try:
-        run(dry_run=args.dry_run, job_id=args.job_id)
+        run(dry_run=args.dry_run, job_ids=args.job_id)
         return 0
     except Exception as exc:
         progress("error", 0, f"执行失败: {exc}")

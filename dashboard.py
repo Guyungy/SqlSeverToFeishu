@@ -16,13 +16,13 @@ from collections import deque
 from functools import wraps
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, render_template, request
 
-from multi_sync import sql_column_expression, decode_sql_value, automatic_job, list_primary_key, feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
+from multi_sync import default_incremental_column, DATE_TYPES, NUMERIC_TYPES, sql_column_expression, decode_sql_value, automatic_job, list_primary_key, feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
 from sync import quote_identifier
 from workspace import (
     config_edit_lock,
@@ -169,7 +169,7 @@ class JobManager:
             self.seq += 1
             self.lines.append((self.seq, line.rstrip("\n")))
 
-    def start(self, dry_run: bool, sync_job_id: str = "") -> Dict[str, Any]:
+    def start(self, dry_run: bool, sync_job_id: str = "", sync_job_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         with self.lock:
             if self.status in {"starting", "running", "cancelling"}:
                 return {"ok": False, "message": "已有同步任务正在运行", "job_id": self.job_id}
@@ -183,17 +183,17 @@ class JobManager:
             self.seq = 0
             self.lines.clear()
             runtime_id = self.job_id
-        threading.Thread(target=self._run, args=(runtime_id, dry_run, sync_job_id), daemon=True).start()
+        threading.Thread(target=self._run, args=(runtime_id, dry_run, sync_job_id, sync_job_ids), daemon=True).start()
         return {"ok": True, "job_id": runtime_id, "mode": self.mode}
 
-    def _run(self, runtime_id: str, dry_run: bool, sync_job_id: str) -> None:
+    def _run(self, runtime_id: str, dry_run: bool, sync_job_id: str, sync_job_ids: Optional[List[str]] = None) -> None:
         run_logger.info("run=%s event=start mode=%s job=%s", runtime_id,
-                        "dry_run" if dry_run else "sync", sync_job_id or "all_enabled")
+                        "dry_run" if dry_run else "sync", sync_job_id or ",".join(sync_job_ids or []) or "all_enabled")
         command = [sys.executable, "-u", str(BASE_DIR / "multi_sync.py")]
         if dry_run:
             command.append("--dry-run")
-        if sync_job_id:
-            command.extend(["--job-id", sync_job_id])
+        for selected_id in sync_job_ids or ([sync_job_id] if sync_job_id else []):
+            command.extend(["--job-id", selected_id])
         kwargs: Dict[str, Any] = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         try:
             process = subprocess.Popen(
@@ -606,6 +606,50 @@ def create_bulk_jobs_api():
         return jsonify({"ok": False, "message": safe_error(exc, "批量创建任务失败")}), 400
 
 
+@app.route("/api/jobs/incremental", methods=["POST"])
+@edit_config
+def batch_incremental_api():
+    try:
+        payload = request.get_json(silent=True) or {}
+        selected_ids = payload.get("job_ids")
+        mode = payload.get("mode", "auto")
+        if not isinstance(selected_ids, list) or not selected_ids or any(not isinstance(item, str) for item in selected_ids):
+            raise ValueError("请选择需要调整的任务")
+        if mode not in {"auto", "column", "disable"}:
+            raise ValueError("请选择有效的增量配置方式")
+        config = load_config()
+        selected_set = set(selected_ids)
+        if not selected_set.issubset({job["id"] for job in config["jobs"]}):
+            raise ValueError("部分任务已不存在，请刷新后重试")
+        updated, skipped = [], []
+        for job in config["jobs"]:
+            if job["id"] not in selected_set:
+                continue
+            try:
+                column = ""
+                if mode != "disable":
+                    if "generated_key" in job and not job["generated_key"]["columns"]:
+                        raise ValueError("无主键表使用内容标识，保留全量同步")
+                    column = str(payload.get("column") or "") if mode == "column" else default_incremental_column(job["columns"], job["unique_key"])
+                    if mode == "auto" and not column:
+                        source = get_source(config, job["source_id"])
+                        metadata = list_columns(source, job["schema"], job["table"])
+                        selected_columns = {item["source"] for item in job["columns"]}
+                        column = default_incremental_column([item for item in metadata if item["name"] in selected_columns], job["unique_key"])
+                    if not column:
+                        raise ValueError("未识别到更新时间或自增唯一键，可使用统一指定字段")
+                    if not any(item["source"] == column and item["sql_type"] in DATE_TYPES | NUMERIC_TYPES for item in job["columns"]):
+                        raise ValueError("增量字段必须是已选的日期或数字字段")
+                job["incremental"] = {"enabled": mode != "disable", "column": column}
+                updated.append({"id": job["id"], "name": job["name"], "column": column})
+            except Exception as exc:
+                skipped.append({"id": job["id"], "name": job["name"], "message": safe_error(exc, "配置增量失败")})
+        saved = save_config(config)
+        return jsonify({"ok": True, "config": public_config(saved), "updated": updated, "skipped": skipped})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": safe_error(exc, "批量配置增量失败")}), 400
+
+
 @app.route("/api/jobs", methods=["POST"])
 @edit_config
 def save_jobs_api():
@@ -652,11 +696,20 @@ def run_api():
         payload = request.get_json(silent=True) or {}
         config = load_config()
         requested_job = str(payload.get("job_id") or "")
-        enabled = [job for job in config["jobs"] if job.get("enabled") and (not requested_job or job["id"] == requested_job)]
+        selected_ids = payload.get("job_ids")
+        if selected_ids is not None:
+            if requested_job or not isinstance(selected_ids, list) or not selected_ids or any(not isinstance(item, str) or not item for item in selected_ids):
+                raise ValueError("请选择有效的任务列表")
+            selected_ids = list(dict.fromkeys(selected_ids))
+        selected_set = set(selected_ids or ([requested_job] if requested_job else []))
+        enabled = [job for job in config["jobs"] if job.get("enabled") and (not selected_set or job["id"] in selected_set)]
         if not enabled:
             raise ValueError("没有可运行的同步任务")
+        if selected_set and {job["id"] for job in enabled} != selected_set:
+            raise ValueError("部分任务不存在或已停用，请刷新任务列表")
         resolve_app_token()
-        result = jobs.start(bool(payload.get("dry_run")), requested_job)
+        result = jobs.start(bool(payload.get("dry_run")), sync_job_ids=selected_ids) if selected_ids is not None else jobs.start(bool(payload.get("dry_run")), requested_job)
+        result["job_count"] = len(enabled)
         return jsonify(result), 200 if result.get("ok") else 409
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "启动同步失败")}), 400

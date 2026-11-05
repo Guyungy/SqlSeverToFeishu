@@ -383,8 +383,8 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
         key_columns = generated_key["columns"]
         if any(not isinstance(name, str) or name not in source_names or name == unique_key for name in key_columns):
             raise ValueError("自动行标识引用了无效字段")
-        if incremental_enabled:
-            raise ValueError("自动行标识任务使用全量同步")
+        if incremental_enabled and not key_columns:
+            raise ValueError("无主键的自动行标识任务使用全量同步")
     split = job.get("split") or {}
     if not isinstance(split, dict):
         raise ValueError("自动分表配置格式错误")

@@ -402,6 +402,43 @@ class FeishuClient:
             if not page_token:
                 raise FeishuAPIError("飞书记录分页响应缺少 page_token")
 
+    def record_count(self, app_token: str, table_id: str, unique_field: str) -> Optional[int]:
+        data = self.request("GET", f"/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                            params={"page_size": 1, "field_names": json.dumps([unique_field], ensure_ascii=False)})
+        total = (data.get("data") or {}).get("total")
+        return total if type(total) is int and total >= 0 else None
+
+    def iter_records_by_keys(self, app_token: str, table_id: str, field_names: Sequence[str],
+                             unique_field: str, keys: Sequence[str]) -> Iterable[Dict[str, Any]]:
+        seen_records = set()
+        for start in range(0, len(keys), 20):
+            batch = keys[start:start + 20]
+            body = {"field_names": list(field_names), "filter": {"conjunction": "or", "conditions": [
+                {"field_name": unique_field, "operator": "is", "value": [key]} for key in batch]}}
+            page_token = None
+            seen_tokens = set()
+            while True:
+                params = {"page_size": 500}
+                if page_token:
+                    params["page_token"] = page_token
+                data = self.request("POST", f"/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
+                                    params=params, json=body)
+                page = data.get("data") or {}
+                for record in page.get("items") or []:
+                    record_id = record.get("record_id")
+                    if record_id in seen_records:
+                        continue
+                    if record_id:
+                        seen_records.add(record_id)
+                    yield record
+                if not page.get("has_more"):
+                    break
+                next_token = page.get("page_token")
+                if not next_token or next_token in seen_tokens:
+                    raise FeishuAPIError("飞书增量查询响应缺少有效 page_token")
+                seen_tokens.add(next_token)
+                page_token = next_token
+
     def batch_create(self, app_token: str, table_id: str, records: Sequence[Dict[str, Any]]) -> None:
         payload = {"records": list(records)}
         client_token = str(uuid.uuid4())

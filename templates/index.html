@@ -143,16 +143,29 @@
 
             <div class="panel">
                 <div class="panel-head"><div><h2>已保存的任务</h2><p class="panel-description">可编辑字段、目标表和增量设置。启停开关自动保存。</p></div><span id="job-result-count" class="pill neutral">0 个任务</span></div><div class="job-filters"><label>搜索任务<input id="job-search" type="search" placeholder="任务、表名或数据库"></label><label>运行状态<select id="job-status-filter"><option value="all">全部任务</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></label></div>
+                <div class="actions wrap job-bulk-actions"><button id="configure-incremental" class="btn secondary">批量配置增量</button><button id="check-filtered-jobs" class="btn secondary">预检筛选任务</button><button id="run-filtered-jobs" class="btn primary">同步筛选任务</button><span id="job-scope-hint" class="message"></span></div>
                 <div id="job-list" class="job-list empty">还没有任务。请先在上方保存同步计划。</div>
                 <div class="list-pagination"><label>每页<select id="job-page-size"><option value="20">20 个任务</option><option value="50">50 个任务</option><option value="100">100 个任务</option></select></label><span id="job-page-info" aria-live="polite"></span><button id="job-prev" class="btn secondary">上一页</button><button id="job-next" class="btn secondary">下一页</button></div>
             </div>
         </section>
 
+        <dialog id="incremental-dialog" aria-labelledby="incremental-dialog-title">
+            <div class="panel"><div class="panel-head"><h2 id="incremental-dialog-title">批量配置增量同步</h2><button id="close-incremental-dialog" class="btn secondary">关闭</button></div>
+                <p id="incremental-scope" class="muted"></p>
+                <label>配置方式<select id="incremental-batch-mode"><option value="auto">自动识别更新时间或自增唯一键</option><option value="column">统一指定字段名称</option><option value="disable">关闭增量，改为全量同步</option></select></label>
+                <label id="incremental-batch-column-wrap" hidden>增量字段<input id="incremental-batch-column" placeholder="例如 UpdateTime 或 ID"></label>
+                <p class="plan-hint">更新时间字段可追踪更新。递增 ID 仅追踪新增记录。首次启用或更换增量字段后会全量校验一次，之后按游标读取变化。</p>
+                <div id="incremental-batch-results" class="message" aria-live="polite"></div>
+                <div class="actions"><button id="save-incremental-batch" class="btn primary">应用到筛选任务</button></div>
+            </div>
+        </dialog>
+
         <section id="view-runs" class="view">
             <div class="panel">
                 <div class="panel-head"><div><p class="kicker">EXECUTION</p><h2>预检与同步</h2></div><span id="run-badge" class="pill neutral">就绪</span></div>
                 <div class="notice"><strong>增量规则</strong><span>首次执行读取全量；之后从上次成功游标开始，使用包含边界的查询重新覆盖边界记录，避免同一时间点的数据遗漏。只有全部写入成功才推进游标。若改动了数据源、字段、唯一键、增量字段或目标飞书表，旧游标会自动作废并重新全量扫描。</span></div>
-                <div class="actions"><button id="dry-run" class="btn secondary">预检全部任务</button><button id="run-all" class="btn success">同步全部任务</button><button id="cancel-run" class="btn danger" disabled>停止任务</button></div>
+                <div class="actions"><button id="dry-run" class="btn secondary">预检全部任务</button><button id="run-all" class="btn success">同步全部任务</button><button id="run-new-jobs" class="btn secondary">仅同步未成功任务</button><button id="cancel-run" class="btn danger" disabled>停止任务</button></div>
+                <p id="run-schedule-hint" class="plan-hint"></p><button class="btn secondary" data-jump="settings">调整自动同步周期</button>
                 <div class="progress"><div><span id="progress-text">等待开始</span><span id="progress-percent">0%</span></div><div class="track"><i id="progress-fill"></i></div></div>
             </div>
             <div class="panel"><div class="panel-head"><h2>运行日志</h2><button id="clear-log" class="btn secondary">清空显示</button></div><pre id="log"></pre></div>
@@ -196,6 +209,8 @@ let planCancelRequested = false;
 const listPages = {table:1, job:1};
 let editorSnapshot = '';
 let editorSaving = false;
+let incrementalBatchIds = [];
+let incrementalBatchSaving = false;
 const $ = id => document.getElementById(id);
 async function api(url, options={}) {
     const headers = new Headers(options.headers || {}); headers.set('X-CSRF-Token', csrf);
@@ -257,6 +272,7 @@ function renderSettings(force){
     $('settings-badge').textContent=fromEnv?`${fromEnv} 项被环境变量覆盖`:'界面可控';
     $('settings-badge').className=`pill ${fromEnv?'neutral':'good'}`;
     const sch=store.schedule||{};
+    $('run-schedule-hint').textContent=sch.enabled?`自动同步已开启，每 ${sch.interval_minutes} 分钟执行已启用任务。`:'自动同步未开启，可在运行设置中调整周期。';
     $('schedule-status').textContent=sch.enabled?(sch.next_run_at?`已开启，下次运行：${new Date(sch.next_run_at).toLocaleString()}（每 ${sch.interval_minutes} 分钟）`:(sch.message||'已开启')):'未开启；需要面板保持运行';
 }
 $('save-settings').onclick=async()=>{
@@ -611,13 +627,21 @@ $('save-job').onclick=async()=>{
     finally{editorSaving=false;$('job-editor-fields').disabled=false;$('cancel-job-edit').disabled=false;$('close-job-editor').disabled=false;$('save-job').disabled=false;$('save-job').textContent='保存修改';}
 };
 async function persistJobs(){const d=await api('/api/jobs',{method:'POST',body:JSON.stringify({jobs:store.config.jobs})});if(d.ok){store.config=d.config;renderAll();return true;}alert(d.message);await loadWorkspace();return false;}
-function renderJobs(){
-    const list=$('job-list');
+function filteredJobs(){
     const query=$('job-search').value.trim();
     const status=$('job-status-filter').value;
-    const jobs=store.config.jobs.filter(job=>
+    return store.config.jobs.filter(job=>
         matchesSearch(`${job.name} ${job.schema}.${job.table} ${sourceName(job.source_id)}`,query)&&
         (status==='enabled'?job.enabled:status==='disabled'?!job.enabled:true));
+}
+function renderJobs(){
+    const list=$('job-list');
+    const jobs=filteredJobs();
+    const runnable=jobs.filter(job=>job.enabled);
+    $('job-scope-hint').textContent=`筛选共 ${jobs.length} 个任务，已启用 ${runnable.length} 个，跨页应用`;
+    $('configure-incremental').disabled=!jobs.length||incrementalBatchSaving;
+    $('check-filtered-jobs').disabled=!runnable.length||store.running;
+    $('run-filtered-jobs').disabled=!runnable.length||store.running;
     $('job-result-count').textContent=`${jobs.length}/${store.config.jobs.length} 个任务`;
     const page=pageItems(jobs,'job');
     const scrollTop=list.scrollTop;
@@ -628,7 +652,7 @@ function renderJobs(){
             <label class="switch"><input type="checkbox" data-enable="${job.id}" ${job.enabled?'checked':''} aria-label="启用 ${escapeHtml(job.name)}"><span>${job.enabled?'启用':'停用'}</span></label>
             <div class="job-main"><b>${escapeHtml(job.name)}</b>
                 <small>${escapeHtml(sourceName(job.source_id))} · ${escapeHtml(job.schema)}.${escapeHtml(job.table)} · ${job.columns.length} 个字段</small>
-                <div class="tags"><span>${job.incremental.enabled?'增量':'全量扫描'}</span>
+                <div class="tags"><span>${job.incremental.enabled?'增量 · '+escapeHtml(job.incremental.column):'全量扫描'}</span>
                     ${job.split?.enabled?`<span>分表上限 ${job.split.row_limit} 行${job.split.column?' · '+escapeHtml(job.split.column):''}</span>`:''}
                     <span>${job.target.table_id?'已绑定飞书表':'自动建表'}</span>
                     ${state?.last_success_at?`<span>上次成功 ${escapeHtml(state.last_success_at)}</span>`:''}
@@ -636,7 +660,8 @@ function renderJobs(){
             </div>
             <div class="job-actions">
                 <button class="btn secondary" data-edit-job="${job.id}">编辑</button>
-                <button class="btn secondary" data-run-job="${job.id}">预检</button>
+                <button class="btn secondary" data-run-job="${job.id}" ${!job.enabled||store.running?'disabled':''}>预检</button>
+                <button class="btn primary" data-sync-job="${job.id}" ${!job.enabled||store.running?'disabled':''}>同步此表</button>
                 ${job.incremental.enabled?`<button class="btn secondary" data-reset-job="${job.id}">重置游标</button>`:''}
                 <button class="btn danger" data-delete-job="${job.id}">删除</button>
             </div>
@@ -654,6 +679,7 @@ function renderJobs(){
         openJobEditor(job.source_id,job.schema,job.table);
     });
     list.querySelectorAll('[data-run-job]').forEach(button=>button.onclick=()=>startRun(true,button.dataset.runJob));
+    list.querySelectorAll('[data-sync-job]').forEach(button=>button.onclick=()=>startRun(false,button.dataset.syncJob));
     list.querySelectorAll('[data-reset-job]').forEach(button=>button.onclick=async()=>{
         if(!confirm('重置后该任务下次会执行全量扫描，确认继续？'))return;
         const data=await api(`/api/jobs/${button.dataset.resetJob}/state`,{method:'DELETE'});
@@ -666,6 +692,44 @@ function renderJobs(){
         await persistJobs();
     });
 }
+$('check-filtered-jobs').onclick=()=>startRun(true,'',filteredJobs().filter(job=>job.enabled).map(job=>job.id));
+$('run-filtered-jobs').onclick=()=>startRun(false,'',filteredJobs().filter(job=>job.enabled).map(job=>job.id));
+$('configure-incremental').onclick=()=>{
+    incrementalBatchIds=filteredJobs().map(job=>job.id);
+    if(!incrementalBatchIds.length)return;
+    $('incremental-scope').textContent=`应用到当前筛选的 ${incrementalBatchIds.length} 个已保存任务，覆盖全部分页。`;
+    $('incremental-batch-results').textContent='';
+    $('incremental-dialog').showModal();
+};
+$('close-incremental-dialog').onclick=()=>{if(!incrementalBatchSaving)$('incremental-dialog').close();};
+$('incremental-dialog').addEventListener('cancel',event=>{if(incrementalBatchSaving)event.preventDefault();});
+$('incremental-batch-mode').onchange=()=>{$('incremental-batch-column-wrap').hidden=$('incremental-batch-mode').value!=='column';};
+$('save-incremental-batch').onclick=async()=>{
+    if(incrementalBatchSaving)return;
+    const mode=$('incremental-batch-mode').value;
+    const column=$('incremental-batch-column').value.trim();
+    if(mode==='column'&&!column){message('incremental-batch-results',false,'请填写统一的增量字段名称。');return;}
+    incrementalBatchSaving=true;
+    $('save-incremental-batch').disabled=true;
+    $('close-incremental-dialog').disabled=true;
+    message('incremental-batch-results',true,`正在配置 ${incrementalBatchIds.length} 个任务...`);
+    try{
+        const data=await api('/api/jobs/incremental',{method:'POST',body:JSON.stringify({job_ids:incrementalBatchIds,mode,column})});
+        if(!data.ok)throw new Error(data.message);
+        store.config=data.config;
+        renderAll();
+        const skipped=data.skipped||[];
+        message('incremental-batch-results',!skipped.length,
+            `已配置 ${data.updated.length} 个任务，跳过 ${skipped.length} 个。`+
+            skipped.map(item=>`${item.name} — ${item.message}`).join('；'));
+    }catch(error){message('incremental-batch-results',false,error.message);}
+    finally{
+        incrementalBatchSaving=false;
+        $('save-incremental-batch').disabled=false;
+        $('close-incremental-dialog').disabled=false;
+        renderJobs();
+    }
+};
 $('job-search').oninput=()=>{listPages.job=1;renderJobs();};
 $('job-status-filter').onchange=()=>{listPages.job=1;renderJobs();};
 
@@ -675,23 +739,29 @@ function applyRunStatus(status){
     $('cancel-run').disabled=!store.running;
     $('dry-run').disabled=store.running;
     $('run-all').disabled=store.running;
+    $('run-new-jobs').disabled=store.running;
+    renderJobs();
     const labels={starting:'启动中',running:'同步运行中',cancelling:'正在停止',success:'执行成功',cancelled:'已停止',failed:'执行失败',idle:'就绪'};
     $('run-badge').textContent=labels[status.status]||'就绪';
     $('run-badge').className=`pill ${store.running?'running':status.status==='success'?'good':'neutral'}`;
 }
 $('dry-run').onclick=()=>startRun(true,'');$('run-all').onclick=()=>startRun(false,'');
+$('run-new-jobs').onclick=()=>startRun(false,'',store.config.jobs.filter(job=>job.enabled&&!store.states[job.id]?.last_success_at).map(job=>job.id));
 $('cancel-run').onclick=async()=>{
     try{const d=await api('/api/cancel',{method:'POST',body:'{}'});appendLog(d.message);}
     catch(error){appendLog(error.message);}
 };
 $('clear-log').onclick=()=>{$('log').textContent='';};
-async function startRun(dryRun,jobId){
+async function startRun(dryRun,jobId,jobIds=null){
     if(store.running)return;
-    if(!dryRun&&!confirm('确认正式同步？系统可能自动创建飞书数据表和字段，并新增或更新记录。'))return;
+    const selected=jobIds??(jobId?[jobId]:store.config.jobs.filter(job=>job.enabled).map(job=>job.id));
+    if(!selected.length){nav('runs');setProgress(0,'当前范围没有可运行的任务。');return;}
+    if(!dryRun&&!confirm(`将同步 ${selected.length} 个任务，可能创建飞书表并写入记录。继续吗？`))return;
     nav('runs');$('log').textContent='';store.cursor=0;setProgress(0,'正在启动...');
     applyRunStatus({running:true,status:'starting'});
     try{
-        const d=await api('/api/run',{method:'POST',body:JSON.stringify({dry_run:dryRun,job_id:jobId})});
+        const payload=jobIds===null?{dry_run:dryRun,job_id:jobId}:{dry_run:dryRun,job_ids:jobIds};
+        const d=await api('/api/run',{method:'POST',body:JSON.stringify(payload)});
         if(!d.ok){appendLog(d.message);applyRunStatus({running:false,status:'failed'});return;}
         poll();
     }catch(error){appendLog(error.message);applyRunStatus({running:false,status:'failed'});}
