@@ -1,6 +1,8 @@
 import copy
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest import mock
 
 import multi_sync
@@ -47,6 +49,11 @@ class FakeFeishu:
 
 class SplitSyncTests(unittest.TestCase):
     def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patch = mock.patch.object(workspace, 'STATE_PATH', Path(directory.name) / 'state.json')
+        patch.start()
+        self.addCleanup(patch.stop)
         self.config = workspace.validate_config({
             'sources': [{'id': 'source', 'name': '业务库', 'database': 'Business', 'server': 'localhost'}],
             'jobs': [{'id': 'job', 'source_id': 'source', 'table': 'Orders',
@@ -69,8 +76,7 @@ class SplitSyncTests(unittest.TestCase):
                 row_sink(rows[start:start + 1000])
             return [], datetime(2026, 1, 1), False
         with mock.patch.object(multi_sync, 'fetch_job_rows', side_effect=fetch), \
-             mock.patch.object(multi_sync, 'save_target_binding'), \
-             mock.patch.object(multi_sync, 'save_state'):
+             mock.patch.object(multi_sync, 'save_target_binding'):
             return multi_sync.run_job(self.client, 'app', self.config, self.state, self.job, dry_run)
 
     def test_time_ordered_split_and_repeat_sync_are_idempotent(self):

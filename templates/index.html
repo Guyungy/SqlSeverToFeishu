@@ -788,6 +788,7 @@ function renderJobs(){
                     ${job.split?.enabled?`<span>分表上限 ${job.split.row_limit} 行${job.split.column?' · '+escapeHtml(job.split.column):''}</span>`:''}
                     <span>${job.target.table_id?'已绑定飞书表':'自动建表'}</span>
                     ${state?.last_success_at?`<span>上次成功 ${escapeHtml(state.last_success_at)}</span>`:''}
+                    ${state?.reset_pending?'<span>待全量重扫</span>':''}
                 </div>
             </div>
             <div class="job-actions">

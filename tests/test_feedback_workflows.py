@@ -43,6 +43,11 @@ class IncrementalDefaultsTests(unittest.TestCase):
 
 class IncrementalLookupTests(unittest.TestCase):
     def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patch = mock.patch.object(workspace, 'STATE_PATH', Path(directory.name) / 'state.json')
+        patch.start()
+        self.addCleanup(patch.stop)
         self.config = config_fixture()
         self.job = self.config['jobs'][0]
         self.job['incremental'] = {'enabled': True, 'column': 'Id'}
@@ -64,8 +69,7 @@ class IncrementalLookupTests(unittest.TestCase):
             row_sink(rows)
             return [], cursor, True
         with mock.patch.object(multi_sync, 'ensure_target', return_value=('tbl', types or {'Id': 2}, 'existing')), \
-             mock.patch.object(multi_sync, 'fetch_job_rows', side_effect=fetch), \
-             mock.patch.object(multi_sync, 'save_state'):
+             mock.patch.object(multi_sync, 'fetch_job_rows', side_effect=fetch):
             return multi_sync.run_job(self.client, 'app', self.config, self.state, self.job, False)
 
     def test_two_changes_do_not_scan_140000_rows_and_still_split_at_capacity(self):
@@ -116,6 +120,7 @@ class RenamedPartitionsTests(unittest.TestCase):
     def test_renamed_root_and_child_keep_saved_ids(self):
         fixture = test_split_sync.SplitSyncTests()
         fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
         rows = fixture.rows(5)
         fixture.run_sync(rows)
         for index, table in enumerate(fixture.client.tables.values()):

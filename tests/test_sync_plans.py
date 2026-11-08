@@ -108,9 +108,11 @@ class LargeSyncTests(unittest.TestCase):
             for batch in batches:
                 row_sink(batch)
             return [], 123, False
-        with mock.patch.object(multi_sync, 'ensure_target', return_value=('tbl', {'Id': 2}, 'existing')), \
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(workspace, 'STATE_PATH', Path(directory) / 'state.json'), \
+             mock.patch.object(multi_sync, 'ensure_target', return_value=('tbl', {'Id': 2}, 'existing')), \
              mock.patch.object(multi_sync, 'fetch_job_rows', side_effect=fetch), \
-             mock.patch.object(multi_sync, 'save_state') as save_state:
+             mock.patch.object(workspace, 'save_state', wraps=workspace.save_state) as save_state:
             if fail_write:
                 with self.assertRaisesRegex(RuntimeError, 'write failed'):
                     multi_sync.run_job(client, 'app', config, state, job, False)

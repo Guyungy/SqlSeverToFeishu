@@ -46,3 +46,4 @@ ui/dist/
 
 # Dashboard/worker configuration coordination
 sync_config.json.lock
+sync_state.json.lock

@@ -28,6 +28,22 @@ function uiContext() {
     return {context, element, run: code => vm.runInContext(code, context)};
 }
 
+test('reset pending is visible alongside the last successful sync', () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[{id:'a',name:'客户库'}],jobs:[{
+            id:'job',source_id:'a',schema:'dbo',table:'Orders',name:'订单',enabled:true,
+            columns:[{source:'Id'}],incremental:{enabled:true,column:'Id'},target:{table_id:'tbl'}
+        }]};
+        store.states={job:{last_success_at:'2026-11-09',reset_pending:true}};
+        renderJobs();
+    `);
+    assert.match(ui.element('job-list').innerHTML, /待全量重扫/);
+    assert.match(ui.element('job-list').innerHTML, /上次成功 2026-11-09/);
+    ui.run('delete store.states.job.reset_pending; renderJobs();');
+    assert.doesNotMatch(ui.element('job-list').innerHTML, /待全量重扫/);
+});
+
 test('selection remains global across pages and multiple-name search', () => {
     const ui = uiContext();
     ui.run(`

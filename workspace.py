@@ -24,13 +24,14 @@ STATE_PATH = BASE_DIR / "sync_state.json"
 
 
 _config_thread_lock = threading.RLock()
+_state_thread_lock = threading.RLock()
 
 
 @contextlib.contextmanager
-def config_edit_lock():
+def _edit_lock(path: Path, thread_lock):
     """Serialize dashboard and worker read-modify-write operations."""
-    with _config_thread_lock:
-        lock_path = CONFIG_PATH.with_suffix(".json.lock")
+    with thread_lock:
+        lock_path = path.with_suffix(".json.lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "a+b") as lock_file:
             if os.name == "nt":
@@ -58,6 +59,14 @@ def config_edit_lock():
                     msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def config_edit_lock():
+    return _edit_lock(CONFIG_PATH, _config_thread_lock)
+
+
+def state_edit_lock():
+    return _edit_lock(STATE_PATH, _state_thread_lock)
 
 
 def atomic_json_write(path: Path, data: Dict[str, Any]) -> None:
@@ -510,7 +519,9 @@ def load_state() -> Dict[str, Any]:
         return {"version": 1, "jobs": {}}
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data.get("jobs"), dict):
+        if not isinstance(data, dict) or not isinstance(data.get("jobs"), dict):
+            raise ValueError
+        if any(not isinstance(entry, dict) for entry in data["jobs"].values()):
             raise ValueError
         return data
     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -519,3 +530,35 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(data: Dict[str, Any]) -> None:
     atomic_json_write(STATE_PATH, data)
+
+
+def reset_job_state(job_id: str) -> None:
+    with state_edit_lock():
+        state = load_state()
+        entry = state["jobs"].setdefault(job_id, {})
+        entry.pop("cursor", None)
+        # Keep target IDs so renamed child tables can still be found on a full scan.
+        entry["reset_token"] = uuid.uuid4().hex
+        entry["reset_pending"] = True
+        save_state(state)
+
+
+def save_job_state(state: Dict[str, Any], job_id: str, entry: Dict[str, Any]) -> bool:
+    """Merge a successful job without undoing resets or other jobs' changes."""
+    with state_edit_lock():
+        current = load_state()
+        previous = state["jobs"].get(job_id, {})
+        latest = current["jobs"].get(job_id, {})
+        reset_during_run = previous.get("reset_token") != latest.get("reset_token")
+        saved = dict(entry)
+        if "reset_token" in latest:
+            saved["reset_token"] = latest["reset_token"]
+        if reset_during_run:
+            saved.pop("cursor", None)
+            saved["reset_pending"] = True
+        current["jobs"][job_id] = saved
+        save_state(current)
+        # Publish the new snapshot only after the atomic file replacement succeeds.
+        state.clear()
+        state.update(current)
+        return reset_during_run

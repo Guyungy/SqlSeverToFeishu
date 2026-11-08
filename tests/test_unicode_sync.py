@@ -1,5 +1,7 @@
 import unittest
+import tempfile
 from decimal import Decimal
+from pathlib import Path
 from unittest import mock
 
 import dashboard
@@ -32,11 +34,12 @@ class UnicodeSyncTests(unittest.TestCase):
         client = mock.Mock()
         client.list_tables.return_value = []
         client.iter_records.return_value = iter([])
-        with mock.patch.object(multi_sync, 'list_columns', return_value=metadata), \
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(workspace, 'STATE_PATH', Path(directory) / 'state.json'), \
+             mock.patch.object(multi_sync, 'list_columns', return_value=metadata), \
              mock.patch.object(multi_sync, 'list_primary_key', return_value=['订单号']), \
              mock.patch.object(multi_sync, 'sql_connection', return_value=connection), \
-             mock.patch.object(multi_sync, 'ensure_target', return_value=('tbl', {'订单号': 1, '产品名称(中文)': 1, '金额(元)': 2}, 'existing')), \
-             mock.patch.object(multi_sync, 'save_state'):
+             mock.patch.object(multi_sync, 'ensure_target', return_value=('tbl', {'订单号': 1, '产品名称(中文)': 1, '金额(元)': 2}, 'existing')):
             job = multi_sync.automatic_job(source, '业务', '订单表(历史)')
             config = workspace.validate_config({'sources': [source], 'jobs': [job]})
             summary = multi_sync.run_job(client, 'app', config, {'jobs': {}}, config['jobs'][0], False)

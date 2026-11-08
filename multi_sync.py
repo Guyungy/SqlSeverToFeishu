@@ -43,7 +43,7 @@ from workspace import (
     load_state,
     runtime_settings,
     save_config,
-    save_state,
+    save_job_state,
     source_password,
 )
 from feishu_link import parse_feishu_base_url
@@ -893,8 +893,9 @@ def run_job(
         entry["cursor"] = _encode_cursor(max_cursor)
     elif incremental_run and job_state.get("cursor"):
         entry["cursor"] = job_state["cursor"]
-    state["jobs"][job["id"]] = entry
-    save_state(state)
+    summary["state_reset_pending"] = save_job_state(state, job["id"], entry)
+    if summary["state_reset_pending"]:
+        progress("job_plan", 90, f"{job['name']}：运行期间收到重置请求，下次同步将执行全量扫描")
     return summary
 
 
@@ -903,7 +904,6 @@ def run(dry_run: bool = False, job_id: Optional[str] = None, job_ids: Optional[L
     if job_ids is not None and (not job_ids or job_id):
         raise ConfigError("请选择明确且非空的任务范围")
     config = load_config()
-    state = load_state()
     jobs = [job for job in config["jobs"] if job.get("enabled")]
     selected_ids = set(job_ids or ([job_id] if job_id else []))
     if selected_ids:
@@ -918,6 +918,8 @@ def run(dry_run: bool = False, job_id: Optional[str] = None, job_ids: Optional[L
     with sync_lock():
         total = len(jobs)
         for index, job in enumerate(jobs, start=1):
+            # A reset made while an earlier job ran must apply to this job too.
+            state = load_state()
             progress("job_start", max(1, int((index - 1) * 90 / total)), f"开始处理 {job['name']}（{index}/{total}）")
             results.append(run_job(client, app_token, config, state, job, dry_run))
     totals = {

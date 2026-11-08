@@ -38,7 +38,7 @@ from workspace import (
     public_config,
     runtime_settings,
     save_config,
-    save_state,
+    reset_job_state,
     update_env,
     validate_config,
     validate_settings,
@@ -54,7 +54,6 @@ DASHBOARD_LOG_PATH = BASE_DIR / "dashboard_server.log"
 RUN_LOG_PATH = BASE_DIR / "run_history.log"
 SECRET_MASKS = {"********", "************"}
 config_lock = threading.Lock()
-state_lock = threading.Lock()
 
 logger = logging.getLogger("dashboard")
 logger.setLevel(logging.INFO)
@@ -706,10 +705,7 @@ def save_jobs_api():
 @app.route("/api/jobs/<job_id>/state", methods=["DELETE"])
 def reset_job_state_api(job_id: str):
     try:
-        with state_lock:
-            state = load_state()
-            state["jobs"].pop(job_id, None)
-            save_state(state)
+        reset_job_state(job_id)
         return jsonify({"ok": True, "message": "增量游标已重置，下次将执行全量扫描"})
     except Exception as exc:
         return jsonify({"ok": False, "message": safe_error(exc, "重置增量状态失败")}), 400

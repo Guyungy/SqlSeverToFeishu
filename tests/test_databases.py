@@ -246,6 +246,80 @@ class SQLiteWorkflowTests(unittest.TestCase):
         self.assertEqual((summary['create'], summary['skip']), (0, 1))
         self.assertEqual(state['jobs'][job['id']]['cursor'], original_cursor)
 
+    def test_reset_during_write_preserves_partitions_and_forces_full_rescan(self):
+        job = self.create_job()
+        job['split']['row_limit'] = 1
+        self.request('/api/jobs', {'job': job})
+        config = workspace.load_config()
+        job = config['jobs'][0]
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.record_count = lambda *args: None
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.execute(f'INSERT INTO {self.table} ("名称", "UpdatedAt") VALUES ({self.marker}, {self.marker})',
+                     ('后续记录', '2026-01-02 12:00:00'))
+        self.writer.commit()
+        write = fake.batch_create
+
+        def reset_after_write(*args):
+            write(*args)
+            response = self.client.delete('/api/jobs/' + job['id'] + '/state', headers=self.headers)
+            self.assertEqual(response.status_code, 200)
+
+        with mock.patch.object(fake, 'batch_create', side_effect=reset_after_write):
+            summary = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(summary['state_reset_pending'])
+        self.assertNotIn('cursor', state['jobs'][job['id']])
+        self.assertEqual(len(state['jobs'][job['id']]['partitions']), 2)
+        for index, table in enumerate(fake.tables.values()):
+            table['name'] = f'重命名分表{index}'
+        self.execute(f'UPDATE {self.table} SET "名称"={self.marker} WHERE "Id"=1', ('历史记录修正',))
+        self.writer.commit()
+        pending = workspace.load_state()
+        pending_bytes = workspace.STATE_PATH.read_bytes()
+        preview = multi_sync.run_job(fake, 'app_test', config, pending, job, True)
+        self.assertFalse(preview['incremental'])
+        self.assertEqual(preview['update'], 1)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), pending_bytes)
+        with mock.patch.object(fake, 'batch_update', side_effect=RuntimeError('write failed')):
+            with self.assertRaisesRegex(RuntimeError, 'write failed'):
+                multi_sync.run_job(fake, 'app_test', config, pending, job, False)
+        self.assertTrue(pending['jobs'][job['id']]['reset_pending'])
+        self.assertNotIn('cursor', pending['jobs'][job['id']])
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), pending_bytes)
+        # Restart the actual runner from disk, including renamed partition IDs.
+        with mock.patch.object(multi_sync, 'feishu_client', return_value=fake), \
+             mock.patch.object(multi_sync, 'resolve_app_token', return_value='app_test'), \
+             mock.patch('sync.LOCK_PATH', self.root / '.sync.lock'), \
+             mock.patch.object(multi_sync, 'configure_logging'):
+            summary = multi_sync.run(job_id=job['id'])[0]
+        self.assertFalse(summary['incremental'])
+        self.assertEqual((summary['create'], summary['update'], summary['skip']), (0, 1, 1))
+        self.assertEqual(len(fake.tables), 2)
+        saved = workspace.load_state()['jobs'][job['id']]
+        self.assertIn('cursor', saved)
+        self.assertNotIn('reset_pending', saved)
+
+    def test_state_write_failure_retries_without_advancing_memory_or_duplicating_rows(self):
+        job = self.create_job()
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.record_count = lambda *args: None
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        before = copy.deepcopy(state)
+        disk_before = workspace.STATE_PATH.read_bytes()
+        self.execute(f'INSERT INTO {self.table} ("名称", "UpdatedAt") VALUES ({self.marker}, {self.marker})',
+                     ('状态写入失败后重试', '2026-01-02 12:00:00'))
+        self.writer.commit()
+        with mock.patch.object(workspace, 'save_state', side_effect=OSError('disk full')):
+            with self.assertRaisesRegex(OSError, 'disk full'):
+                multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state, before)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), disk_before)
+        summary = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((summary['create'], summary['update'], summary['skip']), (0, 0, 2))
+        self.assertEqual(sum(len(rows) for rows in fake.records.values()), 2)
+        self.assertNotEqual(state['jobs'][job['id']]['cursor'], before['jobs'][job['id']]['cursor'])
+
     def test_source_is_read_only(self):
         with multi_sync.sql_connection(self.source) as connection, databases.cursor_for(connection, self.source) as cursor:
             with self.assertRaises(Exception):
