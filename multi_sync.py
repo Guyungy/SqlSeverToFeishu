@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import copy
@@ -15,7 +16,7 @@ import sqlite3
 import tempfile
 import uuid
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Callable, Any, Dict, List, Optional, Sequence, Tuple
 
 import pymssql
@@ -327,6 +328,8 @@ def sql_type_to_feishu(sql_type: str) -> int:
 
 
 def _decode_cursor(cursor: Dict[str, Any]) -> Any:
+    if not isinstance(cursor, dict) or "value" not in cursor:
+        raise ValueError("增量游标格式错误")
     value = cursor.get("value")
     value_type = cursor.get("type")
     if value_type == "datetime":
@@ -334,12 +337,22 @@ def _decode_cursor(cursor: Dict[str, Any]) -> Any:
     if value_type == "date":
         return date.fromisoformat(value)
     if value_type == "decimal":
+        if not isinstance(value, str):
+            raise ValueError("小数增量游标格式错误")
         return Decimal(value)
     if value_type == "int":
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError("整数增量游标格式错误")
         return int(value)
     if value_type == "float":
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ValueError("浮点增量游标格式错误")
         return float(value)
-    return value
+    if value_type == "bool" and isinstance(value, bool):
+        return value
+    if value_type == "str" and isinstance(value, str):
+        return value
+    raise ValueError("增量游标类型错误")
 
 
 def _encode_cursor(value: Any) -> Dict[str, Any]:
@@ -350,7 +363,7 @@ def _encode_cursor(value: Any) -> Dict[str, Any]:
     if isinstance(value, Decimal):
         return {"type": "decimal", "value": str(value)}
     if isinstance(value, bool):
-        return {"type": "int", "value": int(value)}
+        return {"type": "bool", "value": value}
     if isinstance(value, int):
         return {"type": "int", "value": value}
     if isinstance(value, float):
@@ -379,16 +392,20 @@ def fetch_job_rows(
     params: Tuple[Any, ...] = ()
     incremental_run = bool(incremental_column and job_state and job_state.get("cursor"))
     if incremental_run:
-        cursor_value = _decode_cursor(job_state["cursor"])
         declared_type = str(metadata.get(incremental_column, {}).get("sql_type") or "")
-        if _cursor_fits_sql_type(cursor_value, declared_type, source):
-            query += f" WHERE {databases.quote_identifier(source, incremental_column)} >= {databases.placeholder(source)}"
+        try:
+            cursor_value = _decode_cursor(job_state["cursor"])
+        except (ValueError, TypeError, InvalidOperation, OverflowError):
+            cursor_value = None
+        if _cursor_fits_sql_type(cursor_value, declared_type, source, metadata[incremental_column]):
+            quoted_column = databases.quote_identifier(source, incremental_column)
+            query += f" WHERE ({quoted_column} >= {databases.placeholder(source)} OR {quoted_column} IS NULL)"
             params = (databases.cursor_parameter(cursor_value, metadata[incremental_column], source),)
         else:
             incremental_run = False
             progress(
                 "job_plan", 65,
-                f"{job['name']}：已保存的增量游标与字段 {incremental_column}（{declared_type or '未知类型'}）不匹配，本次改为全量扫描",
+                f"{job['name']}：已保存的增量游标无效或与字段 {incremental_column}（{declared_type or '未知类型'}）不匹配，本次改为全量扫描",
             )
     order_columns = [name for name in (incremental_column, unique_key) if name and name in metadata]
     if order_columns:
@@ -397,6 +414,7 @@ def fetch_job_rows(
     rows: List[Dict[str, Any]] = []
     max_cursor = None
     count = 0
+    null_cursor_count = 0
     occurrences: Dict[str, int] = {}
     connection = sql_connection(source, settings=settings) if settings is not None else sql_connection(source)
     with connection as conn:
@@ -417,7 +435,14 @@ def fetch_job_rows(
                     add_generated_row_keys(chunk, job, occurrences)
                 if incremental_column:
                     values = [row[incremental_column] for row in chunk if row.get(incremental_column) is not None]
+                    null_cursor_count += len(chunk) - len(values)
                     if values:
+                        declared_type = metadata[incremental_column].get("sql_type", "")
+                        if declared_type in DATE_TYPES | NUMERIC_TYPES and any(
+                            not _cursor_fits_sql_type(value, declared_type, source, metadata[incremental_column])
+                            for value in values
+                        ):
+                            raise ConfigError(f"任务 {job['name']} 的增量字段 {incremental_column} 包含无效值，请检查字段类型和日期格式")
                         chunk_max = max(values)
                         max_cursor = chunk_max if max_cursor is None else max(max_cursor, chunk_max)
                 if row_sink is not None:
@@ -426,20 +451,41 @@ def fetch_job_rows(
                     rows.extend(chunk)
                 count += len(chunk)
                 progress("sql_read", 50, f"{job['name']}：已读取 {count} 行")
+    if null_cursor_count:
+        progress("sql_read", 55, f"{job['name']}：增量字段 {incremental_column} 有 {null_cursor_count} 行为空，每轮都会重新核对")
     return rows, max_cursor, incremental_run
 
 
-def _cursor_fits_sql_type(value: Any, sql_type: str, source: Optional[Dict[str, Any]] = None) -> bool:
+def _cursor_fits_sql_type(value: Any, sql_type: str, source: Optional[Dict[str, Any]] = None,
+                         column: Optional[Dict[str, Any]] = None) -> bool:
     """Detect a cursor that no longer matches its incremental column type."""
     kind = (sql_type or "").lower()
     if kind in DATE_TYPES:
         if source and databases.database_type(source) == "sqlite":
-            return isinstance(value, str)
-        return isinstance(value, (datetime, date))
+            if not isinstance(value, str):
+                return False
+            try:
+                datetime.fromisoformat(value)
+                return True
+            except ValueError:
+                return False
+        if kind == "date":
+            return isinstance(value, date) and not isinstance(value, datetime)
+        if not isinstance(value, datetime):
+            return False
+        aware = kind == "datetimeoffset" or (
+            source is not None and databases.database_type(source) in {"mysql", "mariadb"}
+            and (column or {}).get("native_type") == "timestamp"
+        )
+        return (value.utcoffset() is not None) == aware
     if kind == "bit":
         return isinstance(value, bool)
+    if kind in {"int", "bigint", "smallint", "tinyint"}:
+        return isinstance(value, int) and not isinstance(value, bool)
     if kind in NUMERIC_TYPES:
-        return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+        if isinstance(value, Decimal):
+            return value.is_finite()
+        return (isinstance(value, int) and not isinstance(value, bool)) or (isinstance(value, float) and math.isfinite(value))
     return isinstance(value, str)
 
 

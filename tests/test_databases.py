@@ -184,6 +184,68 @@ class SQLiteWorkflowTests(unittest.TestCase):
         self.assertEqual(state, before)
         self.assertEqual(workspace.STATE_PATH.read_bytes(), stored)
 
+    def test_null_incremental_values_are_rechecked_and_retry_is_idempotent(self):
+        job = self.create_job()
+        job['split']['row_limit'] = 1
+        self.request('/api/jobs', {'job': job})
+        config = workspace.load_config()
+        config['settings']['null_policy'] = 'overwrite'
+        job = config['jobs'][0]
+        fake = FakeFeishu()
+        fake.record_count = lambda *args: None
+        state = {'jobs': {}}
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        first_cursor = copy.deepcopy(state['jobs'][job['id']]['cursor'])
+        self.execute(f'INSERT INTO {self.table} ("名称", "UpdatedAt") VALUES ({self.marker}, {self.marker})',
+                     ('空时间新增', None))
+        self.writer.commit()
+        before = copy.deepcopy(state)
+        disk_before = workspace.STATE_PATH.read_bytes()
+        fake.fail_on_batch = fake.batch_count + 1
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state, before)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), disk_before)
+        fake.fail_on_batch = None
+        retried = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(retried['incremental'])
+        self.assertEqual((retried['create'], retried['update'], retried['skip']), (0, 0, 2))
+        self.assertEqual(len(fake.tables), 2)
+        self.assertEqual(state['jobs'][job['id']]['cursor'], first_cursor)
+        self.execute(f'UPDATE {self.table} SET "名称"={self.marker} WHERE "UpdatedAt" IS NULL', ('空时间修改',))
+        self.writer.commit()
+        updated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(updated['update'], 1)
+        self.execute(f'UPDATE {self.table} SET "UpdatedAt"={self.marker} WHERE "UpdatedAt" IS NULL', ('2026-01-03 00:00:00',))
+        self.writer.commit()
+        filled = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((filled['create'], filled['update']), (0, 1))
+        later_cursor = copy.deepcopy(state['jobs'][job['id']]['cursor'])
+        self.assertNotEqual(first_cursor, later_cursor)
+        self.execute(f'UPDATE {self.table} SET "名称"={self.marker}, "UpdatedAt"=NULL', ('时间清空后更新',))
+        self.writer.commit()
+        cleared = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((cleared['create'], cleared['update']), (0, 2))
+        self.assertEqual(state['jobs'][job['id']]['cursor'], later_cursor)
+        for rows in fake.records.values():
+            self.assertEqual(rows[0]['fields']['名称'], '时间清空后更新')
+            self.assertIsNone(rows[0]['fields']['UpdatedAt'])
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((repeated['create'], repeated['update'], repeated['skip']), (0, 0, 2))
+
+    def test_corrupt_saved_cursor_recovers_by_full_scan(self):
+        job = self.create_job()
+        config = workspace.load_config()
+        fake = FakeFeishu()
+        state = {'jobs': {}}
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        original_cursor = copy.deepcopy(state['jobs'][job['id']]['cursor'])
+        state['jobs'][job['id']]['cursor'] = {'type': 'datetime', 'value': 'invalid-date'}
+        summary = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertFalse(summary['incremental'])
+        self.assertEqual((summary['create'], summary['skip']), (0, 1))
+        self.assertEqual(state['jobs'][job['id']]['cursor'], original_cursor)
+
     def test_source_is_read_only(self):
         with multi_sync.sql_connection(self.source) as connection, databases.cursor_for(connection, self.source) as cursor:
             with self.assertRaises(Exception):
@@ -282,6 +344,20 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.execute(f'CREATE VIEW "{self.schema}"."订单视图" AS SELECT * FROM "{self.schema}"."订单"')
         self.finish_setup()
 
+    def test_timestamp_timezone_type_change_rebuilds_cursor(self):
+        job = self.create_job()
+        rows, maximum, _ = multi_sync.fetch_job_rows(self.source, job, {})
+        self.assertIsNone(maximum.tzinfo)
+        self.execute(f'DROP VIEW "{self.schema}"."订单视图"')
+        self.execute(f'ALTER TABLE {self.table} ALTER COLUMN "UpdatedAt" TYPE TIMESTAMPTZ USING "UpdatedAt" AT TIME ZONE \'UTC\'')
+        rows, maximum, used = multi_sync.fetch_job_rows(self.source, job, {'cursor': multi_sync._encode_cursor(maximum)})
+        self.assertFalse(used)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(maximum.utcoffset())
+        rows, _, used = multi_sync.fetch_job_rows(self.source, job, {'cursor': multi_sync._encode_cursor(maximum)})
+        self.assertTrue(used)
+        self.assertEqual(len(rows), 1)
+
     def test_select_only_account_sees_primary_key_and_identity(self):
         user = 'reader_' + uuid.uuid4().hex[:16]
         self.execute(f'CREATE ROLE "{user}" LOGIN')
@@ -345,6 +421,14 @@ class MySQLWorkflowTests(SQLiteWorkflowTests):
         incremental, _, used = multi_sync.fetch_job_rows(self.source, job, {'cursor': multi_sync._encode_cursor(maximum)})
         self.assertTrue(used)
         self.assertEqual(len(incremental), 1)
+
+    def test_zero_timestamp_reports_the_incremental_field(self):
+        job = self.create_job()
+        # A legacy MySQL database can contain zero dates when strict mode is off.
+        self.execute(f'UPDATE {self.table} SET "UpdatedAt" = \'0000-00-00 00:00:00\'')
+        self.writer.commit()
+        with self.assertRaisesRegex(multi_sync.ConfigError, '增量字段 UpdatedAt.*无效值'):
+            multi_sync.fetch_job_rows(self.source, job, {})
 
     def test_minimal_readonly_account_sees_primary_key_and_metadata(self):
         user = 'reader_' + uuid.uuid4().hex[:16]
@@ -466,5 +550,5 @@ class MySQLDriverTests(unittest.TestCase):
             rows, maximum, incremental = multi_sync.fetch_job_rows(source, job, {'cursor': multi_sync._encode_cursor(saved)})
         self.assertTrue(incremental)
         self.assertEqual(maximum, saved)
-        cursor.execute.assert_called_once_with('SELECT `Id`, `UpdatedAt` FROM `业务库`.`订单` WHERE `UpdatedAt` >= %s ORDER BY `UpdatedAt`, `Id`', (saved,))
+        cursor.execute.assert_called_once_with('SELECT `Id`, `UpdatedAt` FROM `业务库`.`订单` WHERE (`UpdatedAt` >= %s OR `UpdatedAt` IS NULL) ORDER BY `UpdatedAt`, `Id`', (saved,))
         self.assertEqual(rows, [{'Id': 1, 'UpdatedAt': saved}])
