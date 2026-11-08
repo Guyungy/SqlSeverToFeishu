@@ -99,6 +99,13 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
         "timezone": settings["timezone_offset"],
         "null_policy": settings["null_policy"],
     }
+    incremental = job.get("incremental") or {}
+    if incremental.get("enabled") and any(
+        column["source"] == incremental.get("column")
+        and column.get("sql_type") not in DATE_TYPES | NUMERIC_TYPES | {"bit"}
+        for column in job.get("columns", [])
+    ):
+        identity["cursor_comparison_version"] = 1
     if databases.database_type(source) != "mssql":
         identity["source"]["type"] = databases.database_type(source)
     if databases.database_type(source) in {"mysql", "mariadb"}:
@@ -424,7 +431,7 @@ def fetch_job_rows(
         except (ValueError, TypeError, InvalidOperation, OverflowError):
             cursor_value = None
         if _cursor_fits_sql_type(cursor_value, declared_type, source, metadata[incremental_column]):
-            quoted_column = databases.quote_identifier(source, incremental_column)
+            quoted_column = databases.comparison_expression(metadata[incremental_column], source)
             query += f" WHERE ({quoted_column} >= {databases.placeholder(source)} OR {quoted_column} IS NULL)"
             params = (databases.cursor_parameter(cursor_value, metadata[incremental_column], source),)
         else:
@@ -435,12 +442,8 @@ def fetch_job_rows(
             )
     order_columns = [name for name in (incremental_column, unique_key) if name and name in metadata]
     if order_columns:
-        order_expressions = []
-        for name in dict.fromkeys(order_columns):
-            expression = databases.quote_identifier(source, name)
-            if databases.database_type(source) == "postgresql" and metadata[name]["sql_type"] in {"json", "jsonb"}:
-                expression = f"CAST({expression} AS TEXT)"
-            order_expressions.append(expression)
+        order_expressions = [databases.comparison_expression(metadata[name], source)
+                             for name in dict.fromkeys(order_columns)]
         query += " ORDER BY " + ", ".join(order_expressions)
 
     rows: List[Dict[str, Any]] = []
@@ -475,8 +478,9 @@ def fetch_job_rows(
                             for value in values
                         ):
                             raise ConfigError(f"任务 {job['name']} 的增量字段 {incremental_column} 包含无效值，请检查字段类型和日期格式")
-                        chunk_max = max(values)
-                        max_cursor = chunk_max if max_cursor is None else max(max_cursor, chunk_max)
+                        # The query is ordered by this column. Python ordering
+                        # differs from database collations and some native types.
+                        max_cursor = values[-1]
                 if row_sink is not None:
                     row_sink(chunk)
                 else:

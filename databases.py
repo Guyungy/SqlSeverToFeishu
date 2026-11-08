@@ -398,6 +398,22 @@ def select_query(source, schema, table, expressions, limit=None):
     return query
 
 
+def comparison_expression(column, source):
+    """Use the same scalar expression for cursor filtering and ordering."""
+    name = quote_identifier(source, column["name"])
+    kind = database_type(source)
+    sql_type = column.get("sql_type")
+    if kind == "postgresql" and sql_type in {"json", "jsonb"}:
+        return f"CAST({name} AS TEXT)"
+    if kind in {"mysql", "mariadb"} and sql_type in {"enum", "set"}:
+        # Native ENUM/SET ordering uses numeric indexes, whereas comparison to
+        # a bound string uses text. Explicit text keeps both operations aligned.
+        return f"CAST({name} AS CHAR)"
+    if kind == "mssql" and sql_type in {"text", "ntext"}:
+        return f"CAST({name} AS NVARCHAR(MAX))"
+    return name
+
+
 def prepare_read(cursor, source):
     if database_type(source) == "mssql":
         cursor.execute("SET TEXTSIZE 2147483647")

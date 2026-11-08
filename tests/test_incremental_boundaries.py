@@ -1,5 +1,6 @@
 """Cursor recovery and engine-specific types at incremental boundaries."""
 import unittest
+import json
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest import mock
@@ -10,6 +11,40 @@ from sync import ConfigError
 
 
 class CursorBoundaryTests(unittest.TestCase):
+    def test_non_numeric_incremental_plans_invalidate_old_comparison_fingerprints(self):
+        dumps = json.dumps
+        for engine in ('mssql', 'sqlite', 'postgresql', 'mysql', 'mariadb'):
+            source = {'type': engine}
+            for sql_type in ('varchar', 'uuid', 'json', 'enum', 'time', 'datetime2', 'int'):
+                job = {'columns': [{'source': '进度', 'sql_type': sql_type}],
+                       'incremental': {'enabled': True, 'column': '进度'}}
+                current = multi_sync.job_fingerprint(source, job, 'app', 'table', {})
+                with mock.patch.object(multi_sync.json, 'dumps', side_effect=lambda value, **kwargs:
+                                       dumps({k: v for k, v in value.items() if k != 'cursor_comparison_version'}, **kwargs)):
+                    old = multi_sync.job_fingerprint(source, job, 'app', 'table', {})
+                with self.subTest(engine=engine, sql_type=sql_type):
+                    self.assertEqual(current == old, sql_type in {'datetime2', 'int'})
+
+    def test_sql_server_text_cursor_uses_database_order_across_batches(self):
+        source = {'type': 'mssql'}
+        job = {'name': '文本进度', 'schema': 'dbo', 'table': 'Orders', 'unique_key': 'Id',
+               'columns': [{'source': 'Id'}, {'source': '进度'}],
+               'incremental': {'enabled': True, 'column': '进度'}}
+        metadata = [{'name': 'Id', 'sql_type': 'int'}, {'name': '进度', 'sql_type': 'ntext'}]
+        connection = mock.MagicMock()
+        cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
+        cursor.fetchmany.side_effect = [[(1, None), (2, 'a')], [(3, 'Z')], []]
+        with mock.patch.object(multi_sync, 'sql_connection', return_value=connection), \
+             mock.patch.object(multi_sync, 'list_columns', return_value=metadata):
+            rows, maximum, used = multi_sync.fetch_job_rows(source, job, {'cursor': {'type': 'str', 'value': 'a'}})
+        self.assertTrue(used)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(maximum, 'Z')
+        cursor.execute.assert_called_with(
+            'SELECT [Id], CAST([进度] AS NVARCHAR(MAX)) AS [进度] FROM [dbo].[Orders] '
+            'WHERE (CAST([进度] AS NVARCHAR(MAX)) >= %s OR CAST([进度] AS NVARCHAR(MAX)) IS NULL) '
+            'ORDER BY CAST([进度] AS NVARCHAR(MAX)), [Id]', ('a',))
+
     def test_mysql_time_cursor_preserves_signed_microseconds(self):
         values = [
             (timedelta(hours=-838, minutes=-59, seconds=-59), '-838:59:59.000000'),

@@ -246,6 +246,64 @@ class SQLiteWorkflowTests(unittest.TestCase):
         self.assertEqual((summary['create'], summary['skip']), (0, 1))
         self.assertEqual(state['jobs'][job['id']]['cursor'], original_cursor)
 
+    def test_text_incremental_cursor_follows_database_collation_across_batches(self):
+        engine = databases.database_type(self.source)
+        relation = databases.qualified_table(self.source, self.schema, '文本游标')
+        if engine == 'postgresql':
+            self.execute(f'CREATE COLLATION "{self.schema}"."忽略大小写" '
+                         "(provider=icu, locale='und-u-ks-level2', deterministic=false)")
+            text_type = f'VARCHAR(20) COLLATE "{self.schema}"."忽略大小写"'
+        elif engine in {'mysql', 'mariadb'}:
+            text_type = 'VARCHAR(20) COLLATE utf8mb4_general_ci'
+        else:
+            text_type = 'TEXT COLLATE NOCASE'
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "进度" {text_type}, "名称" TEXT)')
+        with contextlib.closing(self.writer.cursor()) as cursor:
+            cursor.executemany(f'INSERT INTO {relation} VALUES ({self.marker},{self.marker},{self.marker})',
+                               [(index, 'a', '中文旧记录') for index in range(1001)] +
+                               [(1001, 'Z', '边界'), (1002, None, '空进度')])
+        self.writer.commit()
+        result = self.request('/api/jobs/bulk', {'tables': [
+            {'source_id': self.source['id'], 'schema': self.schema, 'name': '文本游标'}]})
+        self.assertEqual(result['errors'], [])
+        job = result['config']['jobs'][0]
+        job['incremental'] = {'enabled': True, 'column': '进度'}
+        job['split']['row_limit'] = 1000
+        self.request('/api/jobs', {'job': job})
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.record_count = lambda *args: None
+        first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(first['create'], 1003)
+        self.assertEqual(state['jobs'][job['id']]['cursor'], {'type': 'str', 'value': 'Z'})
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(repeated['incremental'])
+        self.assertEqual((repeated['source_rows'], repeated['skip']), (2, 2))
+        self.execute(f'UPDATE {relation} SET "名称"={self.marker} WHERE "Id"=1001', ('边界更新😀',))
+        self.execute(f'INSERT INTO {relation} VALUES ({self.marker},{self.marker},{self.marker})', (1003, 'ZZ', '新增'))
+        self.writer.commit()
+        before, disk_before = copy.deepcopy(state), workspace.STATE_PATH.read_bytes()
+        fake.fail_on_batch = fake.batch_count + 1
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state, before)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), disk_before)
+        fake.fail_on_batch = None
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state['jobs'][job['id']]['cursor'], {'type': 'str', 'value': 'ZZ'})
+        records = [row['fields'] for rows in fake.records.values() for row in rows]
+        self.assertEqual(len(records), 1004)
+        self.assertEqual(len({str(row['Id']) for row in records}), 1004)
+        self.assertEqual(next(row['名称'] for row in records if str(row['Id']) == '1001'), '边界更新😀')
+        # An old comparison fingerprint forces one reconciliation before reuse.
+        state['jobs'][job['id']]['fingerprint'] = 'legacy_python_cursor_order'
+        self.execute(f'UPDATE {relation} SET "名称"={self.marker} WHERE "Id"=0', ('补齐旧记录',))
+        self.writer.commit()
+        upgraded = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(upgraded['cursor_reset'])
+        self.assertFalse(upgraded['incremental'])
+        self.assertEqual((upgraded['source_rows'], upgraded['create'], upgraded['update']), (1004, 0, 1))
+
     def test_reset_during_write_preserves_partitions_and_forces_full_rescan(self):
         job = self.create_job()
         job['split']['row_limit'] = 1
@@ -417,6 +475,48 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.execute(f'CREATE TABLE "{self.schema}"."订单" ("Id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "名称" TEXT, "UpdatedAt" TIMESTAMP, "数据" BYTEA)')
         self.execute(f'CREATE VIEW "{self.schema}"."订单视图" AS SELECT * FROM "{self.schema}"."订单"')
         self.finish_setup()
+
+    def test_native_and_json_incremental_fields_use_database_comparison(self):
+        self.execute(f'CREATE TYPE "{self.schema}"."级别" AS ENUM (\'Z\',\'a\')')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."JSON域" AS jsonb')
+        cases = [
+            ('inet', ['192.168.1.1', '2001:db8::1'], ['192.168.1.1', '2001:db8::1']),
+            ('uuid', ['00000000-0000-0000-0000-000000000001', 'ffffffff-ffff-ffff-ffff-ffffffffffff'],
+             ['00000000-0000-0000-0000-000000000001', 'ffffffff-ffff-ffff-ffff-ffffffffffff']),
+            (f'"{self.schema}"."级别"', ['Z', 'a'], ['Z', 'a']),
+            ('json', ['10', '2'], ['10', '2']),
+            ('jsonb', ['10', '2'], ['10', '2']),
+            (f'"{self.schema}"."JSON域"', ['10', '2'], ['10', '2']),
+        ]
+        for index, (sql_type, inputs, expected) in enumerate(cases):
+            with self.subTest(sql_type=sql_type):
+                name = f'比较类型{index}'
+                relation = f'"{self.schema}"."{name}"'
+                self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "进度" {sql_type}, "名称" TEXT)')
+                for row_id, value in enumerate(inputs):
+                    self.execute(f'INSERT INTO {relation} VALUES (%s,%s,\'中文😀\')', (row_id, value))
+                self.execute(f'INSERT INTO {relation} VALUES (99,NULL,\'空值\')')
+                result = self.request('/api/jobs/bulk', {'tables': [
+                    {'source_id': self.source['id'], 'schema': self.schema, 'name': name}]})
+                self.assertEqual(result['errors'], [])
+                job = next(job for job in result['config']['jobs'] if job['table'] == name)
+                job['incremental'] = {'enabled': True, 'column': '进度'}
+                self.request('/api/jobs', {'job': job})
+                config = workspace.load_config()
+                fake, state = FakeFeishu(), {'jobs': {}}
+                fake.record_count = lambda *args: None
+                first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual(first['create'], 3)
+                self.assertEqual(state['jobs'][job['id']]['cursor'], {'type': 'str', 'value': expected[-1]})
+                preview = self.request('/api/sources/' + self.source['id'] + '/preview',
+                                       {'schema': self.schema, 'table': name, 'columns': ['Id', '进度']})
+                self.assertEqual(dict(preview['rows']), {'0': expected[0], '1': expected[1], '99': None})
+                self.execute(f'UPDATE {relation} SET "名称"=\'边界更新\' WHERE "Id"=1')
+                second = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertTrue(second['incremental'])
+                self.assertEqual((second['source_rows'], second['update'], second['skip']), (2, 1, 1))
+                repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual((repeated['source_rows'], repeated['skip']), (2, 2))
 
     def test_interval_cursor_retains_day_and_microsecond_boundaries(self):
         relation = f'"{self.schema}"."时长游标"'
@@ -1279,6 +1379,33 @@ class MySQLWorkflowTests(SQLiteWorkflowTests):
         self.writer.commit()
         with self.assertRaisesRegex(multi_sync.ConfigError, '增量字段 UpdatedAt.*无效值'):
             multi_sync.fetch_job_rows(self.source, job, {})
+
+    def test_enum_and_set_incremental_comparison_matches_text_order(self):
+        for sql_type in ('ENUM', 'SET'):
+            with self.subTest(sql_type=sql_type):
+                name = '文本顺序_' + sql_type
+                relation = f'"{self.schema}"."{name}"'
+                self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, '
+                             f'"进度" {sql_type}(\'Z\',\'a\') COLLATE utf8mb4_general_ci, "名称" TEXT)')
+                self.execute(f'INSERT INTO {relation} VALUES (1,\'a\',\'中文旧值\'),(2,\'Z\',\'中文边界\'),(3,NULL,\'空值\')')
+                result = self.request('/api/jobs/bulk', {'tables': [
+                    {'source_id': self.source['id'], 'schema': self.schema, 'name': name}]})
+                self.assertEqual(result['errors'], [])
+                job = next(job for job in result['config']['jobs'] if job['table'] == name)
+                job['incremental'] = {'enabled': True, 'column': '进度'}
+                self.request('/api/jobs', {'job': job})
+                config = workspace.load_config()
+                fake, state = FakeFeishu(), {'jobs': {}}
+                fake.record_count = lambda *args: None
+                first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual(first['create'], 3)
+                self.assertEqual(state['jobs'][job['id']]['cursor'], {'type': 'str', 'value': 'Z'})
+                self.execute(f'UPDATE {relation} SET "名称"=\'边界更新\' WHERE "Id"=2')
+                second = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertTrue(second['incremental'])
+                self.assertEqual((second['source_rows'], second['update'], second['skip']), (2, 1, 1))
+                repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual((repeated['source_rows'], repeated['skip']), (2, 2))
 
     def test_time_cursor_preserves_negative_and_multiday_boundaries(self):
         relation = f'"{self.schema}"."时长边界"'
