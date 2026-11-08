@@ -276,7 +276,7 @@ def needs_exact_text(column, source):
 
 def list_columns(source, schema, table):
     kind = database_type(source)
-    domains = {}
+    postgres_types = {}
     with connect(source) as conn, cursor_for(conn, source) as cursor:
         if kind == "sqlite":
             if schema != "main":
@@ -323,10 +323,11 @@ def list_columns(source, schema, table):
                 cursor.execute(
                     "WITH RECURSIVE domain_columns AS ("
                     "SELECT a.attname, a.atttypid AS type_id, a.atttypmod AS type_mod, "
-                    "a.attnotnull AS not_null, format_type(a.atttypid, NULL) AS domain_name "
+                    "a.attnotnull AS not_null, "
+                    "CASE WHEN t.typtype = 'd' THEN format_type(a.atttypid, NULL) END AS domain_name "
                     "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid "
-                    "WHERE n.nspname = %s AND c.relname = %s AND t.typtype = 'd' "
+                    "WHERE n.nspname = %s AND c.relname = %s "
                     "AND a.attnum > 0 AND NOT a.attisdropped AND has_schema_privilege(n.oid, 'USAGE') "
                     "AND has_column_privilege(c.oid, a.attnum, 'SELECT') "
                     "UNION ALL SELECT d.attname, t.typbasetype, "
@@ -334,19 +335,22 @@ def list_columns(source, schema, table):
                     "d.not_null OR t.typnotnull, d.domain_name "
                     "FROM domain_columns d JOIN pg_type t ON t.oid = d.type_id WHERE t.typtype = 'd') "
                     "SELECT d.attname, format_type(d.type_id, d.type_mod), NOT d.not_null, "
-                    "information_schema._pg_numeric_precision(d.type_id, d.type_mod), d.domain_name "
+                    "information_schema._pg_numeric_precision(d.type_id, d.type_mod), d.domain_name, "
+                    "t.typelem = 'bytea'::regtype AS binary_array "
                     "FROM domain_columns d JOIN pg_type t ON t.oid = d.type_id WHERE t.typtype <> 'd'",
                     (schema, table),
                 )
-                domains = {row[0]: row for row in cursor.fetchall()}
+                postgres_types = {row[0]: row for row in cursor.fetchall()}
     columns = [{"name": r[0], "sql_type": normalize_type(kind, r[1]), "native_type": r[1].lower(),
              "nullable": r[2], "ordinal": int(r[3]), "is_identity": bool(r[4]),
              "identity_increment": float(r[5] or 0), "numeric_precision": r[6]} for r in rows]
     for column in columns:
-        domain = domains.get(column["name"])
-        if domain:
-            column.update(legacy_sql_type=column["sql_type"], domain_type=domain[4],
-                          sql_type=normalize_type(kind, domain[1]), nullable=domain[2], numeric_precision=domain[3])
+        resolved = postgres_types.get(column["name"])
+        if resolved and resolved[4]:
+            column.update(legacy_sql_type=column["sql_type"], domain_type=resolved[4],
+                          sql_type=normalize_type(kind, resolved[1]), nullable=resolved[2], numeric_precision=resolved[3])
+        if resolved and resolved[5]:
+            column["binary_array"] = True
     return columns
 
 
@@ -398,8 +402,17 @@ def decode_value(value, column, source):
     if isinstance(value, (bytes, memoryview)):
         return bytes(value).hex()
     if isinstance(value, (dict, list)):
+        if column.get("binary_array"):
+            return json.dumps(value, ensure_ascii=False, default=lambda item: bytes(item).hex())
         return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     return value
+
+
+def legacy_binary_array(value):
+    """Restore the former driver's byte values from a decoded hex JSON array."""
+    if isinstance(value, list):
+        return [legacy_binary_array(item) for item in value]
+    return bytes.fromhex(value) if value is not None else None
 
 
 def cursor_parameter(value, column, source):

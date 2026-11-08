@@ -418,6 +418,134 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.execute(f'CREATE VIEW "{self.schema}"."订单视图" AS SELECT * FROM "{self.schema}"."订单"')
         self.finish_setup()
 
+    def test_binary_array_preview_preserves_shape_nulls_and_hex_across_relations(self):
+        relation = f'"{self.schema}"."二进制数组"'
+        self.execute(f'CREATE DOMAIN "{self.schema}"."数组域" AS bytea[]')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."嵌套数组域" AS "{self.schema}"."数组域"')
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "数据" bytea[], '
+                     f'"域数据" "{self.schema}"."嵌套数组域", "内部" text)')
+        values = [[b'\x00\xff', b'', None, '中文😀'.encode()], [], None,
+                  [[b'\x00', None], [b'', b'\xff']]]
+        for index, value in enumerate(values):
+            self.execute(f'INSERT INTO {relation} VALUES (%s,%s,%s,\'内部\')', (index,value,value))
+        self.execute(f'CREATE VIEW "{self.schema}"."数组视图" AS SELECT * FROM {relation}')
+        self.execute(f'CREATE MATERIALIZED VIEW "{self.schema}"."数组快照" AS SELECT * FROM {relation}')
+        user = 'reader_' + uuid.uuid4().hex[:16]
+        self.execute(f'CREATE ROLE "{user}" LOGIN')
+        self.addCleanup(lambda: self.execute(f'DROP ROLE "{user}"'))
+        self.addCleanup(lambda: self.execute(f'DROP OWNED BY "{user}"'))
+        self.execute(f'GRANT USAGE ON SCHEMA "{self.schema}" TO "{user}"')
+        source = {**self.source, 'user': user}
+        workspace.save_config({'sources': [source], 'jobs': []})
+        expected = [['00ff','',None,'中文😀'.encode().hex()], [], None, [['00',None],['','ff']]]
+        for name in ('二进制数组','数组视图','数组快照'):
+            self.execute(f'GRANT SELECT ("Id","数据","域数据") ON "{self.schema}"."{name}" TO "{user}"')
+            metadata = self.request(f'/api/sources/{source["id"]}/columns?schema={self.schema}&table={name}')
+            self.assertEqual([col['name'] for col in metadata['columns']], ['Id','数据','域数据'])
+            self.assertTrue(all(col['binary_array'] for col in metadata['columns'][1:]))
+            preview = self.request('/api/sources/' + source['id'] + '/preview',
+                                   {'schema': self.schema, 'table': name, 'columns': ['Id','数据','域数据']})
+            for row in preview['rows']:
+                for value in row[1:]:
+                    self.assertEqual(None if value is None else json.loads(value), expected[int(row[0])])
+        tables = self.request('/api/discovery', {'source_id': source['id']})['tables']
+        created = self.request('/api/jobs/bulk', {'tables': tables})
+        self.assertEqual(created['errors'], [])
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        for job in config['jobs']:
+            first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+            repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+            self.assertEqual((first['create'], repeated['create'], repeated['update']), (4,0,0))
+            for row in fake.records[job['target']['table_id']]:
+                value = row['fields'].get('数据')
+                self.assertEqual(None if value is None else json.loads(value), expected[row['fields']['Id']])
+
+    def test_binary_array_upgrade_keeps_existing_ids_across_batches_and_retry(self):
+        for mode in ('primary', 'content', 'array_key', 'legacy_json'):
+            with self.subTest(mode=mode):
+                name = '旧数组_' + mode
+                relation = f'"{self.schema}"."{name}"'
+                id_column = '"Id" int PRIMARY KEY,' if mode == 'primary' else ''
+                self.execute(f'CREATE TABLE {relation} ({id_column}"数据" bytea[], "内容" jsonb)')
+                count = 2 if mode == 'array_key' else 1001
+                for index in range(count):
+                    value = [bytes([index % 2]), b'', None]
+                    params = (index, value, '"中文"') if mode == 'primary' else (value, '"中文"')
+                    placeholders = ','.join(['%s'] * len(params))
+                    self.execute(f'INSERT INTO {relation} VALUES ({placeholders})', params)
+                job = multi_sync.automatic_job(self.source, self.schema, name)
+                if mode == 'array_key':
+                    job.pop('generated_key')
+                    job['unique_key'] = '数据'
+                    job['columns'] = [col for col in job['columns'] if col['source'] != '__sqlfeishu_row_key']
+                if mode == 'primary':
+                    job['incremental'] = {'enabled': True, 'column': 'Id'}
+                job['split']['row_limit'] = 500 if mode != 'array_key' else 1
+                config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+                job = config['jobs'][0]
+                metadata = multi_sync.list_columns(self.source, self.schema, name)
+                for column in metadata:
+                    column.pop('binary_array', None)
+                    if mode == 'legacy_json' and column['name'] == '内容':
+                        column['sql_type'] = 'text'
+                fake, state = FakeFeishu(), {'jobs': {}}
+                fake.record_count = lambda *args: None
+                with mock.patch.object(multi_sync, 'list_columns', return_value=metadata):
+                    multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                if mode == 'legacy_json':
+                    state['jobs'][job['id']].pop('postgres_json_v2_table_id')
+                    state['jobs'][job['id']].pop('postgres_json_v2_columns')
+                    workspace.save_state(state)
+                before_ids = {row['record_id'] for rows in fake.records.values() for row in rows}
+                before_state = copy.deepcopy(state)
+                before_disk = workspace.STATE_PATH.read_bytes()
+                update = fake.batch_update
+                calls = 0
+                def lose_second_update(*args):
+                    nonlocal calls
+                    update(*args)
+                    calls += 1
+                    if calls == 2:
+                        raise RuntimeError('accepted update response lost')
+                with mock.patch.object(fake, 'batch_update', side_effect=lose_second_update):
+                    with self.assertRaisesRegex(RuntimeError, 'response lost'):
+                        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual(state, before_state)
+                self.assertEqual(workspace.STATE_PATH.read_bytes(), before_disk)
+                retried = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual(retried['create'], 0)
+                self.assertEqual(retried['source_rows'], count)
+                self.assertTrue(retried['cursor_reset'])
+                records = [row for rows in fake.records.values() for row in rows]
+                self.assertEqual(before_ids, {row['record_id'] for row in records})
+                self.assertTrue(all(json.loads(row['fields']['数据']) in [['00', '', None], ['01', '', None]] for row in records))
+                self.assertTrue(all(row['fields']['内容'] == '"中文"' for row in records))
+                repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual((repeated['create'], repeated['update'], repeated['skip']),
+                                 (0, 0, 1 if mode == 'primary' else count))
+
+    def test_new_binary_array_task_can_restart_after_accepted_first_write(self):
+        relation = f'"{self.schema}"."数组首次重试"'
+        self.execute(f'CREATE TABLE {relation} ("数据" bytea[])')
+        for value in ([b'\x00\xff'], [], None, [b'\x00\xff']):
+            self.execute(f'INSERT INTO {relation} VALUES (%s)', (value,))
+        job = multi_sync.automatic_job(self.source, self.schema, '数组首次重试')
+        job['split']['row_limit'] = 2
+        config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+        job = config['jobs'][0]
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.fail_on_batch = 1
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        saved = workspace.load_state()
+        self.assertEqual(saved['jobs'][job['id']]['postgres_binary_array_table_id'], job['target']['table_id'])
+        self.assertNotIn('cursor', saved['jobs'][job['id']])
+        fake.fail_on_batch = None
+        config = workspace.load_config()
+        retried = multi_sync.run_job(fake, 'app_test', config, saved, config['jobs'][0], False)
+        self.assertEqual((retried['create'], retried['update'], retried['skip']), (2, 0, 2))
+
     def test_nested_domain_metadata_preview_and_sync_across_relations(self):
         self.execute(f'CREATE DOMAIN "{self.schema}"."金额域" AS numeric(24,4) NOT NULL')
         self.execute(f'CREATE DOMAIN "{self.schema}"."嵌套金额域" AS "{self.schema}"."金额域"')

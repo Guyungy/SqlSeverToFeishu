@@ -111,6 +111,10 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
         column_metadata.get(column["source"], {}).get("domain_type") for column in job.get("columns", [])
     ):
         identity["postgres_domain_version"] = 1
+    if column_metadata and any(
+        column_metadata.get(column["source"], {}).get("binary_array") for column in job.get("columns", [])
+    ):
+        identity["postgres_binary_array_version"] = 1
     if any(column.get("sql_type") in NUMERIC_TYPES for column in job.get("columns", [])):
         identity["number_conversion_version"] = 2
     # Earlier builds ignored the configured timezone during record conversion.
@@ -801,6 +805,8 @@ def run_job(
     partition_map = {part["number"]: part for part in partitions}
     json_columns = [col["source"] for col in job["columns"] if col["sql_type"] in {"json", "jsonb"}
                     and databases.database_type(source) == "postgresql"]
+    binary_array_columns = [col["source"] for col in job["columns"]
+                            if column_metadata.get(col["source"], {}).get("binary_array")]
     identity_columns = job.get("generated_key", {}).get("columns") or [
         col["source"] for col in job["columns"] if col["source"] != job["unique_key"]
     ]
@@ -812,8 +818,16 @@ def run_job(
             if column_metadata.get(name, {}).get("legacy_sql_type", "json") in {"json", "jsonb"}
         ]))
     json_key_columns = (set(json_columns) - migrated_columns) & set(key_columns)
+    migrated_arrays = (previous_state.get("postgres_binary_array_columns", [])
+                       if previous_state.get("postgres_binary_array_table_id") == table_id else [])
+    binary_key_columns = (set(binary_array_columns) - set(migrated_arrays)) & set(key_columns)
+    format_state = {}
+    if json_columns:
+        format_state.update(postgres_json_v2_table_id=table_id, postgres_json_v2_columns=json_columns)
+    if binary_array_columns:
+        format_state.update(postgres_binary_array_table_id=table_id, postgres_binary_array_columns=binary_array_columns)
     new_target = target_action == "created" and len(partitions) == 1
-    migrate_json_keys = bool(json_key_columns) and bool(table_id) and not new_target
+    migrate_keys = bool(json_key_columns or binary_key_columns) and bool(table_id) and not new_target
     legacy_occurrences: Dict[str, int] = {}
     with tempfile.TemporaryDirectory(prefix="sqlfeishu-") as staging_dir:
         with contextlib.closing(sqlite3.connect(os.path.join(staging_dir, "records.sqlite"))) as staging:
@@ -828,7 +842,7 @@ def run_job(
                 keys = validate_row_keys(chunk, job["unique_key"], job["name"], unique_field_type,
                                          settings["timezone_offset"])
                 legacy_keys = [None] * len(chunk)
-                if migrate_json_keys:
+                if migrate_keys:
                     # Reconstruct only the former identity for matching existing
                     # target rows. The outgoing record keeps the exact JSON text.
                     for index, original in enumerate(chunk):
@@ -838,6 +852,11 @@ def run_job(
                                 value = row[column]
                                 if value is not None:
                                     value = json.loads(value)
+                                row[column] = databases.decode_value(value, {}, source)
+                            for column in binary_key_columns:
+                                value = row[column]
+                                if value is not None:
+                                    value = databases.legacy_binary_array(json.loads(value))
                                 row[column] = databases.decode_value(value, {}, source)
                         except (ValueError, RecursionError):
                             # Values the former driver could not decode have no
@@ -921,7 +940,8 @@ def run_job(
                         ).fetchall()
                         key_in_use = staging.execute("SELECT 1 FROM source_rows WHERE key = ?", (legacy_key,)).fetchone()
                         if current or len(matching_groups) > 1 or key_in_use:
-                            raise ConfigError(f"任务 {job['name']} 的旧 JSON 唯一键与当前记录无法一一匹配，请核对目标数据或选择稳定业务唯一键")
+                            kind = "JSON/二进制数组" if binary_key_columns else "JSON"
+                            raise ConfigError(f"任务 {job['name']} 的旧 {kind} 唯一键与当前记录无法一一匹配，请核对目标数据或选择稳定业务唯一键")
                         current = legacy
                 kind = "create"
                 destination = partitions[-1]
@@ -957,17 +977,15 @@ def run_job(
                 return summary
             if not table_id:
                 raise RuntimeError("正式同步时飞书目标表未创建")
-            if json_columns and new_target:
+            if format_state and new_target:
                 # Record the new format before the first write, so a lost batch
                 # response cannot make the retry treat new keys as legacy keys.
                 # Preserve the execution snapshot's reset token for save_job_state.
                 with state_edit_lock():
                     latest = load_state()
-                    latest["jobs"].setdefault(job["id"], {}).update(
-                        postgres_json_v2_table_id=table_id, postgres_json_v2_columns=json_columns)
+                    latest["jobs"].setdefault(job["id"], {}).update(format_state)
                     save_state(latest)
-                state["jobs"].setdefault(job["id"], {}).update(
-                    postgres_json_v2_table_id=table_id, postgres_json_v2_columns=json_columns)
+                state["jobs"].setdefault(job["id"], {}).update(format_state)
             for partition in partitions:
                 if not partition["table_id"]:
                     partition["table_id"], types, _ = ensure_target(
@@ -991,9 +1009,7 @@ def run_job(
         "fingerprint": fingerprint,
         "partitions": partitions,
     }
-    if json_columns:
-        entry["postgres_json_v2_table_id"] = table_id
-        entry["postgres_json_v2_columns"] = json_columns
+    entry.update(format_state)
     if max_cursor is not None:
         entry["cursor"] = _encode_cursor(max_cursor)
     elif incremental_run and job_state.get("cursor"):
