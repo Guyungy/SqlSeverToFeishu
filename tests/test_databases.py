@@ -851,6 +851,79 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.assertNotIn('generated_key', job)
         self.assertEqual(len(multi_sync.fetch_job_rows(source, job, {})[0]), 1)
 
+    def test_column_only_account_builds_and_syncs_tasks_without_hidden_keys(self):
+        user = 'reader_' + uuid.uuid4().hex[:16]
+        self.execute(f'CREATE ROLE "{user}" LOGIN')
+        self.addCleanup(lambda: self.execute(f'DROP ROLE "{user}"'))
+        self.addCleanup(lambda: self.execute(f'DROP OWNED BY "{user}"'))
+        self.execute(f'GRANT USAGE ON SCHEMA "{self.schema}" TO "{user}"')
+        for name, key_definition in [('单列主键', 'PRIMARY KEY ("Id")'),
+                                     ('复合主键', 'PRIMARY KEY ("Id", "序号")')]:
+            relation = f'"{self.schema}"."{name}"'
+            self.execute(f'CREATE TABLE {relation} ("Id" int, "序号" int, "名称" text, '
+                         f'"UpdatedAt" timestamp, "内部" text, {key_definition})')
+            self.execute(f'INSERT INTO {relation} VALUES (1,1,\'中文商品\',\'2026-01-01\',\'内部数据\'),'
+                         '(2,1,\'中文商品\',\'2026-01-01\',\'内部数据\')')
+            self.execute(f'GRANT SELECT ("序号", "名称", "UpdatedAt") ON {relation} TO "{user}"')
+        source = {**self.source, 'user': user}
+        workspace.save_config({'sources': [source], 'jobs': []})
+        tables = self.request('/api/discovery', {'source_id': source['id']})['tables']
+        self.assertEqual({table['name'] for table in tables}, {'单列主键', '复合主键'})
+        for name in ('单列主键', '复合主键'):
+            metadata = self.request(f'/api/sources/{source["id"]}/columns?schema={self.schema}&table={name}')
+            self.assertEqual([col['name'] for col in metadata['columns']], ['序号', '名称', 'UpdatedAt'])
+            self.assertEqual(metadata['primary_key'], [])
+            preview = self.request(f'/api/sources/{source["id"]}/preview',
+                                   {'schema': self.schema, 'table': name, 'columns': ['名称']})
+            self.assertEqual(preview['rows'], [['中文商品'], ['中文商品']])
+        created = self.request('/api/jobs/bulk', {'tables': tables})
+        self.assertEqual(created['errors'], [])
+        self.assertEqual(created['created'], 2)
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        for job in config['jobs']:
+            self.assertEqual(job['generated_key'], {'columns': []})
+            self.assertFalse(job['incremental']['enabled'])
+            first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+            repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+            self.assertEqual((first['create'], repeated['create'], repeated['skip']), (2, 0, 2))
+            records = fake.records[job['target']['table_id']]
+            self.assertEqual(len({row['fields'][job['unique_key']] for row in records}), 2)
+            self.assertTrue(all('Id' not in row['fields'] and '内部' not in row['fields'] for row in records))
+
+        # Access to one component must not collapse a composite key to that column.
+        self.execute(f'GRANT SELECT ("Id") ON "{self.schema}"."复合主键" TO "{user}"')
+        self.assertEqual(multi_sync.list_primary_key(source, self.schema, '复合主键'), ['Id', '序号'])
+        refreshed = multi_sync.automatic_job(source, self.schema, '复合主键')
+        self.assertEqual(refreshed['generated_key'], {'columns': ['Id', '序号']})
+        self.assertEqual(refreshed['incremental'], {'enabled': True, 'column': 'UpdatedAt'})
+        saved = workspace.load_config()['jobs'][1]
+        self.assertEqual(saved['generated_key'], {'columns': []})
+
+    def test_postgresql_discovery_and_metadata_require_readable_schema_and_columns(self):
+        user = 'reader_' + uuid.uuid4().hex[:16]
+        self.execute(f'CREATE ROLE "{user}" LOGIN')
+        self.addCleanup(lambda: self.execute(f'DROP ROLE "{user}"'))
+        self.addCleanup(lambda: self.execute(f'DROP OWNED BY "{user}"'))
+        for name in ('只写表', '部分可读', '可读表'):
+            self.execute(f'CREATE TABLE "{self.schema}"."{name}" ("Id" int PRIMARY KEY, "名称" text, "内部" text)')
+        self.execute(f'GRANT INSERT ON "{self.schema}"."只写表" TO "{user}"')
+        self.execute(f'GRANT SELECT ("名称"), UPDATE ("内部") ON "{self.schema}"."部分可读" TO "{user}"')
+        self.execute(f'GRANT SELECT ON "{self.schema}"."可读表" TO "{user}"')
+        self.execute(f'CREATE VIEW "{self.schema}"."可读视图" AS SELECT * FROM "{self.schema}"."可读表"')
+        self.execute(f'GRANT SELECT ON "{self.schema}"."可读视图" TO "{user}"')
+        source = {**self.source, 'user': user}
+        self.assertEqual(multi_sync.list_tables(source), [])
+        for name in ('只写表', '部分可读', '可读表', '可读视图'):
+            self.assertEqual(multi_sync.list_columns(source, self.schema, name), [])
+            self.assertEqual(multi_sync.list_primary_key(source, self.schema, name), [])
+        self.execute(f'GRANT USAGE ON SCHEMA "{self.schema}" TO "{user}"')
+        self.assertEqual({table['name'] for table in multi_sync.list_tables(source)}, {'部分可读', '可读表', '可读视图'})
+        self.assertEqual(multi_sync.list_columns(source, self.schema, '只写表'), [])
+        self.assertEqual([col['name'] for col in multi_sync.list_columns(source, self.schema, '部分可读')], ['名称'])
+        self.assertEqual(multi_sync.list_primary_key(source, self.schema, '部分可读'), [])
+        self.assertEqual(multi_sync.list_primary_key(source, self.schema, '可读表'), ['Id'])
+
 
 @unittest.skipUnless(os.environ.get('SQLFEISHU_TEST_MYSQL_JSON'), 'MySQL integration connection not configured')
 class MySQLWorkflowTests(SQLiteWorkflowTests):

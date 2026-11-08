@@ -226,6 +226,9 @@ def list_tables(source):
     else:
         query = ("SELECT table_schema, table_name, table_type FROM information_schema.tables "
                  "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
+                 "AND has_schema_privilege(table_schema, 'USAGE') "
+                 "AND (has_table_privilege(format('%%I.%%I', table_schema, table_name), 'SELECT') "
+                 "OR has_any_column_privilege(format('%%I.%%I', table_schema, table_name), 'SELECT')) "
                  "UNION ALL SELECT n.nspname, c.relname, 'materialized_view' "
                  "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
                  "WHERE c.relkind = 'm' AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
@@ -296,7 +299,10 @@ def list_columns(source, schema, table):
                 "pg_get_serial_sequence(format('%%I.%%I', c.table_schema, c.table_name), c.column_name), "
                 "s.seqincrement, c.numeric_precision FROM information_schema.columns c LEFT JOIN pg_sequence s "
                 "ON s.seqrelid = to_regclass(pg_get_serial_sequence(format('%%I.%%I', c.table_schema, c.table_name), c.column_name)) "
-                "WHERE c.table_schema = %s AND c.table_name = %s ORDER BY c.ordinal_position", (schema, table),
+                "WHERE c.table_schema = %s AND c.table_name = %s "
+                "AND has_schema_privilege(c.table_schema, 'USAGE') "
+                "AND has_column_privilege(format('%%I.%%I', c.table_schema, c.table_name), c.column_name, 'SELECT') "
+                "ORDER BY c.ordinal_position", (schema, table),
             )
             rows = [(r[0], r[1], r[2] == "YES", r[3], bool(r[4]), r[5] or 0, r[6]) for r in cursor.fetchall()]
             if not rows:
@@ -328,12 +334,18 @@ def list_primary_key(source, schema, table):
             return [row[4] for row in sorted(primary, key=lambda row: row[3])]
         else:
             cursor.execute(
-                "SELECT a.attname FROM pg_index i "
+                "SELECT a.attname, has_schema_privilege(n.oid, 'USAGE') "
+                "AND has_column_privilege(c.oid, a.attnum, 'SELECT') FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, position) "
                 "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
-                "WHERE i.indrelid = to_regclass(format('%%I.%%I', %s::text, %s::text)) AND i.indisprimary "
+                "WHERE n.nspname = %s AND c.relname = %s AND i.indisprimary "
                 "AND k.position <= i.indnkeyatts ORDER BY k.position", (schema, table),
             )
+            rows = cursor.fetchall()
+            # A subset of a composite key is not necessarily unique. Use content
+            # identity unless the reader can access every primary-key column.
+            return [row[0] for row in rows] if all(row[1] for row in rows) else []
         return [row[0] for row in cursor.fetchall()]
 
 
