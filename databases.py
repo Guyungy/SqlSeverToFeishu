@@ -221,7 +221,10 @@ def list_tables(source):
     elif kind in {"mysql", "mariadb"}:
         if not source["database"]:
             raise ValueError("请先选择业务数据库并保存数据源，再读取数据表")
-        query = "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.tables WHERE TABLE_SCHEMA = %s ORDER BY TABLE_NAME"
+        query = ("SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.TABLE_TYPE FROM information_schema.tables t "
+                 "WHERE t.TABLE_SCHEMA = %s AND EXISTS (SELECT 1 FROM information_schema.columns c "
+                 "WHERE c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME "
+                 "AND FIND_IN_SET('select', LOWER(c.PRIVILEGES)) > 0) ORDER BY t.TABLE_NAME")
         params = (source["database"],)
     else:
         query = ("SELECT table_schema, table_name, table_type FROM information_schema.tables "
@@ -290,7 +293,8 @@ def list_columns(source, schema, table):
         elif kind in {"mysql", "mariadb"}:
             cursor.execute(
                 "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, ORDINAL_POSITION, EXTRA, @@auto_increment_increment, NUMERIC_PRECISION "
-                "FROM information_schema.columns WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION",
+                "FROM information_schema.columns WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+                "AND FIND_IN_SET('select', LOWER(PRIVILEGES)) > 0 ORDER BY ORDINAL_POSITION",
                 (schema, table),
             )
             rows = [(r[0], r[1], r[2] == "YES", r[3], "auto_increment" in r[4], r[5], r[6]) for r in cursor.fetchall()]
@@ -362,7 +366,13 @@ def list_primary_key(source, schema, table):
             cursor.execute("SHOW INDEX FROM " + qualified_table(source, schema, table), ())
             # TABLE_CONSTRAINTS can hide keys from SELECT-only MariaDB accounts.
             primary = [row for row in cursor.fetchall() if row[2] == "PRIMARY"]
-            return [row[4] for row in sorted(primary, key=lambda row: row[3])]
+            keys = [row[4] for row in sorted(primary, key=lambda row: row[3])]
+            cursor.execute(
+                "SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+                "AND FIND_IN_SET('select', LOWER(PRIVILEGES)) > 0", (schema, table),
+            )
+            readable = {row[0] for row in cursor.fetchall()}
+            return keys if set(keys) <= readable else []
         else:
             cursor.execute(
                 "SELECT a.attname, has_schema_privilege(n.oid, 'USAGE') "

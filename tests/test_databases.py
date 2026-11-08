@@ -1277,6 +1277,91 @@ class MySQLWorkflowTests(SQLiteWorkflowTests):
             self.assertNotIn('generated_key', job)
             self.assertEqual(len(multi_sync.fetch_job_rows(source, job, {})[0]), 1)
 
+    def test_column_permissions_filter_discovery_and_allow_tasks_without_full_keys(self):
+        user = 'reader_' + uuid.uuid4().hex[:16]
+        account = f"'{user}'@'127.0.0.1'"
+        self.execute(f'CREATE USER {account}')
+        self.addCleanup(lambda: self.execute(f'DROP USER {account}'))
+        for name, primary in [('单列主键', 'PRIMARY KEY ("Id")'),
+                              ('复合主键', 'PRIMARY KEY ("Id", "序号")')]:
+            relation = f'"{self.schema}"."{name}"'
+            self.execute(f'CREATE TABLE {relation} ("Id" int, "序号" int, "名称" text, '
+                         f'"UpdatedAt" datetime, "内部" text, {primary})')
+            self.execute(f'INSERT INTO {relation} VALUES (1,1,\'中文数据\',\'2026-01-01\',\'内部资料\'),'
+                         '(2,1,\'中文数据\',\'2026-01-01\',\'内部资料\')')
+            self.execute(f'GRANT SELECT ("序号", "名称", "UpdatedAt"), UPDATE ("内部") ON {relation} TO {account}')
+        self.execute(f'CREATE TABLE "{self.schema}"."只写表" ("Id" int, "名称" text)')
+        self.execute(f'GRANT INSERT ON "{self.schema}"."只写表" TO {account}')
+        self.execute(f'CREATE VIEW "{self.schema}"."只读视图" AS SELECT "名称" FROM "{self.schema}"."单列主键"')
+        self.execute(f'GRANT SELECT ON "{self.schema}"."只读视图" TO {account}')
+        source = {**self.source, 'user': user}
+        workspace.save_config({'sources': [source], 'jobs': []})
+        tables = self.request('/api/discovery', {'source_id': source['id']})['tables']
+        self.assertEqual({table['name'] for table in tables}, {'单列主键', '复合主键', '只读视图'})
+        self.assertEqual(multi_sync.list_columns(source, self.schema, '只写表'), [])
+        for name in ('单列主键', '复合主键'):
+            metadata = self.request(f'/api/sources/{source["id"]}/columns?schema={self.schema}&table={name}')
+            self.assertEqual([col['name'] for col in metadata['columns']], ['序号', '名称', 'UpdatedAt'])
+            self.assertEqual(metadata['primary_key'], [])
+            preview = self.request('/api/sources/' + source['id'] + '/preview',
+                                   {'schema': self.schema, 'table': name, 'columns': ['名称']})
+            self.assertEqual(preview['rows'], [['中文数据'], ['中文数据']])
+        created = self.request('/api/jobs/bulk', {'tables': tables})
+        self.assertEqual(created['errors'], [])
+        self.assertEqual(created['created'], 3)
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        for job in config['jobs']:
+            self.assertEqual(job['generated_key'], {'columns': []})
+            self.assertFalse(job['incremental']['enabled'])
+            first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+            repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+            self.assertEqual((first['create'], repeated['create'], repeated['update'], repeated['skip']), (2, 0, 0, 2))
+            records = fake.records[job['target']['table_id']]
+            self.assertEqual(len({row['fields'][job['unique_key']] for row in records}), 2)
+            self.assertTrue(all('Id' not in row['fields'] and '内部' not in row['fields'] for row in records))
+
+        self.execute(f'GRANT SELECT ("Id") ON "{self.schema}"."复合主键" TO {account}')
+        self.assertEqual(multi_sync.list_primary_key(source, self.schema, '复合主键'), ['Id', '序号'])
+        refreshed = multi_sync.automatic_job(source, self.schema, '复合主键')
+        self.assertEqual(refreshed['generated_key'], {'columns': ['Id', '序号']})
+        self.assertEqual(refreshed['incremental'], {'enabled': True, 'column': 'UpdatedAt'})
+
+        # A later grant revocation must stop the saved plan before record writes.
+        job = next(job for job in config['jobs'] if job['table'] == '复合主键')
+        self.execute(f'REVOKE SELECT ("名称") ON "{self.schema}"."复合主键" FROM {account}')
+        before = copy.deepcopy(fake.records)
+        saved_state = workspace.STATE_PATH.read_bytes()
+        with self.assertRaisesRegex(multi_sync.ConfigError, '字段不存在.*名称'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(fake.records, before)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), saved_state)
+
+    def test_role_grants_are_used_for_readable_columns_and_primary_keys(self):
+        suffix = uuid.uuid4().hex[:12]
+        user, role = 'reader_' + suffix, 'role_' + suffix
+        account = f"'{user}'@'127.0.0.1'"
+        self.execute(f'CREATE ROLE "{role}"')
+        self.addCleanup(lambda: self.execute(f'DROP ROLE "{role}"'))
+        self.execute(f'CREATE USER {account}')
+        self.addCleanup(lambda: self.execute(f'DROP USER {account}'))
+        self.execute(f'GRANT SELECT ("Id", "名称", "UpdatedAt") ON {self.table} TO "{role}"')
+        self.execute(f'GRANT "{role}" TO {account}')
+        if self.engine == 'mysql':
+            self.execute(f'SET DEFAULT ROLE "{role}" TO {account}')
+        else:
+            self.execute(f'SET DEFAULT ROLE "{role}" FOR {account}')
+        source = {**self.source, 'user': user}
+        self.assertEqual([table['name'] for table in multi_sync.list_tables(source)], ['订单'])
+        self.assertEqual([col['name'] for col in multi_sync.list_columns(source, self.schema, '订单')], ['Id', '名称', 'UpdatedAt'])
+        self.assertEqual(multi_sync.list_primary_key(source, self.schema, '订单'), ['Id'])
+        job = multi_sync.automatic_job(source, self.schema, '订单')
+        self.assertNotIn('generated_key', job)
+        self.assertTrue(job['incremental']['enabled'])
+        rows, _, _ = multi_sync.fetch_job_rows(source, job, {})
+        self.assertEqual(rows[0]['名称'], '中文商品😀')
+        self.assertNotIn('数据', rows[0])
+
 
 
 @unittest.skipUnless(os.environ.get('SQLFEISHU_TEST_MARIADB_JSON'), 'MariaDB integration connection not configured')
