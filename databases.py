@@ -253,6 +253,17 @@ def normalize_type(kind, native_type):
     return aliases.get(value, value or "text")
 
 
+def needs_exact_text(column, source):
+    """Recommend lossless text for SQL types whose range exceeds JSON numbers."""
+    kind = column["sql_type"]
+    if kind == "bigint" or (database_type(source) == "sqlite" and kind == "int"):
+        return True
+    if kind in {"decimal", "numeric", "money"}:
+        precision = column.get("numeric_precision")
+        return precision is None or int(precision) > 15
+    return False
+
+
 def list_columns(source, schema, table):
     kind = database_type(source)
     with connect(source) as conn, cursor_for(conn, source) as cursor:
@@ -264,26 +275,26 @@ def list_columns(source, schema, table):
             auto = bool(definition and re.search(r"\bAUTOINCREMENT\b", definition[0] or "", re.I))
             cursor.execute('SELECT name, type, "notnull", cid, pk FROM pragma_table_xinfo(?, ?) WHERE hidden != 1 ORDER BY cid', (table, schema))
             rows = [(row[0], row[1], not bool(row[2] or row[4]), row[3] + 1,
-                     bool(auto and row[4] and row[1].upper() == "INTEGER"), 1) for row in cursor.fetchall()]
+                     bool(auto and row[4] and row[1].upper() == "INTEGER"), 1, None) for row in cursor.fetchall()]
         elif kind in {"mysql", "mariadb"}:
             cursor.execute(
-                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, ORDINAL_POSITION, EXTRA, @@auto_increment_increment "
+                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, ORDINAL_POSITION, EXTRA, @@auto_increment_increment, NUMERIC_PRECISION "
                 "FROM information_schema.columns WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION",
                 (schema, table),
             )
-            rows = [(r[0], r[1], r[2] == "YES", r[3], "auto_increment" in r[4], r[5]) for r in cursor.fetchall()]
+            rows = [(r[0], r[1], r[2] == "YES", r[3], "auto_increment" in r[4], r[5], r[6]) for r in cursor.fetchall()]
         else:
             cursor.execute(
                 "SELECT c.column_name, c.data_type, c.is_nullable, c.ordinal_position, "
                 "pg_get_serial_sequence(format('%%I.%%I', c.table_schema, c.table_name), c.column_name), "
-                "s.seqincrement FROM information_schema.columns c LEFT JOIN pg_sequence s "
+                "s.seqincrement, c.numeric_precision FROM information_schema.columns c LEFT JOIN pg_sequence s "
                 "ON s.seqrelid = to_regclass(pg_get_serial_sequence(format('%%I.%%I', c.table_schema, c.table_name), c.column_name)) "
                 "WHERE c.table_schema = %s AND c.table_name = %s ORDER BY c.ordinal_position", (schema, table),
             )
-            rows = [(r[0], r[1], r[2] == "YES", r[3], bool(r[4]), r[5] or 0) for r in cursor.fetchall()]
+            rows = [(r[0], r[1], r[2] == "YES", r[3], bool(r[4]), r[5] or 0, r[6]) for r in cursor.fetchall()]
     return [{"name": r[0], "sql_type": normalize_type(kind, r[1]), "native_type": r[1].lower(),
              "nullable": r[2], "ordinal": int(r[3]), "is_identity": bool(r[4]),
-             "identity_increment": float(r[5] or 0)} for r in rows]
+             "identity_increment": float(r[5] or 0), "numeric_precision": r[6]} for r in rows]
 
 
 def list_primary_key(source, schema, table):

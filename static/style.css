@@ -76,7 +76,7 @@ body:has(#job-editor-dialog[open]){overflow:hidden}
     #job-editor-dialog .column-tools{flex-wrap:wrap}
     #job-editor-dialog .column-tools label{flex-basis:100%}
     #job-editor-dialog .column-row{grid-template-columns:24px 1fr}
-    #job-editor-dialog .column-row .target-name{grid-column:2}
+    #job-editor-dialog .column-row .column-target{grid-column:2}
 }
 #job-editor-fields{border:0;padding:0;margin:0;min-width:0}
 .editor-advanced{margin-top:18px;border-top:1px solid var(--line);padding-top:16px}
@@ -88,3 +88,6 @@ body:has(#job-editor-dialog[open]){overflow:hidden}
 #incremental-dialog .panel{margin:0;border:0;box-shadow:none}
 #incremental-batch-column-wrap{margin-top:14px}
 #incremental-batch-results{white-space:pre-wrap;line-height:1.8;overflow-wrap:anywhere}
+
+.column-target{display:grid;gap:6px;min-width:0}
+.column-target select{font-size:12px;padding:7px 9px}

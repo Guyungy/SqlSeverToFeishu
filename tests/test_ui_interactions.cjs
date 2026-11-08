@@ -245,3 +245,19 @@ test('failed source save keeps TLS inputs and releases the save button', async (
     assert.equal(ui.element('save-source').disabled, false);
     assert.match(ui.element('source-message').textContent, /network disconnected/);
 });
+
+test('column editor displays saved types and recommends exact text only for new tasks', () => {
+    const ui=uiContext();
+    ui.run(`store.columns=[{name:'Id',sql_type:'bigint',feishu_type:1,nullable:false}];
+        syncKeyOptions=()=>{};
+        renderColumns();`);
+    assert.match(ui.element('column-list').innerHTML, /value="1" selected/);
+    ui.run(`renderColumns({columns:[{source:'Id',target:'编号',sql_type:'bigint'}]})`);
+    assert.match(ui.element('column-list').innerHTML, /value="0" selected/);
+    ui.run(`renderColumns({columns:[{source:'Id',target:'编号',sql_type:'bigint',target_type:2}]})`);
+    assert.match(ui.element('column-list').innerHTML, /value="2" selected/);
+    ui.run(`document.querySelector=(selector)=>selector.includes('data-column=')?{checked:true}:selector.includes('data-type-for=')?{value:'1'}:{value:'精确编号'};`);
+    assert.equal(ui.run('selectedColumns()[0].target_type'), 1);
+    assert.equal(ui.run('selectedColumns()[0].target'), '精确编号');
+    assert.equal(ui.run('selectedColumns()[0].sql_type'), 'bigint');
+});

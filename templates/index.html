@@ -131,6 +131,7 @@
                 </div>
                 <div class="field-header"><strong>同步字段</strong><span id="column-selection-count">可修改右侧飞书字段名</span></div>
                 <div class="column-tools"><label>查找字段<input id="column-search" type="search" placeholder="字段名称"></label><button id="select-all-columns" class="btn secondary">全选全部字段</button><button id="clear-columns" class="btn secondary">取消全部字段</button></div>
+                <p class="plan-hint">大整数、高精度数值可保存为文本。已有飞书字段需匹配所选类型，或填写新的字段名后自动创建。</p>
                 <div id="column-list" class="column-list"></div>
                 <div class="actions"><button id="preview-rows" class="btn secondary">预览前 10 行</button><span id="preview-message" class="message" aria-live="polite"></span></div><div id="row-preview" style="overflow:auto;max-height:360px"></div>
                 <details class="editor-advanced" id="editor-advanced"><summary>分表与增量设置 <span id="editor-advanced-summary"></span></summary>
@@ -573,7 +574,7 @@ function renderTables(){
 }
 function editorFormState(){
     return JSON.stringify([...$('job-editor-panel').querySelectorAll('input:not([type=search]),select')].map(input=>
-        [input.id||input.dataset.column||input.dataset.targetFor,input.type==='checkbox'?input.checked:input.value]));
+        [input.id||input.dataset.column||input.dataset.targetFor||input.dataset.typeFor,input.type==='checkbox'?input.checked:input.value]));
 }
 function closeJobEditor(force=false){
     if(editorSaving)return;
@@ -648,8 +649,42 @@ function filterColumns(){
     document.querySelectorAll('#column-list .column-row').forEach(row=>{row.hidden=!matchesSearch(row.dataset.columnName,query);});
 }
 $('column-search').oninput=filterColumns;
-function renderColumns(existing){const selected=new Map((existing?.columns||[]).map(c=>[c.source,c]));$('column-list').innerHTML=store.columns.map(c=>{const old=selected.get(c.name);return `<div class="column-row" data-column-name="${escapeHtml(c.name)}"><label class="check"><input type="checkbox" aria-label="同步字段 ${escapeHtml(c.name)}" data-column="${escapeHtml(c.name)}" ${!existing||old?'checked':''}><span></span></label><div><b>${escapeHtml(c.name)}</b><small>${escapeHtml(c.sql_type)}${c.nullable?' · 可空':''}</small></div><input class="target-name" aria-label="飞书字段名 ${escapeHtml(c.name)}" data-target-for="${escapeHtml(c.name)}" value="${escapeHtml(old?.target||c.name)}" ${!existing||old?'':'disabled'}></div>`;}).join('');document.querySelectorAll('[data-column]').forEach(c=>c.onchange=()=>{document.querySelector(`[data-target-for="${CSS.escape(c.dataset.column)}"]`).disabled=!c.checked;syncKeyOptions(existing);});syncKeyOptions(existing);}
-function selectedColumns(){return store.columns.filter(c=>document.querySelector(`[data-column="${CSS.escape(c.name)}"]`)?.checked).map(c=>({source:c.name,target:document.querySelector(`[data-target-for="${CSS.escape(c.name)}"]`).value.trim()||c.name,sql_type:c.sql_type,nullable:c.nullable}));}
+function renderColumns(existing){
+    const selected=new Map((existing?.columns||[]).map(column=>[column.source,column]));
+    $('column-list').innerHTML=store.columns.map(column=>{
+        const old=selected.get(column.name);
+        const checked=!existing||!!old;
+        const numeric=['bigint','decimal','float','int','money','numeric','real','smallint','smallmoney','tinyint'].includes(column.sql_type);
+        const targetType=old?.target_type||(!existing&&numeric&&column.feishu_type===1?1:0);
+        const name=escapeHtml(column.name);
+        return `<div class="column-row" data-column-name="${name}">
+            <label class="check"><input type="checkbox" aria-label="同步字段 ${name}" data-column="${name}" ${checked?'checked':''}><span></span></label>
+            <div><b>${name}</b><small>${escapeHtml(column.sql_type)}${column.nullable?' · 可空':''}</small></div>
+            <div class="column-target">
+                <input class="target-name" aria-label="飞书字段名 ${name}" data-target-for="${name}" value="${escapeHtml(old?.target||column.name)}" ${checked?'':'disabled'}>
+                <select aria-label="飞书字段类型 ${name}" data-type-for="${name}" ${checked?'':'disabled'}>
+                    <option value="0" ${targetType===0?'selected':''}>自动类型</option>
+                    <option value="1" ${targetType===1?'selected':''}>文本 · 保留完整数值</option>
+                    <option value="2" ${targetType===2?'selected':''}>数字 · 可计算</option>
+                </select>
+            </div>
+        </div>`;
+    }).join('');
+    document.querySelectorAll('[data-column]').forEach(input=>input.onchange=()=>{
+        for(const attr of ['target','type'])document.querySelector(`[data-${attr}-for="${CSS.escape(input.dataset.column)}"]`).disabled=!input.checked;
+        syncKeyOptions(existing);
+    });
+    syncKeyOptions(existing);
+}
+function selectedColumns(){
+    return store.columns.filter(column=>document.querySelector(`[data-column="${CSS.escape(column.name)}"]`)?.checked).map(column=>{
+        const result={source:column.name,target:document.querySelector(`[data-target-for="${CSS.escape(column.name)}"]`).value.trim()||column.name,
+            sql_type:column.sql_type,nullable:column.nullable};
+        const type=Number(document.querySelector(`[data-type-for="${CSS.escape(column.name)}"]`).value);
+        if(type)result.target_type=type;
+        return result;
+    });
+}
 function syncSplitOptions(columns,existing){
     const select=$('split-column');
     const previous=select.innerHTML?select.value:(existing?.split?.column??store.defaultSplitColumn??'');
@@ -657,11 +692,11 @@ function syncSplitOptions(columns,existing){
     select.innerHTML='<option value="">按唯一键排序</option>'+dates.map(c=>`<option value="${escapeHtml(c.source)}">${escapeHtml(c.source)}</option>`).join('');
     if(dates.some(c=>c.source===previous))select.value=previous;
 }
-function syncKeyOptions(existing){const cols=selectedColumns();syncSplitOptions(cols,existing);$('column-selection-count').textContent=`已选 ${cols.length}/${store.columns.length} 个字段，可修改右侧飞书字段名`;const uk=$('unique-key');const inc=$('incremental-column');const ukValue=uk.value||existing?.unique_key||'';const incValue=inc.value||existing?.incremental.column||'';const options='<option value="">请选择</option>'+cols.map(c=>`<option value="${escapeHtml(c.source)}">${escapeHtml(c.source)}</option>`).join('');uk.innerHTML=options;inc.innerHTML=options;if(cols.some(c=>c.source===ukValue))uk.value=ukValue;if(cols.some(c=>c.source===incValue))inc.value=incValue;}
-$('select-all-columns').onclick=()=>{document.querySelectorAll('[data-column]').forEach(c=>{c.checked=true;document.querySelector(`[data-target-for="${CSS.escape(c.dataset.column)}"]`).disabled=false;});syncKeyOptions();};
+function syncKeyOptions(existing){const cols=selectedColumns();syncSplitOptions(cols,existing);$('column-selection-count').textContent=`已选 ${cols.length}/${store.columns.length} 个字段，可修改右侧飞书字段名和类型`;const uk=$('unique-key');const inc=$('incremental-column');const ukValue=uk.value||existing?.unique_key||'';const incValue=inc.value||existing?.incremental.column||'';const options='<option value="">请选择</option>'+cols.map(c=>`<option value="${escapeHtml(c.source)}">${escapeHtml(c.source)}</option>`).join('');uk.innerHTML=options;inc.innerHTML=options;if(cols.some(c=>c.source===ukValue))uk.value=ukValue;if(cols.some(c=>c.source===incValue))inc.value=incValue;}
+$('select-all-columns').onclick=()=>{document.querySelectorAll('[data-column]').forEach(c=>{c.checked=true;for(const attr of ['target','type'])document.querySelector(`[data-${attr}-for="${CSS.escape(c.dataset.column)}"]`).disabled=false;});syncKeyOptions();};
 $('clear-columns').onclick=()=>{
     document.querySelectorAll('[data-column]').forEach(c=>{c.checked=false;});
-    document.querySelectorAll('[data-target-for]').forEach(c=>{c.disabled=true;});
+    document.querySelectorAll('[data-target-for],[data-type-for]').forEach(c=>{c.disabled=true;});
     syncKeyOptions();
 };
 $('preview-rows').onclick=async()=>{

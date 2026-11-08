@@ -62,7 +62,7 @@ UNIQUE_FIELD_TYPES = {1, 2, 3, 13}
 
 
 def column_field_type(column: Dict[str, Any], unique_key: str) -> int:
-    kind = sql_type_to_feishu(column["sql_type"])
+    kind = column.get("target_type") or sql_type_to_feishu(column["sql_type"])
     # Dates/checkboxes are not safe business keys in the target API.
     return 1 if column["source"] == unique_key and kind not in UNIQUE_FIELD_TYPES else kind
 
@@ -72,6 +72,8 @@ def validate_target_fields(job: Dict[str, Any], field_types: Dict[str, int]) -> 
         kind = field_types.get(column["target"])
         if kind not in WRITABLE_FIELD_TYPES:
             raise ConfigError(f"暂不支持写入复杂或只读飞书字段: {column['target']}（类型 {kind}）")
+        if column.get("target_type") and kind != column["target_type"]:
+            raise ConfigError(f"字段 {column['target']} 的飞书类型与任务设置不一致，请修改飞书字段类型，或填写新的飞书字段名后保存")
         if column["source"] == job["unique_key"] and kind not in UNIQUE_FIELD_TYPES:
             raise ConfigError("唯一键对应的飞书字段必须是文本、数字、单选或电话字段")
 
@@ -97,6 +99,8 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
         identity["source"]["type"] = databases.database_type(source)
     if databases.database_type(source) in {"mysql", "mariadb"}:
         identity["mysql_timestamp_version"] = 2
+    if any(column.get("sql_type") in NUMERIC_TYPES for column in job.get("columns", [])):
+        identity["number_conversion_version"] = 2
     # Earlier builds ignored the configured timezone during record conversion.
     # Invalidate those cursors when the selected timezone differs from that fallback.
     try:
@@ -176,14 +180,14 @@ def list_tables(source: Dict[str, Any]) -> List[Dict[str, str]]:
 
 def list_columns(source: Dict[str, Any], schema: str, table: str) -> List[Dict[str, Any]]:
     if databases.database_type(source) != "mssql":
-        return [{**column, "feishu_type": sql_type_to_feishu(column["sql_type"])}
+        return [{**column, "feishu_type": 1 if databases.needs_exact_text(column, source) else sql_type_to_feishu(column["sql_type"])}
                 for column in databases.list_columns(source, schema, table)]
     with sql_connection(source) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, ORDINAL_POSITION, "
                 "COLUMNPROPERTY(OBJECT_ID(QUOTENAME(TABLE_SCHEMA)+N'.'+QUOTENAME(TABLE_NAME)), COLUMN_NAME, 'IsIdentity'), "
-                "IDENT_INCR(QUOTENAME(TABLE_SCHEMA)+N'.'+QUOTENAME(TABLE_NAME)) "
+                "IDENT_INCR(QUOTENAME(TABLE_SCHEMA)+N'.'+QUOTENAME(TABLE_NAME)), NUMERIC_PRECISION "
                 "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
                 "ORDER BY ORDINAL_POSITION",
                 (schema, table),
@@ -196,7 +200,9 @@ def list_columns(source: Dict[str, Any], schema: str, table: str) -> List[Dict[s
                     "ordinal": int(row[3]),
                     "is_identity": bool(row[4]),
                     "identity_increment": float(row[5] or 0),
-                    "feishu_type": sql_type_to_feishu(str(row[1]).lower()),
+                    "numeric_precision": row[6],
+                    "feishu_type": 1 if databases.needs_exact_text({"sql_type": str(row[1]).lower(), "numeric_precision": row[6]}, source)
+                                   else sql_type_to_feishu(str(row[1]).lower()),
                 }
                 for row in cursor.fetchall()
             ]
@@ -240,6 +246,9 @@ def automatic_job(source: Dict[str, Any], schema: str, table: str) -> Dict[str, 
     primary = list_primary_key(source, schema, table)
     mapped = [{"source": col["name"], "target": col["name"],
                "sql_type": col["sql_type"], "nullable": col["nullable"]} for col in columns]
+    for column, metadata in zip(mapped, columns):
+        if databases.needs_exact_text(metadata, source):
+            column["target_type"] = 1
     generated = len(primary) != 1
     key = primary[0] if not generated else "__sqlfeishu_row_key"
     names = {col["source"] for col in mapped}
@@ -631,7 +640,10 @@ def build_record(row: Dict[str, Any], columns: Sequence[Dict[str, Any]], field_t
         value = row.get(column["source"])
         if value is None and null_policy == "skip":
             continue
-        fields[column["target"]] = convert_value(value, field_types[column["target"]], settings["timezone_offset"])
+        try:
+            fields[column["target"]] = convert_value(value, field_types[column["target"]], settings["timezone_offset"])
+        except ConfigError as exc:
+            raise ConfigError(f"字段 {column['source']} → {column['target']}，{exc}") from exc
     return {"fields": fields}
 
 

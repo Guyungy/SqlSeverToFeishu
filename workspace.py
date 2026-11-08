@@ -385,6 +385,11 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str],
             "sql_type": str(item.get("sql_type") or "nvarchar").lower(),
             "nullable": bool(item.get("nullable", True)),
         })
+        target_type = item.get("target_type", 0)
+        if type(target_type) is not int or target_type not in {0, 1, 2}:
+            raise ValueError("飞书字段类型仅支持自动、文本或数字")
+        if target_type:
+            clean_columns[-1]["target_type"] = target_type
     unique_key = _clean_sql_identifier(job.get("unique_key"), "唯一键", source)
     if unique_key not in source_names:
         raise ValueError("唯一键必须包含在已勾选字段中")

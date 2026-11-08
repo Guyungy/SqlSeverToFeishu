@@ -209,6 +209,8 @@ class DatabaseToHttpTests(unittest.TestCase):
                 with mock.patch.multiple(workspace, CONFIG_PATH=root / 'config.json', STATE_PATH=root / 'state.json'), \
                      mock.patch.object(sync.time, 'sleep'):
                     job = multi_sync.automatic_job(source, 'main', 'Orders')
+                    # Exercise explicitly numeric keys and the key-filter HTTP path.
+                    job['columns'][0]['target_type'] = 2
                     config = workspace.save_config({'sources': [source], 'jobs': [job]})
                     state = {'jobs': {}}
                     first = multi_sync.run_job(fixture.client, 'app', config, state, config['jobs'][0], False)

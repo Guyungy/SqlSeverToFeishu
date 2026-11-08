@@ -25,7 +25,7 @@ class UnicodeSyncTests(unittest.TestCase):
         source = self.source()
         metadata = [{'name': '订单号', 'sql_type': 'nvarchar', 'nullable': False},
                     {'name': '产品名称(中文)', 'sql_type': 'nvarchar', 'nullable': True},
-                    {'name': '金额(元)', 'sql_type': 'decimal', 'nullable': True}]
+                    {'name': '金额(元)', 'sql_type': 'decimal', 'nullable': True, 'numeric_precision': 12}]
         connection = mock.MagicMock()
         cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
         cursor.fetchmany.side_effect = [[('单据甲', '中文商品，型号甲', Decimal('12.50'))], []]

@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -550,12 +550,20 @@ def convert_value(value: Any, field_type: int, timezone_offset: Optional[float] 
     if field_type == 2:
         if isinstance(value, bool):
             return int(value)
-        if isinstance(value, Decimal):
-            return float(value)
-        if isinstance(value, (int, float)):
-            return value
-        text = str(value).strip()
-        return float(text) if "." in text else int(text)
+        try:
+            number = Decimal(str(value).strip())
+        except (InvalidOperation, ValueError) as exc:
+            raise ConfigError("数值格式无效，请检查源字段或使用文本字段") from exc
+        if not number.is_finite():
+            raise ConfigError("数字字段不支持 NaN 或 Infinity，请使用文本字段保留原值")
+        if number == number.to_integral_value():
+            if abs(number) > 2 ** 53 - 1:
+                raise ConfigError("数值超出安全整数范围，请使用文本字段保留原值")
+            return int(number)
+        result = float(number)
+        if not math.isfinite(result) or Decimal(str(result)) != number:
+            raise ConfigError("数值转换会丢失精度，请使用文本字段保留原值")
+        return result
     if field_type == 5:
         return _date_to_milliseconds(value, timezone_offset)
     if field_type == 7:
@@ -588,9 +596,10 @@ def build_record(
         value = row.get(item["sql"])
         if value is None and null_policy == "skip":
             continue
-        fields[item["feishu"]] = convert_value(
-            value, field_types.get(item["feishu"], 1), timezone_offset
-        )
+        try:
+            fields[item["feishu"]] = convert_value(value, field_types.get(item["feishu"], 1), timezone_offset)
+        except ConfigError as exc:
+            raise ConfigError(f"字段 {item['sql']} → {item['feishu']}，{exc}") from exc
     return {"fields": fields}
 
 

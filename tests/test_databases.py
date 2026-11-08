@@ -126,6 +126,64 @@ class SQLiteWorkflowTests(unittest.TestCase):
         self.assertIn('增量字段', response.get_json()['message'])
         self.assertEqual(workspace.load_config()['jobs'][0]['incremental']['column'], 'UpdatedAt')
 
+    def test_exact_large_keys_and_decimal_values_survive_split_and_update(self):
+        kind = databases.database_type(self.source)
+        table = databases.qualified_table(self.source, self.schema, '精度测试')
+        amount_type = 'TEXT' if kind == 'sqlite' else 'DECIMAL(30,10)'
+        time_type = 'DATETIME' if kind in {'sqlite', 'mysql', 'mariadb'} else 'TIMESTAMP'
+        self.execute(f'CREATE TABLE {table} ("Id" BIGINT PRIMARY KEY, "Amount" {amount_type}, "Small" DECIMAL(10,2), "UpdatedAt" {time_type})')
+        values = [(9007199254740993, '123456789012345.6789000000', '12.50', '2026-01-01 00:00:00'),
+                  (9007199254740994, '0.0000000001', '0.01', '2026-01-01 00:00:00')]
+        for row in values:
+            self.execute(f'INSERT INTO {table} VALUES ({", ".join([self.marker] * 4)})', row)
+        self.writer.commit()
+        result = self.request('/api/jobs/bulk', {'tables': [
+            {'source_id': self.source['id'], 'schema': self.schema, 'name': '精度测试'}]})
+        self.assertEqual(result['errors'], [])
+        job = next(job for job in result['config']['jobs'] if job['table'] == '精度测试')
+        self.assertEqual(job['columns'][0]['target_type'], 1)
+        if kind != 'sqlite':
+            self.assertEqual(job['columns'][1]['target_type'], 1)
+            self.assertNotIn('target_type', job['columns'][2])
+        job['split']['row_limit'] = 1
+        self.request('/api/jobs', {'job': job})
+        config = workspace.load_config()
+        job = next(item for item in config['jobs'] if item['id'] == job['id'])
+        fake, state = FakeFeishu(), {'jobs': {}}
+        first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(first['create'], 2)
+        self.assertEqual(len(fake.tables), 2)
+        records = {r['fields']['Id']: r['fields'] for rows in fake.records.values() for r in rows}
+        self.assertEqual(set(records), {'9007199254740993', '9007199254740994'})
+        self.assertEqual(records['9007199254740993']['Amount'], values[0][1])
+        self.assertEqual(records['9007199254740993']['Small'], 12.5 if kind != 'sqlite' else '12.5')
+        self.execute(f'UPDATE {table} SET "Amount"={self.marker}, "UpdatedAt"={self.marker} WHERE "Id"={self.marker}',
+                     ('987654321012345.1234567890', '2026-01-02 00:00:00', 9007199254740993))
+        self.writer.commit()
+        updated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(updated['incremental'])
+        self.assertEqual((updated['create'], updated['update']), (0, 1))
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((repeated['create'], repeated['update']), (0, 0))
+        records = {r['fields']['Id']: r['fields'] for rows in fake.records.values() for r in rows}
+        self.assertEqual(records['9007199254740993']['Amount'], '987654321012345.1234567890')
+        before = copy.deepcopy(state)
+        stored = workspace.STATE_PATH.read_bytes()
+        job['columns'][0]['target_type'] = 2
+        with self.assertRaisesRegex(multi_sync.ConfigError, '类型.*不一致'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state, before)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), stored)
+        # Even a matching numeric target must reject an unsafe ID before writes.
+        for target in fake.tables.values():
+            next(field for field in target['fields'] if field['field_name'] == 'Id')['type'] = 2
+        write_count = fake.batch_count
+        with self.assertRaisesRegex(multi_sync.ConfigError, '唯一键 Id.*安全整数'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(fake.batch_count, write_count)
+        self.assertEqual(state, before)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), stored)
+
     def test_source_is_read_only(self):
         with multi_sync.sql_connection(self.source) as connection, databases.cursor_for(connection, self.source) as cursor:
             with self.assertRaises(Exception):
@@ -380,9 +438,9 @@ class MySQLDriverTests(unittest.TestCase):
         connection = mock.MagicMock()
         cursor = connection.cursor.return_value
         cursor.fetchall.return_value = [
-            ('Id', 'bigint', 'NO', 1, 'auto_increment', 1),
-            ('UpdatedAt', 'timestamp', 'YES', 2, '', 1),
-            ('Flags', 'bit', 'YES', 3, '', 1),
+            ('Id', 'bigint', 'NO', 1, 'auto_increment', 1, 64),
+            ('UpdatedAt', 'timestamp', 'YES', 2, '', 1, None),
+            ('Flags', 'bit', 'YES', 3, '', 1, 16),
         ]
         with mock.patch.object(databases, 'connect') as connect:
             connect.return_value.__enter__.return_value = connection
