@@ -64,7 +64,7 @@ class SplitSyncTests(unittest.TestCase):
                 for index in range(count)]
 
     def run_sync(self, rows, dry_run=False):
-        def fetch(source, job, saved_state, row_sink=None):
+        def fetch(source, job, saved_state, row_sink=None, settings=None):
             for start in range(0, len(rows), 1000):
                 row_sink(rows[start:start + 1000])
             return [], datetime(2026, 1, 1), False

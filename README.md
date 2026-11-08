@@ -4,7 +4,7 @@
 
 # 数据库 → 飞书同步中心
 
-选择数据库，批量把业务表同步到飞书多维表格。支持 SQL Server、PostgreSQL、SQLite，已接入 MySQL/MariaDB 适配。[兼容范围与验证状态](docs/databases.md)。
+选择数据库，批量把业务表同步到飞书多维表格。支持 SQL Server、PostgreSQL、SQLite、MySQL 和 MariaDB。[兼容范围与验证状态](docs/databases.md)
 
 中文管理界面 · 批量建任务 · 增量同步 · 自动分表
 

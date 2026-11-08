@@ -6,6 +6,13 @@
 
 ### 2026-11-09
 
+#### 真实数据库回归与兼容修复
+
+- 增加 MySQL 8.4.13、MariaDB 11.4.13 真实实例集成用例，与 SQLite、PostgreSQL 16 共用发现、中文预览、任务编辑、全量增量和重跑验证。
+- 修复 MariaDB SELECT-only 账号看不到主键约束的问题，改用索引元数据。PostgreSQL 改用系统目录识别主键，验证仅有 Schema USAGE、表 SELECT 权限的账号。
+- 固定 MySQL/MariaDB 会话时区为 UTC，保留 TIMESTAMP 的绝对时间，DATETIME 继续使用页面时区。旧游标在升级后失效并全量核对。
+- 四种真实引擎均覆盖 40001 行分表、末批响应丢失后的重试、复合主键、无主键视图和查询超时配置快照。
+
 #### 多数据库与任务编辑
 
 - Python 网页版增加数据库类型选择，接入 PostgreSQL、SQLite、MySQL/MariaDB 的连接、数据库识别、表和视图发现、主键识别、预览和增量读取。旧配置默认按 SQL Server 加载。

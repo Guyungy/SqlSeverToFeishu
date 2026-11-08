@@ -6,6 +6,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 
 
 DATABASE_TYPES = {"mssql", "mysql", "mariadb", "postgresql", "sqlite"}
@@ -83,6 +84,7 @@ def connect(source, database=None, settings=None):
     try:
         if kind in {"mysql", "mariadb"}:
             with conn.cursor() as cursor:
+                cursor.execute("SET SESSION time_zone = '+00:00'")
                 cursor.execute("START TRANSACTION READ ONLY")
         yield conn
     finally:
@@ -198,14 +200,18 @@ def list_primary_key(source, schema, table):
     with connect(source) as conn, cursor_for(conn, source) as cursor:
         if database_type(source) == "sqlite":
             cursor.execute("SELECT name FROM pragma_table_xinfo(?, ?) WHERE pk > 0 ORDER BY pk", (table, schema))
+        elif database_type(source) in {"mysql", "mariadb"}:
+            cursor.execute("SHOW INDEX FROM " + qualified_table(source, schema, table), ())
+            # TABLE_CONSTRAINTS can hide keys from SELECT-only MariaDB accounts.
+            primary = [row for row in cursor.fetchall() if row[2] == "PRIMARY"]
+            return [row[4] for row in sorted(primary, key=lambda row: row[3])]
         else:
             cursor.execute(
-                "SELECT k.column_name FROM information_schema.table_constraints t "
-                "JOIN information_schema.key_column_usage k ON t.constraint_catalog = k.constraint_catalog "
-                "AND t.constraint_schema = k.constraint_schema AND t.constraint_name = k.constraint_name "
-                "AND t.table_schema = k.table_schema AND t.table_name = k.table_name "
-                "WHERE t.constraint_type = 'PRIMARY KEY' AND t.table_schema = %s AND t.table_name = %s "
-                "ORDER BY k.ordinal_position", (schema, table),
+                "SELECT a.attname FROM pg_index i "
+                "CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, position) "
+                "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+                "WHERE i.indrelid = to_regclass(format('%%I.%%I', %s::text, %s::text)) AND i.indisprimary "
+                "AND k.position <= i.indnkeyatts ORDER BY k.position", (schema, table),
             )
         return [row[0] for row in cursor.fetchall()]
 
@@ -225,10 +231,19 @@ def prepare_read(cursor, source):
 
 def decode_value(value, column, source):
     kind = database_type(source)
+    if kind in {"mysql", "mariadb"} and column.get("native_type") == "timestamp" and isinstance(value, datetime):
+        return value.replace(tzinfo=timezone.utc)
     if kind in {"mysql", "mariadb"} and column.get("native_type") == "bit" and isinstance(value, bytes):
         return int.from_bytes(value, "big")
     if isinstance(value, (bytes, memoryview)):
         return bytes(value).hex()
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return value
+
+
+def cursor_parameter(value, column, source):
+    if database_type(source) in {"mysql", "mariadb"} and column.get("native_type") == "timestamp" and isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
     return value

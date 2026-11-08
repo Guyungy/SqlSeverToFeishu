@@ -21,6 +21,7 @@
 
 - 中文字段、文本内容和 Emoji 按驱动 Unicode 连接读取。
 - MySQL/PostgreSQL 的 `timestamp` 映射为日期，SQL Server 的同名类型保留行版本语义。
+- MySQL/MariaDB 会话固定为 UTC，`TIMESTAMP` 保留绝对时间点，`DATETIME` 按页面的时区解释。升级后相关旧游标失效，下一次执行全量核对以修正日期。
 - PostgreSQL JSON/数组转成 JSON 文本，新引擎的二进制值转成十六进制文本。MySQL 多位 `BIT` 保留整数值。
 - 自动增量优先使用常见更新时间字段，其次使用正向自增主键。ID 增量适用于新增数据，更新历史记录需要维护更新时间字段。
 - SQLite 日期建议统一保存为固定格式 ISO 日期时间文本。混用文本、Unix 时间戳和不同偏移会影响排序与增量比较。
@@ -31,15 +32,20 @@
 | 引擎 | 当前证据 |
 | --- | --- |
 | SQL Server | 原有 112 项回归持续通过，本次未连接客户实例 |
-| SQLite | 本机真实数据库验证连接、发现、中文预览、批量任务、全量和增量读取、重复执行、只读限制 |
-| PostgreSQL 16 | 本机临时实例验证上述流程，包括 identity 主键与服务端游标 |
-| MySQL / MariaDB | 驱动参数、元数据映射和增量 SQL 回归通过，真实实例集成验收待完成 |
+| SQLite | 真实数据库验证连接、发现、中文预览、批量任务、全量和增量读取、重复执行、只读限制、复合主键、无主键视图及 40001 行分表重试 |
+| PostgreSQL 16 | 临时实例验证上述流程，包括只授予 Schema USAGE 和表 SELECT 的账号、identity 主键与服务端游标 |
+| MySQL 8.4.13 | 临时实例验证上述流程，包括只授予表 SELECT 的账号、auto_increment 主键、UTC 时间戳和流式读取 |
+| MariaDB 11.4.13 | 独立临时实例验证上述流程，主键通过只读账号可见的索引元数据识别 |
 
 上述同步回归中的飞书写入使用测试替身。客户数据库、网络、权限及真实飞书目标仍需在部署环境预检和验收。
 
 ## 开发验证
 
-默认测试会运行真实 SQLite 用例。提供专用 PostgreSQL 测试库后可启用集成用例。测试创建随机 Schema 并在结束后清除，测试账号需要创建 Schema 和表的权限。
+默认测试会运行真实 SQLite 用例。配置环境变量后可启用其他引擎的集成用例。
+
+- PostgreSQL 测试会创建随机 Schema、表、视图及只读角色，结束后清除，需要专用测试实例上的管理员账号。
+- MySQL/MariaDB 测试会创建随机数据库、表、视图及只读账号，结束后清除，需要专用测试实例上的管理员账号。
+- 每个引擎用 40001 行测试分表，模拟末批写入已接收但响应丢失，验证重跑后记录数量与唯一键一致，失败时不推进游标。
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
@@ -47,6 +53,12 @@ node --test tests/test_ui_interactions.cjs
 
 SQLFEISHU_TEST_POSTGRES_DSN='host=127.0.0.1 port=5432 dbname=test user=tester' \
   .venv/bin/python -m unittest discover -s tests -p test_databases.py -v
+
+SQLFEISHU_TEST_MYSQL_JSON='{"host":"127.0.0.1","port":53317,"user":"test_admin"}' \
+SQLFEISHU_TEST_MARIADB_JSON='{"host":"127.0.0.1","port":53316,"user":"test_admin"}' \
+  .venv/bin/python -m unittest discover -s tests -p test_databases.py -v
 ```
 
 生产接入使用只读账号，测试库使用独立配置。
+
+之前以 MariaDB 只读账号建出的无主键任务，可在任务编辑器中将唯一键改为实际主键，再配置增量。已有任务保留人工设置，升级后需要主动调整。

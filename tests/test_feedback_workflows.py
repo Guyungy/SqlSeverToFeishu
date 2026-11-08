@@ -60,7 +60,7 @@ class IncrementalLookupTests(unittest.TestCase):
         self.client.iter_records_by_keys.return_value = iter([{'record_id': 'old', 'fields': {'Id': 139999}}])
 
     def run_sync(self, rows, cursor=140000, types=None):
-        def fetch(source, job, state, row_sink=None):
+        def fetch(source, job, state, row_sink=None, settings=None):
             row_sink(rows)
             return [], cursor, True
         with mock.patch.object(multi_sync, 'ensure_target', return_value=('tbl', types or {'Id': 2}, 'existing')), \

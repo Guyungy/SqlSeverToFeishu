@@ -103,7 +103,7 @@ class LargeSyncTests(unittest.TestCase):
         client.iter_records.return_value = iter(records)
         if fail_write:
             client.batch_create.side_effect = RuntimeError('write failed')
-        def fetch(source, job, saved_state, row_sink=None):
+        def fetch(source, job, saved_state, row_sink=None, settings=None):
             self.assertIsNotNone(row_sink)
             for batch in batches:
                 row_sink(batch)
@@ -142,7 +142,7 @@ class LargeSyncTests(unittest.TestCase):
         config = config_fixture()
         client = mock.Mock()
         client.list_tables.return_value = []
-        def fetch(source, job, state, row_sink=None):
+        def fetch(source, job, state, row_sink=None, settings=None):
             row_sink([{'Id': 1}])
             row_sink([{'Id': 1}])
         with mock.patch.object(multi_sync, 'ensure_target', return_value=('tbl', {'Id': 2}, 'existing')), \

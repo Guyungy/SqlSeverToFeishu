@@ -95,6 +95,8 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
     }
     if databases.database_type(source) != "mssql":
         identity["source"]["type"] = databases.database_type(source)
+    if databases.database_type(source) in {"mysql", "mariadb"}:
+        identity["mysql_timestamp_version"] = 2
     # Earlier builds ignored the configured timezone during record conversion.
     # Invalidate those cursors when the selected timezone differs from that fallback.
     try:
@@ -349,6 +351,7 @@ def _encode_cursor(value: Any) -> Dict[str, Any]:
 def fetch_job_rows(
     source: Dict[str, Any], job: Dict[str, Any], job_state: Optional[Dict[str, Any]],
     row_sink: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    settings: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Any], bool]:
     metadata = {item["name"]: item for item in list_columns(source, job["schema"], job["table"])}
     if not metadata:
@@ -370,7 +373,7 @@ def fetch_job_rows(
         declared_type = str(metadata.get(incremental_column, {}).get("sql_type") or "")
         if _cursor_fits_sql_type(cursor_value, declared_type, source):
             query += f" WHERE {databases.quote_identifier(source, incremental_column)} >= {databases.placeholder(source)}"
-            params = (cursor_value,)
+            params = (databases.cursor_parameter(cursor_value, metadata[incremental_column], source),)
         else:
             incremental_run = False
             progress(
@@ -385,7 +388,8 @@ def fetch_job_rows(
     max_cursor = None
     count = 0
     occurrences: Dict[str, int] = {}
-    with sql_connection(source) as conn:
+    connection = sql_connection(source, settings=settings) if settings is not None else sql_connection(source)
+    with connection as conn:
         with databases.cursor_for(conn, source, streaming=True) as cursor:
             databases.prepare_read(cursor, source)
             cursor.execute(query, params)
@@ -727,7 +731,7 @@ def run_job(
                 counts["source_rows"] += len(chunk)
                 staging.commit()
 
-            _, max_cursor, incremental_run = fetch_job_rows(source, job, job_state or None, row_sink=stage_rows)
+            _, max_cursor, incremental_run = fetch_job_rows(source, job, job_state or None, row_sink=stage_rows, settings=settings)
             lookup_mode = "full"
             if not counts["source_rows"]:
                 lookup_mode = "empty"
