@@ -1,14 +1,40 @@
 """Cursor recovery and engine-specific types at incremental boundaries."""
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest import mock
 
 import multi_sync
+import databases
 from sync import ConfigError
 
 
 class CursorBoundaryTests(unittest.TestCase):
+    def test_mysql_time_cursor_preserves_signed_microseconds(self):
+        values = [
+            (timedelta(hours=-838, minutes=-59, seconds=-59), '-838:59:59.000000'),
+            (timedelta(hours=-25, minutes=-30, microseconds=-123456), '-25:30:00.123456'),
+            (timedelta(microseconds=-1), '-00:00:00.000001'),
+            (timedelta(), '00:00:00.000000'),
+            (timedelta(microseconds=1), '00:00:00.000001'),
+            (timedelta(hours=25, microseconds=123456), '25:00:00.123456'),
+            (timedelta(hours=838, minutes=59, seconds=59), '838:59:59.000000'),
+        ]
+        for engine in ('mysql', 'mariadb'):
+            source = {'type': engine}
+            for value, text in values:
+                with self.subTest(engine=engine, value=value):
+                    saved = multi_sync._encode_cursor(value)
+                    self.assertEqual(saved['type'], 'timedelta')
+                    self.assertEqual(multi_sync._decode_cursor(saved), value)
+                    self.assertTrue(multi_sync._cursor_fits_sql_type(value, 'time', source))
+                    self.assertEqual(databases.cursor_parameter(value, {'native_type': 'time'}, source), text)
+            for value in ('-1 day, 23:59:59', '24:00:00', timedelta(hours=839), timedelta(hours=-839), 0):
+                self.assertFalse(multi_sync._cursor_fits_sql_type(value, 'time', source))
+        for value in (True, 1.5, '123', None):
+            with self.assertRaisesRegex(ValueError, '时长增量游标格式错误'):
+                multi_sync._decode_cursor({'type': 'timedelta', 'value': value})
+
     def test_dates_and_timezone_changes_force_full_scan(self):
         naive = datetime(2026, 1, 1)
         aware = naive.replace(tzinfo=timezone.utc)

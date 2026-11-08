@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -417,6 +417,23 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.execute(f'CREATE TABLE "{self.schema}"."订单" ("Id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "名称" TEXT, "UpdatedAt" TIMESTAMP, "数据" BYTEA)')
         self.execute(f'CREATE VIEW "{self.schema}"."订单视图" AS SELECT * FROM "{self.schema}"."订单"')
         self.finish_setup()
+
+    def test_interval_cursor_retains_day_and_microsecond_boundaries(self):
+        relation = f'"{self.schema}"."时长游标"'
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "时长" interval)')
+        values = [timedelta(hours=-25, microseconds=-1), timedelta(microseconds=-1),
+                  timedelta(), timedelta(hours=25, microseconds=1)]
+        for index, value in enumerate(values):
+            self.execute(f'INSERT INTO {relation} VALUES (%s,%s)', (index, value))
+        job = multi_sync.automatic_job(self.source, self.schema, '时长游标')
+        job['incremental'] = {'enabled': True, 'column': '时长'}
+        for index, value in enumerate(values):
+            for cursor in (multi_sync._encode_cursor(value), {'type': 'str', 'value': str(value)}):
+                with self.subTest(value=value, cursor=cursor):
+                    rows, maximum, used = multi_sync.fetch_job_rows(self.source, job, {'cursor': cursor})
+                    self.assertTrue(used)
+                    self.assertEqual([row['Id'] for row in rows], list(range(index, len(values))))
+                    self.assertEqual(maximum, values[-1])
 
     def test_binary_array_preview_preserves_shape_nulls_and_hex_across_relations(self):
         relation = f'"{self.schema}"."二进制数组"'
@@ -1262,6 +1279,94 @@ class MySQLWorkflowTests(SQLiteWorkflowTests):
         self.writer.commit()
         with self.assertRaisesRegex(multi_sync.ConfigError, '增量字段 UpdatedAt.*无效值'):
             multi_sync.fetch_job_rows(self.source, job, {})
+
+    def test_time_cursor_preserves_negative_and_multiday_boundaries(self):
+        relation = f'"{self.schema}"."时长边界"'
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "时长" TIME(6), "名称" text)')
+        values = [
+            ('-838:59:59', timedelta(hours=-838, minutes=-59, seconds=-59)),
+            ('-25:30:00.123456', timedelta(hours=-25, minutes=-30, microseconds=-123456)),
+            ('-01:30:00.000001', timedelta(hours=-1, minutes=-30, microseconds=-1)),
+            ('-00:00:00.000001', timedelta(microseconds=-1)),
+            ('00:00:00', timedelta()),
+            ('00:00:00.000001', timedelta(microseconds=1)),
+            ('24:00:00.000001', timedelta(hours=24, microseconds=1)),
+            ('838:59:59', timedelta(hours=838, minutes=59, seconds=59)),
+        ]
+        for index, (text, _) in enumerate(values):
+            self.execute(f'INSERT INTO {relation} VALUES (%s,%s,\'中文时长😀\')', (index, text))
+        self.execute(f'INSERT INTO {relation} VALUES (99,NULL,\'空时长\')')
+        result = self.request('/api/jobs/bulk', {'tables': [
+            {'source_id': self.source['id'], 'schema': self.schema, 'name': '时长边界'}]})
+        self.assertEqual(result['errors'], [])
+        job = result['config']['jobs'][0]
+        job['incremental'] = {'enabled': True, 'column': '时长'}
+        self.request('/api/jobs', {'job': job})
+        preview = self.request('/api/sources/' + self.source['id'] + '/preview',
+                               {'schema': self.schema, 'table': '时长边界', 'columns': ['Id', '时长', '名称']})
+        self.assertEqual({int(row[0]): row[1] for row in preview['rows']},
+                         {**{i: str(value) for i, (_, value) in enumerate(values)}, 99: None})
+        for index, (_, value) in enumerate(values):
+            rows, maximum, used = multi_sync.fetch_job_rows(
+                self.source, job, {'cursor': multi_sync._encode_cursor(value)})
+            self.assertTrue(used)
+            self.assertEqual([row['Id'] for row in rows], [99] + list(range(index, len(values))))
+            self.assertEqual(maximum, values[-1][1])
+        for cursor in ({'type': 'str', 'value': str(values[2][1])},
+                       {'type': 'timedelta', 'value': True},
+                       {'type': 'timedelta', 'value': 10 ** 100},
+                       multi_sync._encode_cursor(timedelta(hours=839))):
+            rows, _, used = multi_sync.fetch_job_rows(self.source, job, {'cursor': cursor})
+            self.assertFalse(used)
+            self.assertEqual(len(rows), len(values) + 1)
+
+    def test_time_cursor_upgrade_retry_and_null_rows_keep_saved_progress(self):
+        relation = f'"{self.schema}"."时长同步"'
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "时长" TIME(6), "名称" text)')
+        self.execute(f'INSERT INTO {relation} VALUES (1,\'-25:30:00.123456\',\'旧数据\'),'
+                     '(2,\'-01:30:00.000001\',\'边界\'),(3,NULL,\'空时长\')')
+        result = self.request('/api/jobs/bulk', {'tables': [
+            {'source_id': self.source['id'], 'schema': self.schema, 'name': '时长同步'}]})
+        self.assertEqual(result['errors'], [])
+        job = result['config']['jobs'][0]
+        job['incremental'] = {'enabled': True, 'column': '时长'}
+        job['split']['row_limit'] = 1
+        self.request('/api/jobs', {'job': job})
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.record_count = lambda *args: None
+        first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(first['create'], 3)
+        self.assertEqual(state['jobs'][job['id']]['cursor'],
+                         multi_sync._encode_cursor(timedelta(hours=-1, minutes=-30, microseconds=-1)))
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(repeated['incremental'])
+        self.assertEqual((repeated['source_rows'], repeated['skip']), (2, 2))
+
+        # Reproduce a saved string cursor written by the previous version.
+        state['jobs'][job['id']]['cursor'] = {'type': 'str', 'value': '-1 day, 22:29:59.999999'}
+        workspace.save_state(state)
+        self.execute(f'UPDATE {relation} SET "名称"=\'旧记录修正\' WHERE "Id"=1')
+        records_before = {row['record_id'] for rows in fake.records.values() for row in rows}
+        upgraded = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertFalse(upgraded['incremental'])
+        self.assertEqual((upgraded['source_rows'], upgraded['update'], upgraded['create']), (3, 1, 0))
+        self.assertEqual(records_before, {row['record_id'] for rows in fake.records.values() for row in rows})
+
+        self.execute(f'INSERT INTO {relation} VALUES (4,\'-00:30:00.000001\',\'新增中文😀\')')
+        before, disk_before = copy.deepcopy(state), workspace.STATE_PATH.read_bytes()
+        fake.fail_on_batch = fake.batch_count + 1
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state, before)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), disk_before)
+        fake.fail_on_batch = None
+        retry = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(retry['incremental'])
+        self.assertEqual((retry['create'], retry['update'], retry['skip']), (0, 0, 3))
+        self.assertEqual(state['jobs'][job['id']]['cursor'],
+                         multi_sync._encode_cursor(timedelta(minutes=-30, microseconds=-1)))
+        self.assertEqual(sum(len(rows) for rows in fake.records.values()), 4)
 
     def test_minimal_readonly_account_sees_primary_key_and_metadata(self):
         user = 'reader_' + uuid.uuid4().hex[:16]

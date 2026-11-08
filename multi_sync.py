@@ -15,7 +15,7 @@ import signal
 import sqlite3
 import tempfile
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Any, Dict, List, Optional, Sequence, Tuple
 
@@ -352,6 +352,10 @@ def _decode_cursor(cursor: Dict[str, Any]) -> Any:
         raise ValueError("增量游标格式错误")
     value = cursor.get("value")
     value_type = cursor.get("type")
+    if value_type == "timedelta":
+        if type(value) is not int:
+            raise ValueError("时长增量游标格式错误")
+        return timedelta(microseconds=value)
     if value_type == "datetime":
         return datetime.fromisoformat(value)
     if value_type == "date":
@@ -376,6 +380,8 @@ def _decode_cursor(cursor: Dict[str, Any]) -> Any:
 
 
 def _encode_cursor(value: Any) -> Dict[str, Any]:
+    if isinstance(value, timedelta):
+        return {"type": "timedelta", "value": value // timedelta(microseconds=1)}
     if isinstance(value, datetime):
         return {"type": "datetime", "value": value.isoformat()}
     if isinstance(value, date):
@@ -486,6 +492,10 @@ def _cursor_fits_sql_type(value: Any, sql_type: str, source: Optional[Dict[str, 
                          column: Optional[Dict[str, Any]] = None) -> bool:
     """Detect a cursor that no longer matches its incremental column type."""
     kind = (sql_type or "").lower()
+    if kind == "time" and source and databases.database_type(source) in {"mysql", "mariadb"}:
+        return isinstance(value, timedelta) and abs(value) < timedelta(hours=839)
+    if kind == "interval" and source and databases.database_type(source) == "postgresql":
+        return isinstance(value, (timedelta, str))
     if kind in DATE_TYPES:
         if source and databases.database_type(source) == "sqlite":
             if not isinstance(value, str):

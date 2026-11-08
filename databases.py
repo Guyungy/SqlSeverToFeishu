@@ -7,7 +7,7 @@ import sqlite3
 import ssl
 import time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pymysql
 
@@ -426,6 +426,15 @@ def legacy_binary_array(value):
 
 
 def cursor_parameter(value, column, source):
+    if database_type(source) in {"mysql", "mariadb"} and column.get("native_type") == "time" and isinstance(value, timedelta):
+        # PyMySQL formats negative timedelta components independently, changing
+        # their magnitude. Bind one signed duration with exact microseconds.
+        microseconds = value // timedelta(microseconds=1)
+        hours, remainder = divmod(abs(microseconds), 3600 * 1000000)
+        minutes, remainder = divmod(remainder, 60 * 1000000)
+        seconds, fraction = divmod(remainder, 1000000)
+        sign = "-" if microseconds < 0 else ""
+        return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}.{fraction:06d}"
     if database_type(source) in {"mysql", "mariadb"} and column.get("native_type") == "timestamp" and isinstance(value, datetime):
         if value.tzinfo is not None:
             return value.astimezone(timezone.utc).replace(tzinfo=None)
