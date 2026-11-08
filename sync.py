@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -13,6 +14,7 @@ import sys
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -255,6 +257,45 @@ def validate_source_keys(rows: Sequence[Dict[str, Any]], unique_key: str) -> Lis
     return keys
 
 
+def _retry_delay(response, attempt: int) -> float:
+    fallback = min(8.0, 0.5 * (2 ** attempt) + random.random())
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return fallback
+    try:
+        delay = float(retry_after)
+    except ValueError:
+        try:
+            delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+    return min(60.0, max(0.0, delay)) if math.isfinite(delay) else fallback
+
+
+def _response_json(response) -> Dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise FeishuAPIError(f"飞书接口返回了无效 JSON（HTTP {response.status_code}）") from exc
+    if not isinstance(data, dict) or type(data.get("code")) is not int:
+        raise FeishuAPIError(f"飞书接口响应缺少有效业务状态码（HTTP {response.status_code}）")
+    return data
+
+
+def _next_page(page: Dict[str, Any], seen_tokens: set, label: str) -> Optional[str]:
+    if not isinstance(page, dict) or not isinstance(page.get("items", []), list):
+        raise FeishuAPIError(f"飞书{label}分页响应格式错误")
+    if type(page.get("has_more", False)) is not bool:
+        raise FeishuAPIError(f"飞书{label}分页响应 has_more 格式错误")
+    if not page.get("has_more"):
+        return None
+    token = page.get("page_token")
+    if not isinstance(token, str) or not token or token in seen_tokens:
+        raise FeishuAPIError(f"飞书{label}分页响应缺少有效 page_token 或游标重复")
+    seen_tokens.add(token)
+    return token
+
+
 class FeishuClient:
     def __init__(self, app_id: str, app_secret: str, api_base: str = FEISHU_API):
         self.app_id = app_id
@@ -275,11 +316,11 @@ class FeishuClient:
                 if response.status_code == 429 or response.status_code >= 500:
                     last_error = FeishuAPIError(f"飞书授权接口暂时不可用（HTTP {response.status_code}）")
                     if attempt < 4:
-                        time.sleep(min(8.0, 0.5 * (2 ** attempt) + random.random()))
+                        time.sleep(_retry_delay(response, attempt))
                         continue
                     break
                 response.raise_for_status()
-                data = response.json()
+                data = _response_json(response)
                 if data.get("code") != 0 or not data.get("tenant_access_token"):
                     raise FeishuAPIError(f"飞书授权失败: {data.get('msg') or data.get('code')}")
                 self.token = data["tenant_access_token"]
@@ -310,22 +351,38 @@ class FeishuClient:
                     timeout=REQUEST_TIMEOUT,
                     **kwargs,
                 )
-                data = response.json() if response.content else {}
-                code = data.get("code", 0)
-                if response.status_code in (401, 403) or code in TOKEN_EXPIRED_CODES:
+                # Proxies may return HTML for overload and gateway errors.
+                if response.status_code == 429 or response.status_code >= 500:
+                    last_error = FeishuAPIError(f"飞书接口暂时不可用（HTTP {response.status_code}）")
+                    if attempt < 4:
+                        time.sleep(_retry_delay(response, attempt))
+                        continue
+                    break
+                if response.status_code == 401:
                     if attempt < 4:
                         self.token = None
                         continue
                     raise FeishuAPIError("飞书访问令牌刷新后仍无效")
-                if response.status_code == 429 or response.status_code >= 500 or code in TRANSIENT_CODES:
-                    retry_after = response.headers.get("Retry-After")
-                    delay = float(retry_after) if retry_after else min(8.0, 0.5 * (2 ** attempt) + random.random())
+                try:
+                    data = _response_json(response)
+                except FeishuAPIError:
+                    response.raise_for_status()
+                    raise
+                code = data["code"]
+                if code in TOKEN_EXPIRED_CODES:
+                    if attempt < 4:
+                        self.token = None
+                        continue
+                    raise FeishuAPIError("飞书访问令牌刷新后仍无效")
+                if code in TRANSIENT_CODES:
                     last_error = FeishuAPIError(f"飞书接口暂时不可用（HTTP {response.status_code}, code {code}）")
-                    time.sleep(delay)
-                    continue
-                response.raise_for_status()
+                    if attempt < 4:
+                        time.sleep(_retry_delay(response, attempt))
+                        continue
+                    break
                 if code != 0:
                     raise FeishuAPIError(f"飞书接口错误 code={code}: {data.get('msg', '未知错误')}")
+                response.raise_for_status()
                 return data
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_error = exc
@@ -340,22 +397,22 @@ class FeishuClient:
     def list_tables(self, app_token: str) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         page_token = None
+        seen_tokens = set()
         while True:
             params: Dict[str, Any] = {"page_size": 100}
             if page_token:
                 params["page_token"] = page_token
             data = self.request("GET", f"/bitable/v1/apps/{app_token}/tables", params=params)
-            page = data.get("data", {})
+            page = data.get("data")
+            page_token = _next_page(page, seen_tokens, "表格")
             items.extend(page.get("items") or [])
-            if not page.get("has_more"):
+            if page_token is None:
                 return items
-            page_token = page.get("page_token")
-            if not page_token:
-                raise FeishuAPIError("飞书表格分页响应缺少 page_token")
 
     def list_fields(self, app_token: str, table_id: str) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         page_token = None
+        seen_tokens = set()
         while True:
             params: Dict[str, Any] = {"page_size": 100}
             if page_token:
@@ -363,13 +420,11 @@ class FeishuClient:
             data = self.request(
                 "GET", f"/bitable/v1/apps/{app_token}/tables/{table_id}/fields", params=params
             )
-            page = data.get("data", {})
+            page = data.get("data")
+            page_token = _next_page(page, seen_tokens, "字段")
             items.extend(page.get("items") or [])
-            if not page.get("has_more"):
+            if page_token is None:
                 return items
-            page_token = page.get("page_token")
-            if not page_token:
-                raise FeishuAPIError("飞书字段分页响应缺少 page_token")
 
     def list_records(
         self, app_token: str, table_id: str, field_names: Sequence[str]
@@ -381,6 +436,7 @@ class FeishuClient:
     ) -> Iterable[Dict[str, Any]]:
         count = 0
         page_token = None
+        seen_tokens = set()
         while True:
             params: Dict[str, Any] = {
                 "page_size": 500,
@@ -391,16 +447,14 @@ class FeishuClient:
             data = self.request(
                 "GET", f"/bitable/v1/apps/{app_token}/tables/{table_id}/records", params=params
             )
-            page = data.get("data", {})
+            page = data.get("data")
+            page_token = _next_page(page, seen_tokens, "记录")
             items = page.get("items") or []
             count += len(items)
             yield from items
             progress("feishu_check", min(70, 55 + count // 500), f"已读取飞书现有记录 {count} 条")
-            if not page.get("has_more"):
+            if page_token is None:
                 return
-            page_token = page.get("page_token")
-            if not page_token:
-                raise FeishuAPIError("飞书记录分页响应缺少 page_token")
 
     def record_count(self, app_token: str, table_id: str, unique_field: str) -> Optional[int]:
         data = self.request("GET", f"/bitable/v1/apps/{app_token}/tables/{table_id}/records",
@@ -423,7 +477,8 @@ class FeishuClient:
                     params["page_token"] = page_token
                 data = self.request("POST", f"/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
                                     params=params, json=body)
-                page = data.get("data") or {}
+                page = data.get("data")
+                page_token = _next_page(page, seen_tokens, "增量查询")
                 for record in page.get("items") or []:
                     record_id = record.get("record_id")
                     if record_id in seen_records:
@@ -431,13 +486,8 @@ class FeishuClient:
                     if record_id:
                         seen_records.add(record_id)
                     yield record
-                if not page.get("has_more"):
+                if page_token is None:
                     break
-                next_token = page.get("page_token")
-                if not next_token or next_token in seen_tokens:
-                    raise FeishuAPIError("飞书增量查询响应缺少有效 page_token")
-                seen_tokens.add(next_token)
-                page_token = next_token
 
     def batch_create(self, app_token: str, table_id: str, records: Sequence[Dict[str, Any]]) -> None:
         payload = {"records": list(records)}
