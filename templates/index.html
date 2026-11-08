@@ -4,13 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="{{ csrf_token }}">
-    <title>SQL Server → 飞书同步中心</title>
+    <title>数据库 → 飞书同步中心</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <div class="shell">
     <aside class="sidebar">
-        <div class="brand"><span class="brand-mark">SF</span><div><strong>同步中心</strong><small>SQL Server → 飞书</small></div></div>
+        <div class="brand"><span class="brand-mark">SF</span><div><strong>同步中心</strong><small>数据库 → 飞书</small></div></div>
         <nav aria-label="页面导航">
             <button class="nav-item active" data-view="overview">总览</button>
             <button class="nav-item" data-view="feishu">飞书空间</button>
@@ -76,11 +76,12 @@
                     <input id="source-id" type="hidden">
                     <div class="form-grid">
                         <label>显示名称<input id="source-name" placeholder="例如：订单库"></label>
-                        <label>服务器地址<input id="source-server" placeholder="192.168.1.10"></label>
-                        <label>端口<input id="source-port" value="1433" inputmode="numeric"></label>
-                        <label>数据库<input id="source-database" list="database-options" placeholder="BusinessDB"><datalist id="database-options"></datalist></label>
-                        <label>只读用户名<input id="source-user" autocomplete="off"></label>
-                        <label>密码<input id="source-password" type="password" autocomplete="new-password" placeholder="已保存时留空不变"></label>
+                        <label>数据库类型<select id="source-type"><option value="mssql">SQL Server</option><option value="mysql">MySQL</option><option value="mariadb">MariaDB</option><option value="postgresql">PostgreSQL</option><option value="sqlite">SQLite</option></select></label>
+                        <label id="source-server-wrap">服务器地址<input id="source-server" placeholder="192.168.1.10"></label>
+                        <label id="source-port-wrap">端口<input id="source-port" value="1433" inputmode="numeric"></label>
+                        <label><span id="source-database-label">数据库</span><input id="source-database" list="database-options" placeholder="BusinessDB"><datalist id="database-options"></datalist></label>
+                        <label id="source-user-wrap">只读用户名<input id="source-user" autocomplete="off"></label>
+                        <label id="source-password-wrap">密码<input id="source-password" type="password" autocomplete="new-password" placeholder="已保存时留空不变"></label>
                     </div>
                     <div class="actions wrap">
                         <button id="save-source" class="btn primary">保存数据源</button>
@@ -294,11 +295,22 @@ $('save-settings').onclick=async()=>{
     $(id).addEventListener('change',()=>{store.settingsDirty=true;});
 });
 
-function blankSource(){return {id:'',name:'',server:'',port:1433,database:'',user:'',has_password:false,enabled:true};}
-function editSource(s=blankSource()){$('source-id').value=s.id||'';$('source-name').value=s.name||'';$('source-server').value=s.server||'';$('source-port').value=s.port||1433;$('source-database').value=s.database||'';$('source-user').value=s.user||'';$('source-password').value='';$('source-password').placeholder=s.has_password?'已安全保存，留空不变':'输入密码';$('source-editor-title').textContent=s.id?`编辑 ${s.name}`:'添加数据源';$('test-source').disabled=!s.id;$('load-databases').disabled=!s.id;$('delete-source').disabled=!s.id;message('source-message',true,'');}
+function blankSource(){return {id:'',name:'',type:'mssql',server:'',port:1433,database:'',user:'',has_password:false,enabled:true};}
+function editSource(s=blankSource()){$('source-type').value=s.type||'mssql';$('source-id').value=s.id||'';$('source-name').value=s.name||'';$('source-server').value=s.server||'';$('source-port').value=s.port||1433;$('source-database').value=s.database||'';$('source-user').value=s.user||'';$('source-password').value='';$('source-password').placeholder=s.has_password?'已安全保存，留空不变':'输入密码';$('source-editor-title').textContent=s.id?`编辑 ${s.name}`:'添加数据源';$('test-source').disabled=!s.id;$('load-databases').disabled=!s.id;$('delete-source').disabled=!s.id;updateSourceType();message('source-message',true,'');}
+const databaseDefaults={mssql:{port:1433,label:'SQL Server',database:'BusinessDB'},mysql:{port:3306,label:'MySQL',database:'业务数据库'},mariadb:{port:3306,label:'MariaDB',database:'业务数据库'},postgresql:{port:5432,label:'PostgreSQL',database:'postgres'},sqlite:{port:0,label:'SQLite',database:'例如 C:\\data\\business.db 或 /data/business.db'}};
+function updateSourceType(reset=false){
+    const type=$('source-type').value||'mssql';
+    const local=type==='sqlite';
+    for(const id of ['server','port','user','password'])$('source-'+id+'-wrap').hidden=local;
+    $('source-database-label').textContent=local?'数据库文件绝对路径（运行程序所在电脑）':'数据库';
+    $('source-database').placeholder=databaseDefaults[type].database;
+    $('load-databases').disabled=local||!$('source-id').value;
+    if(reset){$('source-port').value=databaseDefaults[type].port;$('database-options').innerHTML='';}
+}
+$('source-type').onchange=()=>updateSourceType(true);
 $('new-source').onclick=()=>editSource();
-function renderSources(){const list=$('source-list');list.className=store.config.sources.length?'source-list':'source-list empty';list.innerHTML=store.config.sources.length?store.config.sources.map(s=>`<button class="source-card" data-id="${s.id}"><span><b>${escapeHtml(s.name)}</b><small>${escapeHtml(s.server)}:${s.port}</small></span><em>${escapeHtml(s.database)}</em></button>`).join(''):'暂无数据源。';list.querySelectorAll('[data-id]').forEach(el=>el.onclick=()=>editSource(store.config.sources.find(s=>s.id===el.dataset.id)));}
-function sourcePayload(){return {id:$('source-id').value,name:$('source-name').value.trim(),server:$('source-server').value.trim(),port:Number($('source-port').value),database:$('source-database').value.trim(),user:$('source-user').value.trim(),enabled:true};}
+function renderSources(){const list=$('source-list');list.className=store.config.sources.length?'source-list':'source-list empty';list.innerHTML=store.config.sources.length?store.config.sources.map(s=>`<button class="source-card" data-id="${s.id}"><span><b>${escapeHtml(s.name)}</b><small>${escapeHtml(databaseDefaults[s.type||'mssql'].label)}${s.type==='sqlite'?'':' · '+escapeHtml(s.server)+':'+s.port}</small></span><em>${escapeHtml(s.database)}</em></button>`).join(''):'暂无数据源。';list.querySelectorAll('[data-id]').forEach(el=>el.onclick=()=>editSource(store.config.sources.find(s=>s.id===el.dataset.id)));}
+function sourcePayload(){return {id:$('source-id').value,type:$('source-type').value||'mssql',name:$('source-name').value.trim(),server:$('source-server').value.trim(),port:Number($('source-port').value),database:$('source-database').value.trim(),user:$('source-user').value.trim(),enabled:true};}
 $('save-source').onclick=async()=>{message('source-message',true,'保存中...');const d=await api('/api/sources',{method:'POST',body:JSON.stringify({source:sourcePayload(),password:$('source-password').value})});message('source-message',d.ok,d.message);if(d.ok){store.config=d.config;renderAll();editSource(store.config.sources.find(s=>s.id===d.source_id));$('builder-source').value=d.source_id;nav('builder');await $('scan-tables').onclick();}};
 $('test-source').onclick=async()=>{const id=$('source-id').value;message('source-message',true,'测试中...');const d=await api(`/api/sources/${id}/test`,{method:'POST',body:'{}'});message('source-message',d.ok,d.message);};
 $('load-databases').onclick=async()=>{const id=$('source-id').value;message('source-message',true,'识别中...');const d=await api(`/api/sources/${id}/databases`);message('source-message',d.ok,d.ok?`识别到 ${d.databases.length} 个数据库`:d.message);if(d.ok){$('database-options').innerHTML=d.databases.map(x=>`<option value="${escapeHtml(x)}">`).join('');}};
@@ -587,13 +599,19 @@ $('preview-rows').onclick=async()=>{
     }catch(error){message('preview-message',false,error.message);}finally{$('preview-rows').disabled=false;}
 };
 $('target-mode').onchange=()=>{$('existing-table-wrap').hidden=$('target-mode').value!=='existing';fillExistingTables();};
-$('incremental-enabled').onchange=()=>{$('incremental-column-wrap').hidden=!$('incremental-enabled').checked;};
+$('incremental-enabled').onchange=()=>{$('incremental-column-wrap').hidden=!$('incremental-enabled').checked;message('job-message',true,'');updateAdvancedSummary();};
 function fillExistingTables(){$('existing-table').innerHTML='<option value="">请选择飞书表</option>'+store.feishuTables.map(t=>`<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');}
 $('save-job').onclick=async()=>{
     const sourceId=$('job-source-id').value;
     if(!sourceId||editorSaving)return;
     if(!$('unique-key').value){message('job-message',false,'请选择唯一键后保存。');$('unique-key').focus();return;}
     if(!$('split-row-limit').checkValidity()){$('editor-advanced').open=true;$('split-row-limit').reportValidity();return;}
+    if($('incremental-enabled').checked&&!$('incremental-column').value){
+        $('editor-advanced').open=true;
+        message('job-message',false,'请先选择增量字段，或关闭增量同步后保存。');
+        $('incremental-column').focus();
+        return;
+    }
     const previous=store.config.jobs.find(job=>job.id===$('job-id').value);
     const job={
         id:$('job-id').value,name:$('job-name').value.trim(),source_id:sourceId,
@@ -605,8 +623,6 @@ $('save-job').onclick=async()=>{
             table_name:$('target-table-name').value.trim(),auto_create_fields:$('auto-fields').checked}
     };
     if(previous?.generated_key&&previous.unique_key===job.unique_key)job.generated_key=previous.generated_key;
-    const jobs=store.config.jobs.map(item=>item.id===job.id?job:item);
-    if(!previous)jobs.push(job);
     editorSaving=true;
     $('job-editor-fields').disabled=true;
     $('cancel-job-edit').disabled=true;
@@ -614,7 +630,7 @@ $('save-job').onclick=async()=>{
     $('save-job').disabled=true;
     $('save-job').textContent='正在保存...';
     try{
-        const data=await api('/api/jobs',{method:'POST',body:JSON.stringify({jobs})});
+        const data=await api('/api/jobs',{method:'POST',body:JSON.stringify({job})});
         if(!data.ok)throw new Error(data.message);
         store.config=data.config;
         renderAll();

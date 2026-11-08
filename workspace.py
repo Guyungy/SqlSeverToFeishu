@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import dotenv_values, load_dotenv
+from databases import database_type, DEFAULT_PORTS, DEFAULT_DATABASES
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -285,7 +286,11 @@ def _clean_text(value: Any, label: str, max_length: int = 128) -> str:
     return text
 
 
-def _clean_sql_identifier(value: Any, label: str) -> str:
+def _clean_sql_identifier(value: Any, label: str, source: Optional[Dict[str, Any]] = None) -> str:
+    if source and database_type(source) != "mssql":
+        if not isinstance(value, str) or not value or "\x00" in value or len(value) > 128:
+            raise ValueError(f"{label}为空、过长或包含空字符")
+        return value
     # Reuse the same rules as query generation; importing here avoids
     # introducing configuration loading at module initialization time.
     from sync import ConfigError, _clean_identifier_part
@@ -300,9 +305,18 @@ def validate_source(source: Dict[str, Any]) -> Dict[str, Any]:
     source_id = _clean_text(source.get("id") or new_id("source"), "数据源 ID", 64)
     if not re.fullmatch(r"[A-Za-z0-9_-]+", source_id):
         raise ValueError("数据源 ID 格式不正确")
-    port = int(source.get("port") or 1433)
-    if not 1 <= port <= 65535:
-        raise ValueError("SQL Server 端口必须在 1-65535 之间")
+    kind = database_type(source)
+    port = 0 if kind == "sqlite" else int(source.get("port") or DEFAULT_PORTS[kind])
+    if kind != "sqlite" and not 1 <= port <= 65535:
+        raise ValueError("数据库端口必须在 1-65535 之间")
+    database = str(source.get("database") or DEFAULT_DATABASES[kind]).strip()
+    if "\x00" in database or (kind != "sqlite" and len(database) > 128):
+        raise ValueError("数据库名过长或包含空字符")
+    if kind == "sqlite":
+        path = Path(database).expanduser()
+        if not database or not path.is_absolute():
+            raise ValueError("SQLite 请填写数据库文件的绝对路径")
+        database = str(path.resolve())
     password_key = _clean_text(
         source.get("password_env") or password_env_key(source_id), "密码环境变量名", 128
     )
@@ -311,9 +325,10 @@ def validate_source(source: Dict[str, Any]) -> Dict[str, Any]:
     result = {
         "id": source_id,
         "name": _clean_text(source.get("name"), "数据源名称"),
-        "server": _clean_text(source.get("server"), "SQL Server 地址", 255),
+        "type": kind,
+        "server": "" if kind == "sqlite" else _clean_text(source.get("server"), "数据库地址", 255),
         "port": port,
-        "database": _clean_text(source.get("database") or "master", "数据库名"),
+        "database": database,
         "user": str(source.get("user") or "").strip(),
         "password_env": password_key,
         "enabled": bool(source.get("enabled", True)),
@@ -323,8 +338,8 @@ def validate_source(source: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(excluded, list) or any(not isinstance(item, dict) for item in excluded):
         raise ValueError("排除的数据表配置格式错误")
     if excluded:
-        result["excluded_tables"] = [{"schema": _clean_sql_identifier(item.get("schema"), "Schema"),
-                                      "table": _clean_sql_identifier(item.get("table"), "数据表")}
+        result["excluded_tables"] = [{"schema": _clean_sql_identifier(item.get("schema"), "Schema", result),
+                                      "table": _clean_sql_identifier(item.get("table"), "数据表", result)}
                                      for item in excluded]
     return result
 
@@ -338,7 +353,8 @@ def default_split_column(columns: List[Dict[str, Any]]) -> str:
     return next((normalized[name] for name in preferred if name in normalized), dates[0] if dates else "")
 
 
-def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, Any]:
+def validate_job(job: Dict[str, Any], source_ids: Iterable[str],
+                 source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     job_id = _clean_text(job.get("id") or new_id("job"), "同步任务 ID", 64)
     if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
         raise ValueError("同步任务 ID 格式不正确")
@@ -354,7 +370,7 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
     for item in columns:
         if not isinstance(item, dict):
             raise ValueError("字段配置必须是对象")
-        source_name = _clean_sql_identifier(item.get("source"), "SQL 字段")
+        source_name = _clean_sql_identifier(item.get("source"), "SQL 字段", source)
         target_name = _clean_text(item.get("target") or source_name, "飞书字段")
         if source_name in source_names:
             raise ValueError(f"SQL 字段重复: {source_name}")
@@ -368,7 +384,7 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
             "sql_type": str(item.get("sql_type") or "nvarchar").lower(),
             "nullable": bool(item.get("nullable", True)),
         })
-    unique_key = _clean_text(job.get("unique_key"), "唯一键")
+    unique_key = _clean_sql_identifier(job.get("unique_key"), "唯一键", source)
     if unique_key not in source_names:
         raise ValueError("唯一键必须包含在已勾选字段中")
     incremental = job.get("incremental") or {}
@@ -407,8 +423,8 @@ def validate_job(job: Dict[str, Any], source_ids: Iterable[str]) -> Dict[str, An
         "id": job_id,
         "name": str(job.get("name") or f"{job.get('schema', 'dbo')}.{job.get('table', '')}").strip(),
         "source_id": source_id,
-        "schema": _clean_sql_identifier(job.get("schema") or "dbo", "Schema"),
-        "table": _clean_sql_identifier(job.get("table"), "数据表"),
+        "schema": _clean_sql_identifier(job.get("schema") or "dbo", "Schema", source),
+        "table": _clean_sql_identifier(job.get("table"), "数据表", source),
         "enabled": bool(job.get("enabled", True)),
         "columns": clean_columns,
         "unique_key": unique_key,
@@ -436,7 +452,16 @@ def validate_config(data: Dict[str, Any]) -> Dict[str, Any]:
     source_ids = [item["id"] for item in sources]
     if len(source_ids) != len(set(source_ids)):
         raise ValueError("数据源 ID 重复")
-    jobs = [validate_job(item, source_ids) for item in jobs_raw]
+    jobs = []
+    sources_by_id = {source["id"]: source for source in sources}
+    for item in jobs_raw:
+        if not isinstance(item, dict):
+            raise ValueError("同步任务配置必须是对象")
+        try:
+            jobs.append(validate_job(item, source_ids, sources_by_id.get(item.get("source_id"))))
+        except ValueError as exc:
+            label = item.get("name") or item.get("table") or item.get("id") or "未命名"
+            raise ValueError(f"任务 {label} 保存失败，{exc}") from exc
     job_ids = [item["id"] for item in jobs]
     if len(job_ids) != len(set(job_ids)):
         raise ValueError("同步任务 ID 重复")

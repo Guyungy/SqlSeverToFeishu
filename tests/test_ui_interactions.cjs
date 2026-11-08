@@ -70,7 +70,7 @@ test('saving drawer preserves order, page and pending table selections', async (
         $('unique-key').value='Id';$('split-row-limit').value='40000';
         $('target-mode').value='auto';$('target-table-name').value='Target25';
         $('job-editor-dialog').open=true;
-        api=async(url, options)=>({ok:true,config:{...store.config,jobs:JSON.parse(options.body).jobs}});
+        api=async(url, options)=>({ok:true,config:{...store.config,jobs:store.config.jobs.map(job=>job.id===JSON.parse(options.body).job.id?JSON.parse(options.body).job:job)}});
     `);
     await ui.element('save-job').onclick();
     assert.equal(ui.run('store.config.jobs[25].id'), 'job25');
@@ -177,4 +177,38 @@ test('batch failure keeps dialog and selection for retry', async () => {
     assert.equal(ui.element('save-incremental-batch').disabled, false);
     assert.equal(ui.run('incrementalBatchIds[0]'), 'job');
     assert.match(ui.element('incremental-batch-results').textContent, /network disconnected/);
+});
+
+test('missing incremental field blocks save and keeps the editor open', async () => {
+    const ui = uiContext();
+    ui.run(`
+        $('job-source-id').value='a';$('unique-key').value='Id';
+        $('incremental-enabled').checked=true;$('incremental-column').value='';
+        $('job-editor-dialog').open=true;
+        api=async()=>{throw new Error('must not submit');};
+    `);
+    await ui.element('save-job').onclick();
+    assert.match(ui.element('job-message').textContent, /请先选择增量字段/);
+    assert.equal(ui.element('job-editor-dialog').open, true);
+    ui.element('incremental-enabled').checked=false;
+    ui.element('incremental-enabled').onchange();
+    assert.equal(ui.element('job-message').textContent, '');
+    assert.equal(ui.element('incremental-column-wrap').hidden, true);
+});
+
+test('database type changes defaults and hides network fields for SQLite', () => {
+    const ui = uiContext();
+    ui.run('editSource()');
+    ui.element('source-type').value='postgresql';
+    ui.element('source-type').onchange();
+    assert.equal(ui.element('source-port').value, 5432);
+    assert.equal(ui.run('sourcePayload().type'), 'postgresql');
+    ui.element('source-type').value='sqlite';
+    ui.element('source-type').onchange();
+    assert.equal(ui.element('source-server-wrap').hidden, true);
+    assert.equal(ui.element('source-password-wrap').hidden, true);
+    assert.match(ui.element('source-database-label').textContent, /绝对路径/);
+    ui.run("editSource({id:'legacy',port:1433})");
+    assert.equal(ui.element('source-type').value, 'mssql');
+    assert.equal(ui.element('source-server-wrap').hidden, false);
 });

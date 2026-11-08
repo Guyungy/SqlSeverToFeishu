@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Multi-source, selectable-table, incremental SQL Server to Feishu sync engine."""
+"""Multi-database, selectable-table, incremental synchronization to Feishu."""
 
 import argparse
 import contextlib
@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Callable, Any, Dict, List, Optional, Sequence, Tuple
 
 import pymssql
+import databases
 from dotenv import load_dotenv
 
 from sync import (
@@ -92,6 +93,16 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
         "timezone": settings["timezone_offset"],
         "null_policy": settings["null_policy"],
     }
+    if databases.database_type(source) != "mssql":
+        identity["source"]["type"] = databases.database_type(source)
+    # Earlier builds ignored the configured timezone during record conversion.
+    # Invalidate those cursors when the selected timezone differs from that fallback.
+    try:
+        legacy_timezone = float(os.environ.get("SYNC_TIMEZONE_OFFSET") or 8)
+    except ValueError:
+        legacy_timezone = 8
+    if settings["timezone_offset"] != legacy_timezone:
+        identity["date_conversion_version"] = 2
     if "generated_key" in job:
         identity["job"]["generated_key"] = job["generated_key"]
     return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
@@ -116,6 +127,8 @@ def feishu_client() -> FeishuClient:
 
 def sql_connection(source: Dict[str, Any], database: Optional[str] = None,
                    settings: Optional[Dict[str, Any]] = None):
+    if databases.database_type(source) != "mssql":
+        return databases.connect(source, database, settings)
     settings = settings or runtime_settings()
     kwargs: Dict[str, Any] = {
         "server": source["server"],
@@ -131,6 +144,8 @@ def sql_connection(source: Dict[str, Any], database: Optional[str] = None,
 
 
 def list_databases(source: Dict[str, Any]) -> List[str]:
+    if databases.database_type(source) != "mssql":
+        return databases.list_databases(source)
     with sql_connection(source, database="master") as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -142,6 +157,8 @@ def list_databases(source: Dict[str, Any]) -> List[str]:
 
 
 def list_tables(source: Dict[str, Any]) -> List[Dict[str, str]]:
+    if databases.database_type(source) != "mssql":
+        return databases.list_tables(source)
     with sql_connection(source) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -155,6 +172,9 @@ def list_tables(source: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 def list_columns(source: Dict[str, Any], schema: str, table: str) -> List[Dict[str, Any]]:
+    if databases.database_type(source) != "mssql":
+        return [{**column, "feishu_type": sql_type_to_feishu(column["sql_type"])}
+                for column in databases.list_columns(source, schema, table)]
     with sql_connection(source) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -180,6 +200,8 @@ def list_columns(source: Dict[str, Any], schema: str, table: str) -> List[Dict[s
 
 
 def list_primary_key(source: Dict[str, Any], schema: str, table: str) -> List[str]:
+    if databases.database_type(source) != "mssql":
+        return databases.list_primary_key(source, schema, table)
     with sql_connection(source) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -261,19 +283,23 @@ def add_generated_row_keys(rows: List[Dict[str, Any]], job: Dict[str, Any],
 SQL_TEXT_TYPES = {"char", "varchar", "text", "nchar", "nvarchar", "ntext"}
 
 
-def sql_column_expression(column: Dict[str, Any]) -> str:
+def sql_column_expression(column: Dict[str, Any], source: Optional[Dict[str, Any]] = None) -> str:
+    if source and databases.database_type(source) != "mssql":
+        return databases.quote_identifier(source, column["name"])
     name = quote_identifier(column["name"])
     if column.get("sql_type", "").lower() in SQL_TEXT_TYPES:
         return f"CAST({name} AS NVARCHAR(MAX)) AS {name}"
     return name
 
 
-def decode_sql_value(value: Any, column: Dict[str, Any]) -> Any:
+def decode_sql_value(value: Any, column: Dict[str, Any], source: Optional[Dict[str, Any]] = None) -> Any:
     if isinstance(value, bytes) and column.get("sql_type", "").lower() in SQL_TEXT_TYPES:
         try:
             return value.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise ConfigError(f"字段 {column['name']} 返回了无法按 UTF-8 解码的文本，请运行数据源中文连接测试") from exc
+    if source and databases.database_type(source) != "mssql":
+        return databases.decode_value(value, column, source)
     return value
 
 
@@ -286,10 +312,6 @@ def sql_type_to_feishu(sql_type: str) -> int:
     if value == "bit":
         return 7
     return 1
-
-
-def _qualified_table(job: Dict[str, Any]) -> str:
-    return f"{quote_identifier(job['schema'])}.{quote_identifier(job['table'])}"
 
 
 def _decode_cursor(cursor: Dict[str, Any]) -> Any:
@@ -339,14 +361,15 @@ def fetch_job_rows(
     unique_key = job["unique_key"]
     incremental = job["incremental"]
     incremental_column = incremental.get("column") if incremental.get("enabled") else ""
-    query = f"SELECT {', '.join(sql_column_expression(metadata[name]) for name in selected)} FROM {_qualified_table(job)}"
+    query = databases.select_query(source, job["schema"], job["table"],
+                                   [sql_column_expression(metadata[name], source) for name in selected])
     params: Tuple[Any, ...] = ()
     incremental_run = bool(incremental_column and job_state and job_state.get("cursor"))
     if incremental_run:
         cursor_value = _decode_cursor(job_state["cursor"])
         declared_type = str(metadata.get(incremental_column, {}).get("sql_type") or "")
-        if _cursor_fits_sql_type(cursor_value, declared_type):
-            query += f" WHERE {quote_identifier(incremental_column)} >= %s"
+        if _cursor_fits_sql_type(cursor_value, declared_type, source):
+            query += f" WHERE {databases.quote_identifier(source, incremental_column)} >= {databases.placeholder(source)}"
             params = (cursor_value,)
         else:
             incremental_run = False
@@ -356,15 +379,15 @@ def fetch_job_rows(
             )
     order_columns = [name for name in (incremental_column, unique_key) if name and name in metadata]
     if order_columns:
-        query += " ORDER BY " + ", ".join(quote_identifier(name) for name in dict.fromkeys(order_columns))
+        query += " ORDER BY " + ", ".join(databases.quote_identifier(source, name) for name in dict.fromkeys(order_columns))
 
     rows: List[Dict[str, Any]] = []
     max_cursor = None
     count = 0
     occurrences: Dict[str, int] = {}
     with sql_connection(source) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SET TEXTSIZE 2147483647")
+        with databases.cursor_for(conn, source, streaming=True) as cursor:
+            databases.prepare_read(cursor, source)
             cursor.execute(query, params)
             while True:
                 values = cursor.fetchmany(1000)
@@ -374,7 +397,7 @@ def fetch_job_rows(
                 for values_row in values:
                     if len(values_row) != len(selected):
                         raise ConfigError(f"任务 {job['name']} 返回的列数与所选字段数不一致")
-                    row = {name: decode_sql_value(value, metadata[name]) for name, value in zip(selected, values_row)}
+                    row = {name: decode_sql_value(value, metadata[name], source) for name, value in zip(selected, values_row)}
                     chunk.append(row)
                 if "generated_key" in job:
                     add_generated_row_keys(chunk, job, occurrences)
@@ -392,10 +415,12 @@ def fetch_job_rows(
     return rows, max_cursor, incremental_run
 
 
-def _cursor_fits_sql_type(value: Any, sql_type: str) -> bool:
+def _cursor_fits_sql_type(value: Any, sql_type: str, source: Optional[Dict[str, Any]] = None) -> bool:
     """Detect a cursor that no longer matches its incremental column type."""
     kind = (sql_type or "").lower()
     if kind in DATE_TYPES:
+        if source and databases.database_type(source) == "sqlite":
+            return isinstance(value, str)
         return isinstance(value, (datetime, date))
     if kind == "bit":
         return isinstance(value, bool)
@@ -595,12 +620,13 @@ def ensure_target(
 def build_record(row: Dict[str, Any], columns: Sequence[Dict[str, Any]], field_types: Dict[str, int],
                  settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     fields = {}
-    null_policy = str((settings or runtime_settings())["null_policy"]).lower()
+    settings = settings or runtime_settings()
+    null_policy = str(settings["null_policy"]).lower()
     for column in columns:
         value = row.get(column["source"])
         if value is None and null_policy == "skip":
             continue
-        fields[column["target"]] = convert_value(value, field_types[column["target"]])
+        fields[column["target"]] = convert_value(value, field_types[column["target"]], settings["timezone_offset"])
     return {"fields": fields}
 
 

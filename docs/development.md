@@ -25,12 +25,14 @@ WHERE [增量字段] >= 上次成功游标
 
 ### 字段类型映射
 
-| SQL Server 类型 | 自动创建的飞书类型 |
+| 数据库字段类型 | 自动创建的飞书类型 |
 | --- | --- |
 | 整数、小数、金额、浮点 | 数字 |
-| `date`、`datetime`、`datetime2`、`datetimeoffset`、`smalldatetime`、`time` | 日期 |
-| `bit` | 复选框 |
+| `date`、`datetime`、`datetime2`、`datetimeoffset`、`smalldatetime`、MySQL/PostgreSQL 时间戳 | 日期 |
+| SQL Server `bit`、PostgreSQL/SQLite 布尔类型 | 复选框 |
 | 其他常见类型 | 文本 |
+
+SQL Server 的 `timestamp` 是二进制行版本，保留文本映射。MySQL/PostgreSQL 的 `timestamp` 归一为日期类型。只有时间而无日期的 `time` 保留文本。配置和验证状态见[数据库兼容说明](databases.md)。
 
 SQL NULL 默认不会覆盖飞书已有值。如果确实需要清空，可以在“运行设置”中把 NULL 处理改为“覆盖”，建议先在副本表验证。
 
@@ -40,7 +42,7 @@ SQL NULL 默认不会覆盖飞书已有值。如果确实需要清空，可以�
 | --- | --- |
 | 🏠 **只在本机管理** | 管理页面仅监听 `127.0.0.1`，并包含 Host、Origin 和 CSRF 检查 |
 | 🔑 **密钥不进任务配置** | App Secret 和 SQL 密码保存在本机 `.env`，页面不回显 |
-| 📖 **数据库只读** | 推荐专用只读账号，程序不需要修改 SQL Server |
+| 📖 **数据库只读** | 推荐专用只读账号，程序只读取源数据库 |
 | 🧭 **先预检再写入** | 正式同步前可查看预计新增、更新和跳过数量 |
 | 🧱 **一次只跑一个** | 手动和定时任务共用运行锁，避免同时写入 |
 | ♻️ **请求可安全重试** | 飞书请求有超时、有限退避和幂等标识 |
@@ -110,6 +112,7 @@ node --test tests/test_ui_interactions.cjs
 SqlSeverToFeishu/
 ├── dashboard.py              Python 网页管理服务
 ├── multi_sync.py             多任务同步与增量游标
+├── databases.py              数据库驱动、元数据与查询方言
 ├── sync.py                   SQL / 飞书同步基础能力
 ├── workspace.py              配置、状态与运行设置
 ├── templates/ + static/      中文管理页面
@@ -126,7 +129,7 @@ SqlSeverToFeishu/
 
 ## 已知限制
 
-- 当前是 SQL Server → 飞书的单向同步，不会把飞书修改回写数据库；
+- 当前是数据库 → 飞书的单向同步，不会把飞书修改回写数据库；
 - SQL 中删除的记录不会自动删除飞书记录；
 - 人员、附件、公式、关联记录等复杂字段不能由普通 SQL 值自动转换；
 - 定时同步依赖管理程序保持运行，不是操作系统级后台服务；

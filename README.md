@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="src-tauri/icons/icon.png" width="80" alt="SQL Server → 飞书同步中心">
+<img src="src-tauri/icons/icon.png" width="80" alt="数据库 → 飞书同步中心">
 
-# SQL Server → 飞书同步中心
+# 数据库 → 飞书同步中心
 
-选择数据库，批量把业务表同步到飞书多维表格。
+选择数据库，批量把业务表同步到飞书多维表格。支持 SQL Server、PostgreSQL、SQLite，已接入 MySQL/MariaDB 适配。[兼容范围与验证状态](docs/databases.md)。
 
 中文管理界面 · 批量建任务 · 增量同步 · 自动分表
 
@@ -16,10 +16,10 @@
 
 准备 Git、Python 3.10 或更高版本，以及以下信息：
 
-- SQL Server 地址、端口、数据库名和只读账号密码。
+- 数据库类型、地址、端口、库名和只读账号密码。SQLite 填写本机文件路径。
 - 飞书自建应用的 App ID、App Secret，以及目标多维表格链接。首次使用先完成[飞书应用授权](docs/feishu-permissions.md)。
 
-在能访问 SQL Server 和飞书接口的电脑上，打开终端获取代码：
+在能访问数据库和飞书接口的电脑上，打开终端获取代码：
 
 ```bash
 git clone https://github.com/Guyungy/SqlSeverToFeishu.git
@@ -58,7 +58,7 @@ Ubuntu 缺少虚拟环境支持时，先执行 `sudo apt install -y python3-full
 | 步骤 | 页面操作 |
 | --- | --- |
 | 连接飞书 | “飞书空间”填写应用凭证和多维表格链接，点击“保存并测试” |
-| 连接数据库 | “数据源”填写并保存 SQL Server 连接，选择需要同步的数据库 |
+| 连接数据库 | “数据源”选择数据库类型并保存连接，选择需要同步的数据库 |
 | 建立任务 | “同步计划”默认全选全部表，取消不需要的表后点击“保存同步计划”，字段会自动配置 |
 | 开始同步 | 点击“预检全部任务”核对数量，再点击“同步全部任务”，到飞书检查结果 |
 
@@ -107,7 +107,7 @@ git pull --ff-only origin main
 
 ## 4. 遇到问题
 
-保留**任务名、报错时间、页面截图或报错原文**，以及操作系统、Python 和 SQL Server 版本。[日志与故障排查](docs/troubleshooting.md)说明如何查看 `run_history.log` 和 `dashboard_server.log`。
+保留**任务名、报错时间、页面截图或报错原文**，以及操作系统、Python、数据库类型及版本。[日志与故障排查](docs/troubleshooting.md)说明如何查看 `run_history.log` 和 `dashboard_server.log`。
 
 在 [GitHub Issues](https://github.com/Guyungy/SqlSeverToFeishu/issues) 提交脱敏后的问题。不要上传 `.env`、密码、App Secret 或真实业务数据。
 

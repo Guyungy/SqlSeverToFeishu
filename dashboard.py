@@ -22,8 +22,8 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, render_template, request
 
+import databases
 from multi_sync import default_incremental_column, DATE_TYPES, NUMERIC_TYPES, sql_column_expression, decode_sql_value, automatic_job, list_primary_key, feishu_client, list_columns, list_databases, list_tables, resolve_app_token, sql_connection
-from sync import quote_identifier
 from workspace import (
     config_edit_lock,
     default_split_column,
@@ -426,6 +426,10 @@ def save_source_api():
         if existing and "excluded_tables" in existing:
             source_data["excluded_tables"] = existing["excluded_tables"]
         source = validate_source(source_data)
+        if existing and databases.database_type(existing) != source["type"] and any(
+            job["source_id"] == source_id for job in config["jobs"]
+        ):
+            raise ValueError("该数据源已有同步任务，连接其他类型数据库时请添加新的数据源")
         password = str(payload.get("password") or "")
         if password and password not in SECRET_MASKS:
             update_env({source["password_env"]: password})
@@ -460,16 +464,20 @@ def test_source_api(source_id: str):
     try:
         source = get_source(load_config(), source_id)
         with sql_connection(source) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT DB_NAME(), @@SERVERNAME")
-                database, server = cursor.fetchone()
-                cursor.execute("SELECT CAST(N'中文编码校验' AS NVARCHAR(50))")
+            with databases.cursor_for(conn, source) as cursor:
+                if databases.database_type(source) == "mssql":
+                    cursor.execute("SELECT DB_NAME(), @@SERVERNAME")
+                    database, server = cursor.fetchone()
+                    cursor.execute("SELECT CAST(N'中文编码校验' AS NVARCHAR(50))")
+                else:
+                    database, server = source["database"], source["server"]
+                    cursor.execute("SELECT " + databases.placeholder(source), ("中文编码校验",))
                 sample = cursor.fetchone()[0]
                 if sample != "中文编码校验":
-                    raise ValueError("数据库连接成功，但中文读取校验失败，请检查 SQL Server 客户端字符集配置")
+                    raise ValueError("数据库连接成功，但中文读取校验失败，请检查数据库客户端字符集配置")
         return jsonify({"ok": True, "message": f"连接成功：{server or source['server']} / {database}，中文读取校验通过"})
     except Exception as exc:
-        return jsonify({"ok": False, "message": safe_error(exc, "SQL Server 连接失败")}), 400
+        return jsonify({"ok": False, "message": safe_error(exc, "数据库连接失败")}), 400
 
 
 @app.route("/api/sources/<source_id>/databases")
@@ -507,11 +515,11 @@ def source_tables_api(source_id: str):
 @app.route("/api/sources/<source_id>/columns")
 def source_columns_api(source_id: str):
     try:
-        schema = request.args.get("schema", "dbo")
+        source = get_source(load_config(), source_id)
+        schema = request.args.get("schema") or databases.default_schema(source)
         table = request.args.get("table", "")
         if not table:
             raise ValueError("缺少数据表名")
-        source = get_source(load_config(), source_id)
         columns = list_columns(source, schema, table)
         primary_key = list_primary_key(source, schema, table)
         return jsonify({"ok": True, "columns": columns, "primary_key": primary_key,
@@ -524,25 +532,26 @@ def source_columns_api(source_id: str):
 def preview_rows_api(source_id: str):
     try:
         payload = request.get_json(silent=True) or {}
-        schema = payload.get("schema", "dbo")
-        table = payload.get("table", "")
         source = get_source(load_config(), source_id)
+        schema = payload.get("schema") or databases.default_schema(source)
+        table = payload.get("table", "")
         metadata = {column["name"]: column for column in list_columns(source, schema, table)}
         columns = payload.get("columns")
         if not isinstance(columns, list) or not columns or any(
             not isinstance(column, str) or column not in metadata for column in columns
         ):
             raise ValueError("请勾选有效的数据表字段")
-        query = (
-            "SELECT TOP (10) " + ", ".join(sql_column_expression(metadata[column]) for column in columns)
-            + f" FROM {quote_identifier(schema)}.{quote_identifier(table)}"
-        )
+        query = databases.select_query(source, schema, table,
+                                       [sql_column_expression(metadata[column], source) for column in columns], limit=10)
         with sql_connection(source) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SET TEXTSIZE 2147483647")
-                cursor.execute(query)
+            with databases.cursor_for(conn, source) as cursor:
+                databases.prepare_read(cursor, source)
+                if databases.database_type(source) == "mssql":
+                    cursor.execute(query)
+                else:
+                    cursor.execute(query, ())
                 rows = [
-                    [None if value is None else str(decode_sql_value(value, metadata[name]))
+                    [None if value is None else str(decode_sql_value(value, metadata[name], source))
                      for name, value in zip(columns, row)]
                     for row in cursor.fetchmany(10)
                 ]
@@ -654,10 +663,19 @@ def batch_incremental_api():
 @edit_config
 def save_jobs_api():
     try:
-        raw_jobs = (request.get_json(silent=True) or {}).get("jobs")
+        payload = request.get_json(silent=True) or {}
+        config = load_config()
+        if "job" in payload:
+            job = payload["job"]
+            if not isinstance(job, dict) or not job.get("id"):
+                raise ValueError("同步任务格式错误")
+            raw_jobs = [job if item["id"] == job["id"] else item for item in config["jobs"]]
+            if not any(item["id"] == job["id"] for item in config["jobs"]):
+                raw_jobs.append(job)
+        else:
+            raw_jobs = payload.get("jobs")
         if not isinstance(raw_jobs, list):
             raise ValueError("任务列表格式错误")
-        config = load_config()
         validated = validate_config({**config, "jobs": raw_jobs})
         previous_jobs = {job["id"]: job for job in config["jobs"]}
         for job in validated["jobs"]:
