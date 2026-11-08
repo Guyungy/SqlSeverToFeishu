@@ -44,6 +44,57 @@ test('reset pending is visible alongside the last successful sync', () => {
     assert.doesNotMatch(ui.element('job-list').innerHTML, /待全量重扫/);
 });
 
+test('materialized views are labeled and selected with other database objects', () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[{id:'a',name:'业务库',type:'postgresql'}],jobs:[]};
+        store.tables=[{source_id:'a',schema:'public',name:'生产日报',type:'materialized_view'},
+                      {source_id:'a',schema:'public',name:'订单',type:'table'},
+                      {source_id:'a',schema:'public',name:'在制视图',type:'view'}];
+        $('builder-source').value='a';restoreTablePlan();renderTables();
+    `);
+    assert.equal(ui.run('pendingTables.size'), 3);
+    assert.match(ui.element('table-list').innerHTML, /业务库 · 物化视图/);
+    assert.match(ui.element('table-list').innerHTML, /业务库 · 数据表/);
+    ui.element('table-search').value='生产日报';
+    ui.element('table-search').oninput();
+    ui.element('clear-visible-tables').onclick();
+    assert.equal(ui.run('pendingTables.size'), 2);
+    assert.equal(ui.run('pendingTables.has(tableKey("a","public","生产日报"))'), false);
+});
+
+test('switching an automatic key removes its synthetic column from the saved job', async () => {
+    const ui = uiContext();
+    ui.run(`
+        store.config={sources:[{id:'a',name:'库'}],jobs:[{
+            id:'job',source_id:'a',schema:'public',table:'日报',name:'日报',enabled:true,
+            unique_key:'__sqlfeishu_row_key',generated_key:{columns:[]},
+            columns:[{source:'编号',target:'编号',sql_type:'bigint'},
+                     {source:'__sqlfeishu_row_key',target:'标识',sql_type:'nvarchar'}],
+            incremental:{enabled:false,column:''},target:{table_id:'existing',mode:'auto',table_name:'日报'}
+        }]};
+        selectedColumns=()=>store.config.jobs[0].columns;
+        $('job-id').value='job';$('job-source-id').value='a';$('job-schema').value='public';
+        $('job-table').value='日报';$('job-name').value='日报';$('job-enabled').checked=true;
+        $('unique-key').value='__sqlfeishu_row_key';$('split-row-limit').value='40000';
+        $('target-mode').value='auto';$('target-table-name').value='日报';
+        globalThis.savedJobs=[];
+        api=async(url,options)=>{
+            const job=JSON.parse(options.body).job;savedJobs.push(job);
+            return {ok:true,config:{...store.config,jobs:[job]}};
+        };
+    `);
+    await ui.element('save-job').onclick();
+    assert.equal(ui.run('savedJobs[0].columns.length'), 2);
+    assert.equal(ui.run('savedJobs[0].generated_key.columns.length'), 0);
+    ui.element('unique-key').value='编号';
+    await ui.element('save-job').onclick();
+    assert.equal(ui.run('savedJobs[1].generated_key'), undefined);
+    assert.deepEqual(JSON.parse(ui.run('JSON.stringify(savedJobs[1].columns.map(col=>col.source))')), ['编号']);
+    assert.equal(ui.run('savedJobs[1].target.table_id'), 'existing');
+    assert.equal(ui.run('savedJobs[0].columns.length'), 2);
+});
+
 test('selection remains global across pages and multiple-name search', () => {
     const ui = uiContext();
     ui.run(`

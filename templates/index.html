@@ -560,7 +560,8 @@ function renderTables(){
         const sourceId=t.source_id;
         const existing=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===t.schema&&j.table===t.name);
         const selected=pendingTables.has(tableKey(sourceId,t.schema,t.name));
-        return `<div class="table-row${selected?' is-selected':''}"><label><input type="checkbox" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}" ${pendingTables.has(tableKey(sourceId,t.schema,t.name))?'checked':''} ${planSaving?'disabled':''}><span><b>${escapeHtml(t.schema)}.${escapeHtml(t.name)}</b><small>${escapeHtml(sourceName(sourceId))} · ${t.type==='view'?'视图':'数据表'}</small></span></label><button class="btn secondary configure-table" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}">${existing?'编辑任务':'配置与预览'}</button></div>`;
+        const typeLabel={view:'视图',materialized_view:'物化视图'}[t.type]||'数据表';
+        return `<div class="table-row${selected?' is-selected':''}"><label><input type="checkbox" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}" ${pendingTables.has(tableKey(sourceId,t.schema,t.name))?'checked':''} ${planSaving?'disabled':''}><span><b>${escapeHtml(t.schema)}.${escapeHtml(t.name)}</b><small>${escapeHtml(sourceName(sourceId))} · ${typeLabel}</small></span></label><button class="btn secondary configure-table" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}">${existing?'编辑任务':'配置与预览'}</button></div>`;
     }).join(''):'没有匹配的数据表。';
     $('table-list').scrollTop=scrollTop;
     document.querySelectorAll('.configure-table').forEach(b=>b.onclick=()=>openJobEditor(b.dataset.source,b.dataset.schema,b.dataset.table));
@@ -738,7 +739,10 @@ $('save-job').onclick=async()=>{
         target:{mode:$('target-mode').value,table_id:$('target-mode').value==='existing'?$('existing-table').value:(previous?.target.table_id||''),
             table_name:$('target-table-name').value.trim(),auto_create_fields:$('auto-fields').checked}
     };
-    if(previous?.generated_key&&previous.unique_key===job.unique_key)job.generated_key=previous.generated_key;
+    if(previous?.generated_key){
+        if(previous.unique_key===job.unique_key)job.generated_key=previous.generated_key;
+        else job.columns=job.columns.filter(column=>column.source!==previous.unique_key);
+    }
     editorSaving=true;
     $('job-editor-fields').disabled=true;
     $('cancel-job-edit').disabled=true;

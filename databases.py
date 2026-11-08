@@ -225,10 +225,17 @@ def list_tables(source):
         params = (source["database"],)
     else:
         query = ("SELECT table_schema, table_name, table_type FROM information_schema.tables "
-                 "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name")
+                 "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
+                 "UNION ALL SELECT n.nspname, c.relname, 'materialized_view' "
+                 "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                 "WHERE c.relkind = 'm' AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
+                 "AND has_schema_privilege(n.oid, 'USAGE') "
+                 "AND (has_table_privilege(c.oid, 'SELECT') OR has_any_column_privilege(c.oid, 'SELECT')) "
+                 "ORDER BY table_schema, table_name")
     with connect(source) as conn, cursor_for(conn, source) as cursor:
         cursor.execute(query, params)
-        return [{"schema": row[0], "name": row[1], "type": "view" if row[2].lower() == "view" else "table"}
+        return [{"schema": row[0], "name": row[1],
+                 "type": {"view": "view", "materialized_view": "materialized_view"}.get(row[2].lower(), "table")}
                 for row in cursor.fetchall()]
 
 
@@ -292,6 +299,19 @@ def list_columns(source, schema, table):
                 "WHERE c.table_schema = %s AND c.table_name = %s ORDER BY c.ordinal_position", (schema, table),
             )
             rows = [(r[0], r[1], r[2] == "YES", r[3], bool(r[4]), r[5] or 0, r[6]) for r in cursor.fetchall()]
+            if not rows:
+                # information_schema.columns omits PostgreSQL materialized views.
+                cursor.execute(
+                    "SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, a.attnum, "
+                    "false, 0, information_schema._pg_numeric_precision(a.atttypid, a.atttypmod) "
+                    "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = %s AND c.relname = %s AND c.relkind = 'm' "
+                    "AND a.attnum > 0 AND NOT a.attisdropped AND has_schema_privilege(n.oid, 'USAGE') "
+                    "AND (has_table_privilege(c.oid, 'SELECT') OR has_column_privilege(c.oid, a.attnum, 'SELECT')) "
+                    "ORDER BY a.attnum", (schema, table),
+                )
+                rows = cursor.fetchall()
     return [{"name": r[0], "sql_type": normalize_type(kind, r[1]), "native_type": r[1].lower(),
              "nullable": r[2], "ordinal": int(r[3]), "is_identity": bool(r[4]),
              "identity_increment": float(r[5] or 0), "numeric_precision": r[6]} for r in rows]

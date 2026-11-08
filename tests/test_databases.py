@@ -418,6 +418,95 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.execute(f'CREATE VIEW "{self.schema}"."订单视图" AS SELECT * FROM "{self.schema}"."订单"')
         self.finish_setup()
 
+    def test_materialized_view_discovery_preview_and_refresh_sync(self):
+        name = '生产%日报"汇总'
+        quoted = '"' + name.replace('"', '""') + '"'
+        relation = f'"{self.schema}".{quoted}'
+        self.execute(f'CREATE MATERIALIZED VIEW {relation} AS SELECT "Id", "名称", "UpdatedAt", '
+                     f'123456789012345.6789::numeric(24,4) AS "金额", '
+                     f'12.50::numeric(10,2) AS "小数", true AS "有效" FROM {self.table}')
+        user = 'reader_' + uuid.uuid4().hex[:16]
+        self.execute(f'CREATE ROLE "{user}" LOGIN')
+        self.addCleanup(lambda: self.execute(f'DROP ROLE "{user}"'))
+        self.addCleanup(lambda: self.execute(f'DROP OWNED BY "{user}"'))
+        self.execute(f'GRANT USAGE ON SCHEMA "{self.schema}" TO "{user}"')
+        self.execute(f'GRANT SELECT ON {relation} TO "{user}"')
+        source = {**self.source, 'user': user}
+        workspace.save_config({'sources': [source], 'jobs': []})
+        discovery = self.request('/api/discovery', {'source_id': source['id']})['tables']
+        self.assertEqual([(t['name'], t['type']) for t in discovery], [(name, 'materialized_view')])
+        columns = multi_sync.list_columns(source, self.schema, name)
+        types = {column['name']: column for column in columns}
+        self.assertEqual(types['Id']['sql_type'], 'bigint')
+        self.assertEqual(types['UpdatedAt']['sql_type'], 'datetime2')
+        self.assertEqual(types['金额']['numeric_precision'], 24)
+        self.assertEqual(types['金额']['feishu_type'], 1)
+        self.assertEqual(types['小数']['feishu_type'], 2)
+        self.assertEqual(types['有效']['feishu_type'], 7)
+        self.assertEqual(multi_sync.list_primary_key(source, self.schema, name), [])
+        preview = self.request('/api/sources/' + source['id'] + '/preview',
+                               {'schema': self.schema, 'table': name, 'columns': ['名称', '金额']})
+        self.assertEqual(preview['rows'], [['中文商品😀', '123456789012345.6789']])
+        created = self.request('/api/jobs/bulk', {'tables': [
+            {'source_id': source['id'], 'schema': self.schema, 'name': name}]})
+        self.assertEqual(created['errors'], [])
+        job = created['config']['jobs'][0]
+        self.assertEqual(job['generated_key'], {'columns': []})
+        self.assertFalse(job['incremental']['enabled'])
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        first = multi_sync.run_job(fake, 'app_test', config, state, config['jobs'][0], False)
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, config['jobs'][0], False)
+        self.assertEqual((first['create'], repeated['create'], repeated['skip']), (1, 0, 1))
+        record = next(iter(fake.records.values()))[0]['fields']
+        self.assertEqual(record['金额'], '123456789012345.6789')
+        self.assertEqual(record['小数'], 12.5)
+        self.assertTrue(record['有效'])
+        # A user-confirmed stable key allows updates to the same target record.
+        job = workspace.load_config()['jobs'][0]
+        generated_name = job['unique_key']
+        job['columns'] = [col for col in job['columns'] if col['source'] != generated_name]
+        job.pop('generated_key')
+        job['unique_key'] = 'Id'
+        job['incremental'] = {'enabled': True, 'column': 'UpdatedAt'}
+        self.request('/api/jobs', {'job': job})
+        config = workspace.load_config()
+        job = config['jobs'][0]
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.execute(f'UPDATE {self.table} SET "名称"=\'刷新后的中文\', "UpdatedAt"=\'2026-01-02 12:00:00\'')
+        # The reader sees the stored snapshot until the database owner refreshes it.
+        stale = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((stale['create'], stale['update']), (0, 0))
+        self.execute(f'REFRESH MATERIALIZED VIEW {relation}')
+        refreshed = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(refreshed['incremental'])
+        self.assertEqual((refreshed['create'], refreshed['update']), (0, 1))
+        self.assertEqual(sum(len(rows) for rows in fake.records.values()), 1)
+        record = next(iter(fake.records.values()))[0]['fields']
+        self.assertEqual(record['名称'], '刷新后的中文')
+
+    def test_materialized_view_metadata_respects_column_and_schema_permissions(self):
+        relation = f'"{self.schema}"."受限快照"'
+        self.execute(f'CREATE MATERIALIZED VIEW {relation} AS SELECT 1 AS "可读", 2 AS "内部"')
+        user = 'reader_' + uuid.uuid4().hex[:16]
+        self.execute(f'CREATE ROLE "{user}" LOGIN')
+        self.addCleanup(lambda: self.execute(f'DROP ROLE "{user}"'))
+        self.addCleanup(lambda: self.execute(f'DROP OWNED BY "{user}"'))
+        source = {**self.source, 'user': user}
+        self.execute(f'GRANT USAGE ON SCHEMA "{self.schema}" TO "{user}"')
+        self.assertEqual(multi_sync.list_tables(source), [])
+        self.assertEqual(multi_sync.list_columns(source, self.schema, '受限快照'), [])
+        self.execute(f'GRANT SELECT ("可读") ON {relation} TO "{user}"')
+        self.assertEqual([table['name'] for table in multi_sync.list_tables(source)], ['受限快照'])
+        self.assertEqual([col['name'] for col in multi_sync.list_columns(source, self.schema, '受限快照')], ['可读'])
+        job = multi_sync.automatic_job(source, self.schema, '受限快照')
+        rows, _, _ = multi_sync.fetch_job_rows(source, job, {})
+        self.assertEqual(rows[0]['可读'], 1)
+        self.assertNotIn('内部', rows[0])
+        self.execute(f'REVOKE USAGE ON SCHEMA "{self.schema}" FROM "{user}"')
+        self.assertEqual(multi_sync.list_tables(source), [])
+        self.assertEqual(multi_sync.list_columns(source, self.schema, '受限快照'), [])
+
     def test_timestamp_timezone_type_change_rebuilds_cursor(self):
         job = self.create_job()
         rows, maximum, _ = multi_sync.fetch_job_rows(self.source, job, {})
