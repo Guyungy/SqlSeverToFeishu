@@ -418,6 +418,321 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.execute(f'CREATE VIEW "{self.schema}"."订单视图" AS SELECT * FROM "{self.schema}"."订单"')
         self.finish_setup()
 
+    def test_json_text_preserves_scalar_types_precision_and_sql_null(self):
+        from decimal import Decimal
+        for kind in ('json', 'jsonb'):
+            with self.subTest(kind=kind):
+                name = '结构数据_' + kind
+                table = f'"{self.schema}"."{name}"'
+                self.execute(f'CREATE TABLE {table} ("Id" int PRIMARY KEY, "内容" {kind}, "UpdatedAt" timestamp)')
+                values = ['null', '"中文😀"', 'true', 'false', '123456789012345.6789',
+                          '{"金额":123456789012345.6789,"明细":[true,null,"中文"]}', '""', '[1,2,3]', None]
+                for index, value in enumerate(values):
+                    self.execute(f'INSERT INTO {table} VALUES (%s, %s, %s)', (index, value, '2026-01-01 00:00:00'))
+                self.writer.commit()
+                created = self.request('/api/jobs/bulk', {'tables': [
+                    {'source_id': self.source['id'], 'schema': self.schema, 'name': name}]})
+                self.assertEqual(created['errors'], [])
+                job = next(job for job in created['config']['jobs'] if job['table'] == name)
+                preview = self.request('/api/sources/' + self.source['id'] + '/preview',
+                                       {'schema': self.schema, 'table': name, 'columns': ['Id', '内容']})
+                by_id = {int(row[0]): row[1] for row in preview['rows']}
+                for index, expected in enumerate(values):
+                    if expected is None:
+                        self.assertIsNone(by_id[index])
+                    else:
+                        self.assertEqual(json.loads(by_id[index], parse_float=Decimal), json.loads(expected, parse_float=Decimal))
+                config = workspace.load_config()
+                fake, state = FakeFeishu(), {'jobs': {}}
+                fake.record_count = lambda *args: None
+                first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual(first['create'], len(values))
+                records = {row['fields']['Id']: row['fields'] for rows in fake.records.values() for row in rows}
+                self.assertEqual(records[0]['内容'], 'null')
+                self.assertEqual(records[1]['内容'], '"中文😀"')
+                self.assertEqual(records[2]['内容'], 'true')
+                self.assertEqual(records[4]['内容'], '123456789012345.6789')
+                self.assertNotIn('内容', records[8])
+                repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual((repeated['create'], repeated['update']), (0, 0))
+
+    def test_json_conversion_version_invalidates_only_postgresql_json_jobs(self):
+        job = self.create_job()
+        settings = workspace.runtime_settings()
+        original_dumps = json.dumps
+        def legacy_dumps(value, *args, **kwargs):
+            if isinstance(value, dict) and 'postgres_json_version' in value:
+                value = {key: item for key, item in value.items() if key != 'postgres_json_version'}
+            return original_dumps(value, *args, **kwargs)
+        for kind, sql_type, changed in [('postgresql', 'jsonb', True), ('postgresql', 'json', True),
+                                        ('postgresql', 'text', False), ('mysql', 'json', False)]:
+            with self.subTest(kind=kind, sql_type=sql_type):
+                source = {**self.source, 'type': kind}
+                job['columns'].append({'source': 'Payload', 'target': 'Payload', 'sql_type': sql_type})
+                current = multi_sync.job_fingerprint(source, job, 'app', 'table', {}, settings)
+                with mock.patch.object(multi_sync.json, 'dumps', side_effect=legacy_dumps):
+                    old = multi_sync.job_fingerprint(source, job, 'app', 'table', {}, settings)
+                self.assertEqual(current != old, changed)
+                job['columns'].pop()
+
+    def test_json_upgrade_rescans_old_rows_and_preserves_generated_keys_on_retry(self):
+        for generated in (False, True):
+            with self.subTest(generated=generated):
+                name = 'JSON升级_' + str(generated)
+                table = f'"{self.schema}"."{name}"'
+                primary = '' if generated else 'PRIMARY KEY'
+                self.execute(f'CREATE TABLE {table} ("Id" int {primary}, "内容" jsonb, "UpdatedAt" timestamp)')
+                values = ['null', '"中文😀"', 'true', '123456789012345.6789',
+                          '{"金额":123456789012345.6789}', '[1,true,null]', None]
+                for index, value in enumerate(values):
+                    self.execute(f'INSERT INTO {table} VALUES (%s, %s, %s)',
+                                 (index, value, f'2026-01-0{1 + index % 2} 00:00:00'))
+                self.writer.commit()
+                job = multi_sync.automatic_job(self.source, self.schema, name)
+                job['split']['row_limit'] = 2
+                config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+                job = config['jobs'][0]
+                fake, state = FakeFeishu(), {'jobs': {}}
+                fake.record_count = lambda *args: None
+                original_projection = multi_sync.sql_column_expression
+
+                def legacy_projection(column, source=None):
+                    if column.get('sql_type') in {'json', 'jsonb'}:
+                        return databases.quote_identifier(source, column['name'])
+                    return original_projection(column, source)
+
+                # Seed exact prior-release rows and state, including the old content hashes.
+                with mock.patch.object(multi_sync, 'sql_column_expression', side_effect=legacy_projection):
+                    rows, maximum, _ = multi_sync.fetch_job_rows(self.source, job, {})
+                def fetch_legacy(source, job, saved_state, row_sink=None, settings=None):
+                    row_sink(copy.deepcopy(rows))
+                    return [], maximum, False
+                # Exclude JSON identity migration only while constructing the legacy fixture.
+                original_types = [column['sql_type'] for column in job['columns']]
+                for column in job['columns']:
+                    if column['sql_type'] in {'json', 'jsonb'}:
+                        column['sql_type'] = 'text'
+                with mock.patch.object(multi_sync, 'fetch_job_rows', side_effect=fetch_legacy), \
+                     mock.patch.object(multi_sync, 'job_fingerprint', return_value='pre-json-fix'):
+                    multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                for column, sql_type in zip(job['columns'], original_types):
+                    column['sql_type'] = sql_type
+                before_state = copy.deepcopy(state)
+                before_ids = {row['record_id'] for rows in fake.records.values() for row in rows}
+                before_disk = workspace.STATE_PATH.read_bytes()
+                update = fake.batch_update
+                calls = 0
+                def lose_update_response(*args):
+                    nonlocal calls
+                    update(*args)
+                    calls += 1
+                    if calls == 2:
+                        raise RuntimeError('response lost after accepted update')
+                with mock.patch.object(fake, 'batch_update', side_effect=lose_update_response):
+                    with self.assertRaisesRegex(RuntimeError, 'response lost'):
+                        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual(state, before_state)
+                self.assertEqual(workspace.STATE_PATH.read_bytes(), before_disk)
+                recovered = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertTrue(recovered['cursor_reset'])
+                self.assertFalse(recovered['incremental'])
+                self.assertEqual(recovered['create'], 0)
+                after_ids = {row['record_id'] for rows in fake.records.values() for row in rows}
+                self.assertEqual(before_ids, after_ids)
+                records = {row['fields']['Id']: row['fields'] for rows in fake.records.values() for row in rows}
+                self.assertEqual(records[0]['内容'], 'null')
+                self.assertEqual(records[1]['内容'], '"中文😀"')
+                self.assertEqual(records[3]['内容'], '123456789012345.6789')
+                repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual((repeated['create'], repeated['update']), (0, 0))
+
+    def test_json_key_migration_detects_ambiguity_and_stops_after_success(self):
+        for generated in (False, True):
+            with self.subTest(generated=generated):
+                name = 'JSON标识_' + str(generated)
+                table = f'"{self.schema}"."{name}"'
+                self.execute(f'CREATE TABLE {table} ("内容" jsonb)')
+                values = ['null', None] if generated else ['"alpha"', 'true', '0.125']
+                for value in values:
+                    self.execute(f'INSERT INTO {table} VALUES (%s)', (value,))
+                self.writer.commit()
+                job = multi_sync.automatic_job(self.source, self.schema, name)
+                if not generated:
+                    job.pop('generated_key')
+                    job['unique_key'] = '内容'
+                    job['columns'] = [col for col in job['columns'] if col['source'] == '内容']
+                config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+                job = config['jobs'][0]
+                fake, state = FakeFeishu(), {'jobs': {}}
+                # Reconstruct the old driver's representation and automatic IDs.
+                rows = [{'内容': databases.decode_value(json.loads(value) if value is not None else None, {}, self.source)}
+                        for value in values]
+                if generated:
+                    multi_sync.add_generated_row_keys(rows, job)
+                def fetch_legacy(source, job, saved_state, row_sink=None, settings=None):
+                    row_sink(copy.deepcopy(rows))
+                    return [], None, False
+                job['columns'][0]['sql_type'] = 'text'
+                with mock.patch.object(multi_sync, 'fetch_job_rows', side_effect=fetch_legacy):
+                    multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                job['columns'][0]['sql_type'] = 'jsonb'
+                before_records = copy.deepcopy(fake.records)
+                before_state = copy.deepcopy(state)
+                if generated:
+                    with self.assertRaisesRegex(multi_sync.ConfigError, '旧 JSON 唯一键.*无法一一匹配'):
+                        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                    self.assertEqual(fake.records, before_records)
+                    self.assertEqual(state, before_state)
+                    continue
+                summary = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual((summary['create'], summary['update']), (0, 2))
+                self.assertEqual(state['jobs'][job['id']]['postgres_json_v2_table_id'], job['target']['table_id'])
+                # Its old representation equals the already migrated "alpha" key.
+                # A completed migration must never redirect this new row to it.
+                self.execute(f'INSERT INTO {table} VALUES (%s)', ('"\\"alpha\\""',))
+                self.writer.commit()
+                added = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual((added['create'], added['update']), (1, 0))
+                self.assertEqual(sum(len(rows) for rows in fake.records.values()), 4)
+
+    def test_json_content_keys_distinguish_json_null_from_sql_null_for_new_tasks(self):
+        table = f'"{self.schema}"."JSON新任务"'
+        self.execute(f'CREATE TABLE {table} ("内容" jsonb)')
+        self.execute(f'INSERT INTO {table} VALUES (\'null\'), (NULL), (\'null\')')
+        job = multi_sync.automatic_job(self.source, self.schema, 'JSON新任务')
+        config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+        job = config['jobs'][0]
+        fake, state = FakeFeishu(), {'jobs': {}}
+        first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((first['create'], repeated['create'], repeated['update'], repeated['skip']), (3, 0, 0, 3))
+        records = [row['fields'] for rows in fake.records.values() for row in rows]
+        self.assertEqual(len({row[job['unique_key']] for row in records}), 3)
+
+    def test_json_column_can_be_selected_as_a_text_unique_key(self):
+        table = f'"{self.schema}"."JSON业务键"'
+        self.execute(f'CREATE TABLE {table} ("内容" json)')
+        self.execute(f'INSERT INTO {table} VALUES (\'"中文"\'), (\'null\'), (\'true\')')
+        job = multi_sync.automatic_job(self.source, self.schema, 'JSON业务键')
+        job.pop('generated_key')
+        job['columns'] = [col for col in job['columns'] if col['source'] == '内容']
+        job['unique_key'] = '内容'
+        config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+        job = config['jobs'][0]
+        fake, state = FakeFeishu(), {'jobs': {}}
+        first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((first['create'], repeated['create'], repeated['skip']), (3, 0, 3))
+
+    def test_new_json_content_keys_retry_after_accepted_partial_write(self):
+        table = f'"{self.schema}"."JSON首次中断"'
+        self.execute(f'CREATE TABLE {table} ("内容" jsonb)')
+        values = ['null', None, 'null', '"中文"', '9' * 5000]
+        for value in values:
+            self.execute(f'INSERT INTO {table} VALUES (%s)', (value,))
+        job = multi_sync.automatic_job(self.source, self.schema, 'JSON首次中断')
+        job['split']['row_limit'] = 2
+        config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+        job = config['jobs'][0]
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.fail_on_batch = 2
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        saved = workspace.load_state()
+        self.assertEqual(saved['jobs'][job['id']], {'postgres_json_v2_table_id': job['target']['table_id']})
+        before_ids = {row['record_id'] for rows in fake.records.values() for row in rows}
+        fake.fail_on_batch = None
+        # Resume as a new process, using only persisted state and configuration.
+        config = workspace.load_config()
+        job = config['jobs'][0]
+        summary = multi_sync.run_job(fake, 'app_test', config, saved, job, False)
+        self.assertEqual((summary['create'], summary['update'], summary['skip']), (1, 0, 4))
+        records = [row for rows in fake.records.values() for row in rows]
+        self.assertTrue(before_ids <= {row['record_id'] for row in records})
+        self.assertEqual(len(records), 5)
+        self.assertIn('9' * 5000, [row['fields'].get('内容') for row in records])
+
+    def test_json_key_migration_accepts_values_the_old_driver_could_not_decode(self):
+        import sys
+        table = f'"{self.schema}"."JSON大整数"'
+        self.execute(f'CREATE TABLE {table} ("内容" jsonb)')
+        self.execute(f'INSERT INTO {table} VALUES (%s)', ('9' * 5000,))
+        job = multi_sync.automatic_job(self.source, self.schema, 'JSON大整数')
+        config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+        job = config['jobs'][0]
+        fake, state = FakeFeishu(), {'jobs': {}}
+        multi_sync.ensure_target(fake, 'app_test', config, job, False)
+        limit = getattr(sys, 'get_int_max_str_digits', lambda: None)()
+        try:
+            if limit is not None:
+                sys.set_int_max_str_digits(4300)
+            first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        finally:
+            if limit is not None:
+                sys.set_int_max_str_digits(limit)
+        self.assertEqual(first['create'], 1)
+        record = next(iter(fake.records.values()))[0]
+        self.assertEqual(record['fields']['内容'], '9' * 5000)
+
+    def test_json_format_marker_preserves_reset_and_precedes_record_writes(self):
+        table = f'"{self.schema}"."JSON状态保存"'
+        self.execute(f'CREATE TABLE {table} ("Id" int PRIMARY KEY, "内容" jsonb, "UpdatedAt" timestamp)')
+        self.execute(f'INSERT INTO {table} VALUES (1, \'null\', \'2026-01-01\')')
+        job = multi_sync.automatic_job(self.source, self.schema, 'JSON状态保存')
+        config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+        job = config['jobs'][0]
+        fake, state = FakeFeishu(), {'jobs': {}}
+        multi_sync.run_job(fake, 'app_test', config, state, job, True)
+        self.assertEqual(fake.tables, {})
+        self.assertFalse(workspace.STATE_PATH.exists())
+
+        with mock.patch.object(multi_sync, 'save_state', side_effect=OSError('disk write failed')):
+            with self.assertRaisesRegex(OSError, 'disk write failed'):
+                multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state, {'jobs': {}})
+        self.assertTrue(all(not rows for rows in fake.records.values()))
+        self.assertFalse(workspace.STATE_PATH.exists())
+
+        # Use a fresh target to exercise a reset before the format marker write.
+        fake = FakeFeishu()
+        fetch = multi_sync.fetch_job_rows
+        def reset_after_fetch(*args, **kwargs):
+            result = fetch(*args, **kwargs)
+            workspace.reset_job_state(job['id'])
+            return result
+        with mock.patch.object(multi_sync, 'fetch_job_rows', side_effect=reset_after_fetch):
+            summary = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(summary['state_reset_pending'])
+        saved = workspace.load_state()['jobs'][job['id']]
+        self.assertNotIn('cursor', saved)
+        self.assertTrue(saved['reset_pending'])
+        self.assertEqual(saved['postgres_json_v2_table_id'], job['target']['table_id'])
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertFalse(repeated['incremental'])
+        self.assertEqual((repeated['create'], repeated['skip']), (0, 1))
+
+    def test_json_generated_key_migration_handles_duplicates_across_fetch_batches(self):
+        table = f'"{self.schema}"."JSON重复行"'
+        self.execute(f'CREATE TABLE {table} ("内容" jsonb)')
+        self.execute(f'INSERT INTO {table} SELECT \'true\'::jsonb FROM generate_series(1,1001)')
+        job = multi_sync.automatic_job(self.source, self.schema, 'JSON重复行')
+        config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+        job = config['jobs'][0]
+        fake, state = FakeFeishu(), {'jobs': {}}
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        before_ids = {row['record_id'] for rows in fake.records.values() for row in rows}
+        legacy_rows = [{'内容': True} for _ in range(1001)]
+        multi_sync.add_generated_row_keys(legacy_rows, job)
+        for record, legacy in zip(next(iter(fake.records.values())), legacy_rows):
+            record['fields'][job['unique_key']] = legacy[job['unique_key']]
+        state['jobs'][job['id']].pop('postgres_json_v2_table_id')
+        workspace.save_state(state)
+        summary = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(summary['create'], 0)
+        self.assertEqual(summary['update'], 1001)
+        self.assertEqual({row['record_id'] for rows in fake.records.values() for row in rows}, before_ids)
+        self.assertEqual(len({row['fields'][job['unique_key']] for rows in fake.records.values() for row in rows}), 1001)
+
     def test_materialized_view_discovery_preview_and_refresh_sync(self):
         name = '生产%日报"汇总'
         quoted = '"' + name.replace('"', '""') + '"'

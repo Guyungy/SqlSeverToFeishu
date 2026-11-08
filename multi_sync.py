@@ -44,7 +44,9 @@ from workspace import (
     runtime_settings,
     save_config,
     save_job_state,
+    save_state,
     source_password,
+    state_edit_lock,
 )
 from feishu_link import parse_feishu_base_url
 
@@ -100,6 +102,10 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
         identity["source"]["type"] = databases.database_type(source)
     if databases.database_type(source) in {"mysql", "mariadb"}:
         identity["mysql_timestamp_version"] = 2
+    if databases.database_type(source) == "postgresql" and any(
+        column.get("sql_type") in {"json", "jsonb"} for column in job.get("columns", [])
+    ):
+        identity["postgres_json_version"] = 2
     if any(column.get("sql_type") in NUMERIC_TYPES for column in job.get("columns", [])):
         identity["number_conversion_version"] = 2
     # Earlier builds ignored the configured timezone during record conversion.
@@ -298,7 +304,12 @@ SQL_TEXT_TYPES = {"char", "varchar", "text", "nchar", "nvarchar", "ntext"}
 
 def sql_column_expression(column: Dict[str, Any], source: Optional[Dict[str, Any]] = None) -> str:
     if source and databases.database_type(source) != "mssql":
-        return databases.quote_identifier(source, column["name"])
+        name = databases.quote_identifier(source, column["name"])
+        if databases.database_type(source) == "postgresql" and column.get("sql_type") in {"json", "jsonb"}:
+            # Let PostgreSQL serialize JSON. Driver decoding merges JSON null with
+            # SQL NULL and rounds JSON decimals before we can preserve their text.
+            return f"CAST({name} AS TEXT) AS {name}"
+        return name
     name = quote_identifier(column["name"])
     if column.get("sql_type", "").lower() in SQL_TEXT_TYPES:
         return f"CAST({name} AS NVARCHAR(MAX)) AS {name}"
@@ -409,7 +420,13 @@ def fetch_job_rows(
             )
     order_columns = [name for name in (incremental_column, unique_key) if name and name in metadata]
     if order_columns:
-        query += " ORDER BY " + ", ".join(databases.quote_identifier(source, name) for name in dict.fromkeys(order_columns))
+        order_expressions = []
+        for name in dict.fromkeys(order_columns):
+            expression = databases.quote_identifier(source, name)
+            if databases.database_type(source) == "postgresql" and metadata[name]["sql_type"] in {"json", "jsonb"}:
+                expression = f"CAST({expression} AS TEXT)"
+            order_expressions.append(expression)
+        query += " ORDER BY " + ", ".join(order_expressions)
 
     rows: List[Dict[str, Any]] = []
     max_cursor = None
@@ -765,9 +782,22 @@ def run_job(
     known_partitions = previous_state.get("partitions", []) if previous_state.get("table_id") == table_id else []
     partitions = sync_partitions(client, app_token, config, job, table_id, field_types, dry_run, known_partitions)
     partition_map = {part["number"]: part for part in partitions}
+    json_columns = [col["source"] for col in job["columns"] if col["sql_type"] in {"json", "jsonb"}
+                    and databases.database_type(source) == "postgresql"]
+    identity_columns = job.get("generated_key", {}).get("columns") or [
+        col["source"] for col in job["columns"] if col["source"] != job["unique_key"]
+    ]
+    key_columns = identity_columns if "generated_key" in job else [job["unique_key"]]
+    json_key_columns = set(json_columns) & set(key_columns)
+    migrated = previous_state.get("postgres_json_v2_table_id") == table_id
+    new_target = target_action == "created" and len(partitions) == 1
+    migrate_json_keys = bool(json_key_columns) and not migrated and bool(table_id) and not new_target
+    legacy_occurrences: Dict[str, int] = {}
     with tempfile.TemporaryDirectory(prefix="sqlfeishu-") as staging_dir:
         with contextlib.closing(sqlite3.connect(os.path.join(staging_dir, "records.sqlite"))) as staging:
-            staging.execute("CREATE TABLE source_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL, sort_value INTEGER)")
+            staging.execute("CREATE TABLE source_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL, "
+                            "sort_value INTEGER, legacy_key TEXT, legacy_group TEXT, key_group TEXT)")
+            staging.execute("CREATE INDEX source_legacy_group ON source_rows(legacy_group, key_group)")
             staging.execute("CREATE TABLE target_rows (key TEXT PRIMARY KEY, record TEXT NOT NULL, partition INTEGER)")
             staging.execute("CREATE TABLE operations (kind TEXT, record TEXT NOT NULL, partition INTEGER)")
             counts = {"source_rows": 0, "create": 0, "update": 0, "skip": 0}
@@ -775,7 +805,29 @@ def run_job(
             def stage_rows(chunk):
                 keys = validate_row_keys(chunk, job["unique_key"], job["name"], unique_field_type,
                                          settings["timezone_offset"])
-                for row, key in zip(chunk, keys):
+                legacy_keys = [None] * len(chunk)
+                if migrate_json_keys:
+                    # Reconstruct only the former identity for matching existing
+                    # target rows. The outgoing record keeps the exact JSON text.
+                    for index, original in enumerate(chunk):
+                        row = dict(original)
+                        try:
+                            for column in json_key_columns:
+                                value = row[column]
+                                if value is not None:
+                                    value = json.loads(value)
+                                row[column] = databases.decode_value(value, {}, source)
+                        except (ValueError, RecursionError):
+                            # Values the former driver could not decode have no
+                            # legacy identity, but their current JSON text is valid.
+                            continue
+                        if "generated_key" in job:
+                            add_generated_row_keys([row], job, legacy_occurrences)
+                        value = row[job["unique_key"]]
+                        if value is not None and str(value).strip():
+                            legacy_keys[index] = normalize_business_key(
+                                convert_value(value, unique_field_type, settings["timezone_offset"]), unique_field_type)
+                for row, key, legacy_key in zip(chunk, keys, legacy_keys):
                     record = build_record(row, job["columns"], field_types, settings)
                     try:
                         sort_value = 0
@@ -783,8 +835,13 @@ def run_job(
                             sort_value = convert_value(row[split_column], 5, settings["timezone_offset"])
                             if sort_value is None:
                                 sort_value = 9223372036854775807
-                        staging.execute("INSERT INTO source_rows VALUES (?, ?, ?)",
-                                        (key, json.dumps(record, ensure_ascii=False), sort_value))
+                        legacy_group = legacy_key
+                        key_group = key
+                        if legacy_key and "generated_key" in job:
+                            legacy_group = legacy_key.rsplit("_", 1)[0]
+                            key_group = key.rsplit("_", 1)[0]
+                        staging.execute("INSERT INTO source_rows VALUES (?, ?, ?, ?, ?, ?)",
+                                        (key, json.dumps(record, ensure_ascii=False), sort_value, legacy_key, legacy_group, key_group))
                     except sqlite3.IntegrityError as exc:
                         raise ConfigError(f"任务 {job['name']} 的 SQL 结果存在重复唯一键: {key}") from exc
                 counts["source_rows"] += len(chunk)
@@ -829,9 +886,21 @@ def run_job(
                 for partition in partitions:
                     partition["rows"] = previous_counts.get(partition["table_id"], 0)
             staging.commit()
-            for key, payload in staging.execute("SELECT key, record FROM source_rows ORDER BY sort_value, key"):
+            for key, payload, legacy_key, legacy_group in staging.execute(
+                "SELECT key, record, legacy_key, legacy_group FROM source_rows ORDER BY sort_value, key"
+            ):
                 record = json.loads(payload)
                 current = staging.execute("SELECT record, partition FROM target_rows WHERE key = ?", (key,)).fetchone()
+                if legacy_key and legacy_key != key:
+                    legacy = staging.execute("SELECT record, partition FROM target_rows WHERE key = ?", (legacy_key,)).fetchone()
+                    if legacy:
+                        matching_groups = staging.execute(
+                            "SELECT DISTINCT key_group FROM source_rows WHERE legacy_group = ? LIMIT 2", (legacy_group,)
+                        ).fetchall()
+                        key_in_use = staging.execute("SELECT 1 FROM source_rows WHERE key = ?", (legacy_key,)).fetchone()
+                        if current or len(matching_groups) > 1 or key_in_use:
+                            raise ConfigError(f"任务 {job['name']} 的旧 JSON 唯一键与当前记录无法一一匹配，请核对目标数据或选择稳定业务唯一键")
+                        current = legacy
                 kind = "create"
                 destination = partitions[-1]
                 if current:
@@ -866,6 +935,15 @@ def run_job(
                 return summary
             if not table_id:
                 raise RuntimeError("正式同步时飞书目标表未创建")
+            if json_columns and new_target:
+                # Record the new format before the first write, so a lost batch
+                # response cannot make the retry treat new keys as legacy keys.
+                # Preserve the execution snapshot's reset token for save_job_state.
+                with state_edit_lock():
+                    latest = load_state()
+                    latest["jobs"].setdefault(job["id"], {})["postgres_json_v2_table_id"] = table_id
+                    save_state(latest)
+                state["jobs"].setdefault(job["id"], {})["postgres_json_v2_table_id"] = table_id
             for partition in partitions:
                 if not partition["table_id"]:
                     partition["table_id"], types, _ = ensure_target(
@@ -889,6 +967,8 @@ def run_job(
         "fingerprint": fingerprint,
         "partitions": partitions,
     }
+    if json_columns:
+        entry["postgres_json_v2_table_id"] = table_id
     if max_cursor is not None:
         entry["cursor"] = _encode_cursor(max_cursor)
     elif incremental_run and job_state.get("cursor"):
