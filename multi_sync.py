@@ -83,7 +83,8 @@ def validate_target_fields(job: Dict[str, Any], field_types: Dict[str, int]) -> 
 
 def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
                     table_id: Optional[str], field_types: Dict[str, int],
-                    settings: Optional[Dict[str, Any]] = None) -> str:
+                    settings: Optional[Dict[str, Any]] = None,
+                    column_metadata: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
     """Bind cursors to their actual source, target and conversion semantics.
 
     时区与 NULL 策略参与指纹：这两项决定同一个 SQL 值怎么变成飞书值，
@@ -106,6 +107,10 @@ def job_fingerprint(source: Dict[str, Any], job: Dict[str, Any], app_token: str,
         column.get("sql_type") in {"json", "jsonb"} for column in job.get("columns", [])
     ):
         identity["postgres_json_version"] = 2
+    if column_metadata and any(
+        column_metadata.get(column["source"], {}).get("domain_type") for column in job.get("columns", [])
+    ):
+        identity["postgres_domain_version"] = 1
     if any(column.get("sql_type") in NUMERIC_TYPES for column in job.get("columns", [])):
         identity["number_conversion_version"] = 2
     # Earlier builds ignored the configured timezone during record conversion.
@@ -762,9 +767,21 @@ def run_job(
 ) -> Dict[str, Any]:
     source = get_source(config, job["source_id"])
     settings = runtime_settings(config)
+    column_metadata = {}
+    if databases.database_type(source) == "postgresql":
+        column_metadata = {column["name"]: column for column in list_columns(source, job["schema"], job["table"])}
+        # Older saved plans may contain a domain name or USER-DEFINED. Resolve
+        # conversion semantics while retaining the user's mappings and target IDs.
+        job = {**job, "columns": [dict(column) for column in job["columns"]]}
+        for column in job["columns"]:
+            metadata = column_metadata.get(column["source"], {})
+            if metadata.get("domain_type"):
+                column["sql_type"] = metadata["sql_type"]
+                if not column.get("target_type") and databases.needs_exact_text(metadata, source):
+                    column["target_type"] = 1
     table_id, field_types, target_action = ensure_target(client, app_token, config, job, dry_run)
     validate_target_fields(job, field_types)
-    fingerprint = job_fingerprint(source, job, app_token, table_id, field_types, settings)
+    fingerprint = job_fingerprint(source, job, app_token, table_id, field_types, settings, column_metadata)
     job_state = state["jobs"].get(job["id"]) or {}
     # A saved cursor is only reusable while the source, fields, key and target table stay identical.
     cursor_reset = bool(job_state.get("fingerprint")) and job_state["fingerprint"] != fingerprint
@@ -788,10 +805,15 @@ def run_job(
         col["source"] for col in job["columns"] if col["source"] != job["unique_key"]
     ]
     key_columns = identity_columns if "generated_key" in job else [job["unique_key"]]
-    json_key_columns = set(json_columns) & set(key_columns)
-    migrated = previous_state.get("postgres_json_v2_table_id") == table_id
+    migrated_columns = set()
+    if previous_state.get("postgres_json_v2_table_id") == table_id:
+        migrated_columns = set(previous_state.get("postgres_json_v2_columns", [
+            name for name in json_columns
+            if column_metadata.get(name, {}).get("legacy_sql_type", "json") in {"json", "jsonb"}
+        ]))
+    json_key_columns = (set(json_columns) - migrated_columns) & set(key_columns)
     new_target = target_action == "created" and len(partitions) == 1
-    migrate_json_keys = bool(json_key_columns) and not migrated and bool(table_id) and not new_target
+    migrate_json_keys = bool(json_key_columns) and bool(table_id) and not new_target
     legacy_occurrences: Dict[str, int] = {}
     with tempfile.TemporaryDirectory(prefix="sqlfeishu-") as staging_dir:
         with contextlib.closing(sqlite3.connect(os.path.join(staging_dir, "records.sqlite"))) as staging:
@@ -941,9 +963,11 @@ def run_job(
                 # Preserve the execution snapshot's reset token for save_job_state.
                 with state_edit_lock():
                     latest = load_state()
-                    latest["jobs"].setdefault(job["id"], {})["postgres_json_v2_table_id"] = table_id
+                    latest["jobs"].setdefault(job["id"], {}).update(
+                        postgres_json_v2_table_id=table_id, postgres_json_v2_columns=json_columns)
                     save_state(latest)
-                state["jobs"].setdefault(job["id"], {})["postgres_json_v2_table_id"] = table_id
+                state["jobs"].setdefault(job["id"], {}).update(
+                    postgres_json_v2_table_id=table_id, postgres_json_v2_columns=json_columns)
             for partition in partitions:
                 if not partition["table_id"]:
                     partition["table_id"], types, _ = ensure_target(
@@ -969,6 +993,7 @@ def run_job(
     }
     if json_columns:
         entry["postgres_json_v2_table_id"] = table_id
+        entry["postgres_json_v2_columns"] = json_columns
     if max_cursor is not None:
         entry["cursor"] = _encode_cursor(max_cursor)
     elif incremental_run and job_state.get("cursor"):

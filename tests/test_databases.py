@@ -418,6 +418,159 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.execute(f'CREATE VIEW "{self.schema}"."订单视图" AS SELECT * FROM "{self.schema}"."订单"')
         self.finish_setup()
 
+    def test_nested_domain_metadata_preview_and_sync_across_relations(self):
+        self.execute(f'CREATE DOMAIN "{self.schema}"."金额域" AS numeric(24,4) NOT NULL')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."嵌套金额域" AS "{self.schema}"."金额域"')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."时间域" AS timestamp')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."布尔域" AS boolean')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."内容域" AS jsonb')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."嵌套内容域" AS "{self.schema}"."内容域"')
+        relation = f'"{self.schema}"."域数据"'
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, '
+                     f'"金额" "{self.schema}"."嵌套金额域", "UpdatedAt" "{self.schema}"."时间域", '
+                     f'"内容" "{self.schema}"."嵌套内容域", "有效" "{self.schema}"."布尔域", "内部" text)')
+        self.execute(f'INSERT INTO {relation} VALUES (1,123456789012345.6789,\'2026-01-01\',\'null\',true,\'隐藏\'),'
+                     '(2,12.5000,\'2026-01-02\',\'"中文😀"\',false,\'隐藏\')')
+        self.execute(f'CREATE VIEW "{self.schema}"."域视图" AS SELECT * FROM {relation}')
+        self.execute(f'CREATE MATERIALIZED VIEW "{self.schema}"."域快照" AS SELECT * FROM {relation}')
+        user = 'reader_' + uuid.uuid4().hex[:16]
+        self.execute(f'CREATE ROLE "{user}" LOGIN')
+        self.addCleanup(lambda: self.execute(f'DROP ROLE "{user}"'))
+        self.addCleanup(lambda: self.execute(f'DROP OWNED BY "{user}"'))
+        self.execute(f'GRANT USAGE ON SCHEMA "{self.schema}" TO "{user}"')
+        source = {**self.source, 'user': user}
+        workspace.save_config({'sources': [source], 'jobs': []})
+        for name in ('域数据', '域视图', '域快照'):
+            self.execute(f'GRANT SELECT ("Id","金额","UpdatedAt","内容","有效") '
+                         f'ON "{self.schema}"."{name}" TO "{user}"')
+            columns = multi_sync.list_columns(source, self.schema, name)
+            metadata = {col['name']: col for col in columns}
+            self.assertNotIn('内部', metadata)
+            self.assertEqual(metadata['金额']['sql_type'], 'numeric')
+            self.assertEqual(metadata['金额']['numeric_precision'], 24)
+            self.assertFalse(metadata['金额']['nullable'])
+            self.assertEqual(metadata['金额']['feishu_type'], 1)
+            self.assertEqual(metadata['UpdatedAt']['sql_type'], 'datetime2')
+            self.assertEqual(metadata['UpdatedAt']['feishu_type'], 5)
+            self.assertEqual(metadata['有效']['feishu_type'], 7)
+            self.assertEqual(metadata['内容']['sql_type'], 'jsonb')
+            preview = self.request('/api/sources/' + source['id'] + '/preview',
+                                   {'schema': self.schema, 'table': name, 'columns': ['Id','内容','金额']})
+            self.assertEqual(preview['rows'], [['1','null','123456789012345.6789'], ['2','"中文😀"','12.5000']])
+        tables = self.request('/api/discovery', {'source_id': source['id']})['tables']
+        created = self.request('/api/jobs/bulk', {'tables': tables})
+        self.assertEqual(created['errors'], [])
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.record_count = lambda *args: None
+        for job in config['jobs']:
+            self.assertEqual(next(col for col in job['columns'] if col['source']=='金额')['target_type'], 1)
+            first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+            repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+            self.assertEqual((first['create'], repeated['create'], repeated['update']), (2,0,0))
+            records = {row['fields']['Id']: row for row in fake.records[job['target']['table_id']]}
+            self.assertEqual(records[1]['fields']['内容'], 'null')
+            self.assertEqual(records[1]['fields']['金额'], '123456789012345.6789')
+            self.assertTrue(records[1]['fields']['有效'])
+            self.assertIsInstance(records[1]['fields']['UpdatedAt'], int)
+        job = next(job for job in config['jobs'] if job['table']=='域数据')
+        self.assertTrue(job['incremental']['enabled'])
+        self.execute(f'UPDATE {relation} SET "内容"=\'"更新中文"\', "UpdatedAt"=\'2026-01-03\' WHERE "Id"=1')
+        updated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(updated['incremental'])
+        self.assertEqual((updated['create'], updated['update']), (0,1))
+
+    def test_old_domain_plan_migrates_mixed_json_keys_and_retries_in_place(self):
+        self.execute(f'CREATE DOMAIN "{self.schema}"."内容域" AS jsonb')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."嵌套域" AS "{self.schema}"."内容域"')
+        relation = f'"{self.schema}"."旧域表"'
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "原生内容" jsonb, '
+                     f'"域内容" "{self.schema}"."嵌套域", "UpdatedAt" timestamp)')
+        self.execute(f'INSERT INTO {relation} VALUES (1,\'null\',\'null\',\'2026-01-01\'),'
+                     '(2,\'"中文"\',\'123456789012345.6789\',\'2026-01-02\')')
+        self.execute(f'CREATE MATERIALIZED VIEW "{self.schema}"."旧域快照" AS SELECT * FROM {relation}')
+        for name in ('旧域表', '旧域快照'):
+            with self.subTest(name=name):
+                metadata = multi_sync.list_columns(self.source, self.schema, name)
+                legacy_metadata = copy.deepcopy(metadata)
+                for column in legacy_metadata:
+                    if column.pop('domain_type', None):
+                        column['sql_type'] = column.pop('legacy_sql_type')
+                projection = multi_sync.sql_column_expression
+                def legacy_projection(column, source=None):
+                    if column['name']=='域内容':
+                        return databases.quote_identifier(source, column['name'])
+                    return projection(column, source)
+                with mock.patch.object(multi_sync, 'list_columns', return_value=legacy_metadata):
+                    job = multi_sync.automatic_job(self.source, self.schema, name)
+                    job['split']['row_limit'] = 1
+                    config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+                    job = config['jobs'][0]
+                    fake, state = FakeFeishu(), {'jobs': {}}
+                    fake.record_count = lambda *args: None
+                    with mock.patch.object(multi_sync, 'sql_column_expression', side_effect=legacy_projection):
+                        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                # a9fa674 tracked the target format without listing converted columns.
+                state['jobs'][job['id']].pop('postgres_json_v2_columns')
+                workspace.save_state(state)
+                before = copy.deepcopy(state)
+                before_ids = {row['record_id'] for rows in fake.records.values() for row in rows}
+                old_job = copy.deepcopy(job)
+                write = fake.batch_update
+                def lose_response(*args):
+                    write(*args)
+                    raise RuntimeError('accepted update, lost response')
+                with mock.patch.object(fake, 'batch_update', side_effect=lose_response):
+                    with self.assertRaisesRegex(RuntimeError, 'lost response'):
+                        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual(state, before)
+                summary = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertTrue(summary['cursor_reset'])
+                self.assertFalse(summary['incremental'])
+                self.assertEqual(summary['create'], 0)
+                self.assertEqual(before_ids, {row['record_id'] for rows in fake.records.values() for row in rows})
+                records = {row['fields']['Id']: row['fields'] for rows in fake.records.values() for row in rows}
+                self.assertEqual(records[1]['原生内容'], 'null')
+                self.assertEqual(records[1]['域内容'], 'null')
+                self.assertEqual(records[2]['域内容'], '123456789012345.6789')
+                self.assertEqual(job, old_job)
+                repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+                self.assertEqual((repeated['create'], repeated['update']), (0,0))
+
+    def test_unrun_legacy_domain_plan_preserves_precision_and_date_incremental(self):
+        self.execute(f'CREATE DOMAIN "{self.schema}"."金额域" AS numeric(24,4)')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."时间域" AS timestamp')
+        relation = f'"{self.schema}"."未运行域快照"'
+        self.execute(f'CREATE MATERIALIZED VIEW {relation} AS SELECT 1 AS "Id", '
+                     f'123456789012345.6789::"{self.schema}"."金额域" AS "金额", '
+                     f'\'2026-01-01\'::"{self.schema}"."时间域" AS "UpdatedAt"')
+        metadata = multi_sync.list_columns(self.source, self.schema, '未运行域快照')
+        for column in metadata:
+            if column.get('domain_type'):
+                column['sql_type'] = column['legacy_sql_type']
+        with mock.patch.object(multi_sync, 'list_columns', return_value=metadata):
+            job = multi_sync.automatic_job(self.source, self.schema, '未运行域快照')
+        job.pop('generated_key')
+        job['unique_key'] = 'Id'
+        job['columns'] = [col for col in job['columns'] if col['source'] != '__sqlfeishu_row_key']
+        job['incremental'] = {'enabled': True, 'column': 'UpdatedAt'}
+        config = workspace.save_config({'sources': [self.source], 'jobs': [job]})
+        job = config['jobs'][0]
+        original_columns = copy.deepcopy(job['columns'])
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.record_count = lambda *args: None
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        record = fake.records[job['target']['table_id']][0]['fields']
+        self.assertEqual(record['金额'], '123456789012345.6789')
+        self.assertIsInstance(record['UpdatedAt'], int)
+        fields = {field['field_name']: field['type'] for field in fake.list_fields('app_test', job['target']['table_id'])}
+        self.assertEqual(fields['金额'], 1)
+        self.assertEqual(fields['UpdatedAt'], 5)
+        self.assertEqual(job['columns'], original_columns)
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(repeated['incremental'])
+        self.assertEqual((repeated['create'], repeated['skip']), (0,1))
+
     def test_json_text_preserves_scalar_types_precision_and_sql_null(self):
         from decimal import Decimal
         for kind in ('json', 'jsonb'):
@@ -639,7 +792,8 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         with self.assertRaisesRegex(RuntimeError, 'response lost'):
             multi_sync.run_job(fake, 'app_test', config, state, job, False)
         saved = workspace.load_state()
-        self.assertEqual(saved['jobs'][job['id']], {'postgres_json_v2_table_id': job['target']['table_id']})
+        self.assertEqual(saved['jobs'][job['id']], {'postgres_json_v2_table_id': job['target']['table_id'],
+                                                   'postgres_json_v2_columns': ['内容']})
         before_ids = {row['record_id'] for rows in fake.records.values() for row in rows}
         fake.fail_on_batch = None
         # Resume as a new process, using only persisted state and configuration.

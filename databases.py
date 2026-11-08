@@ -276,6 +276,7 @@ def needs_exact_text(column, source):
 
 def list_columns(source, schema, table):
     kind = database_type(source)
+    domains = {}
     with connect(source) as conn, cursor_for(conn, source) as cursor:
         if kind == "sqlite":
             if schema != "main":
@@ -318,9 +319,35 @@ def list_columns(source, schema, table):
                     "ORDER BY a.attnum", (schema, table),
                 )
                 rows = cursor.fetchall()
-    return [{"name": r[0], "sql_type": normalize_type(kind, r[1]), "native_type": r[1].lower(),
+            if rows:
+                cursor.execute(
+                    "WITH RECURSIVE domain_columns AS ("
+                    "SELECT a.attname, a.atttypid AS type_id, a.atttypmod AS type_mod, "
+                    "a.attnotnull AS not_null, format_type(a.atttypid, NULL) AS domain_name "
+                    "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid "
+                    "WHERE n.nspname = %s AND c.relname = %s AND t.typtype = 'd' "
+                    "AND a.attnum > 0 AND NOT a.attisdropped AND has_schema_privilege(n.oid, 'USAGE') "
+                    "AND has_column_privilege(c.oid, a.attnum, 'SELECT') "
+                    "UNION ALL SELECT d.attname, t.typbasetype, "
+                    "CASE WHEN d.type_mod >= 0 THEN d.type_mod ELSE t.typtypmod END, "
+                    "d.not_null OR t.typnotnull, d.domain_name "
+                    "FROM domain_columns d JOIN pg_type t ON t.oid = d.type_id WHERE t.typtype = 'd') "
+                    "SELECT d.attname, format_type(d.type_id, d.type_mod), NOT d.not_null, "
+                    "information_schema._pg_numeric_precision(d.type_id, d.type_mod), d.domain_name "
+                    "FROM domain_columns d JOIN pg_type t ON t.oid = d.type_id WHERE t.typtype <> 'd'",
+                    (schema, table),
+                )
+                domains = {row[0]: row for row in cursor.fetchall()}
+    columns = [{"name": r[0], "sql_type": normalize_type(kind, r[1]), "native_type": r[1].lower(),
              "nullable": r[2], "ordinal": int(r[3]), "is_identity": bool(r[4]),
              "identity_increment": float(r[5] or 0), "numeric_precision": r[6]} for r in rows]
+    for column in columns:
+        domain = domains.get(column["name"])
+        if domain:
+            column.update(legacy_sql_type=column["sql_type"], domain_type=domain[4],
+                          sql_type=normalize_type(kind, domain[1]), nullable=domain[2], numeric_precision=domain[3])
+    return columns
 
 
 def list_primary_key(source, schema, table):
