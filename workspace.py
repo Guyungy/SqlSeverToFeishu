@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import dotenv_values, load_dotenv
-from databases import database_type, DEFAULT_PORTS, DEFAULT_DATABASES
+from databases import database_type, validate_tls, DEFAULT_PORTS, DEFAULT_DATABASES
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -332,6 +332,7 @@ def validate_source(source: Dict[str, Any]) -> Dict[str, Any]:
         "user": str(source.get("user") or "").strip(),
         "password_env": password_key,
         "enabled": bool(source.get("enabled", True)),
+        "tls": validate_tls(source),
     }
 
     excluded = source.get("excluded_tables", [])

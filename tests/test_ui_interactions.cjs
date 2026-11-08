@@ -212,3 +212,36 @@ test('database type changes defaults and hides network fields for SQLite', () =>
     assert.equal(ui.element('source-type').value, 'mssql');
     assert.equal(ui.element('source-server-wrap').hidden, false);
 });
+
+test('TLS editor restores saved settings and only submits applicable certificate fields', () => {
+    const ui = uiContext();
+    ui.run(`editSource({id:'pg',type:'postgresql',tls:{mode:'verify-full',ca:'/certs/ca.pem',cert:'/certs/client.pem',key:'/certs/key.pem'}})`);
+    assert.equal(ui.element('source-tls-ca-wrap').hidden, false);
+    assert.equal(ui.run('sourcePayload().tls.ca'), '/certs/ca.pem');
+    ui.element('source-tls-mode').value='require';
+    ui.element('source-tls-mode').onchange();
+    assert.equal(ui.element('source-tls-ca-wrap').hidden, true);
+    assert.equal(ui.run('sourcePayload().tls.ca'), '');
+    assert.equal(ui.run('sourcePayload().tls.cert'), '/certs/client.pem');
+    ui.element('source-tls-mode').value='disable';
+    ui.element('source-tls-mode').onchange();
+    assert.equal(ui.run('sourcePayload().tls.cert'), undefined);
+    ui.element('source-type').value='sqlite';
+    ui.element('source-type').onchange();
+    assert.equal(ui.element('source-tls-wrap').hidden, true);
+    assert.equal(ui.run('sourcePayload().tls.mode'), 'default');
+    ui.run('editSource()');
+    assert.equal(ui.run('sourcePayload().tls.mode'), 'default');
+    assert.equal(ui.element('source-tls-ca').value, '');
+});
+
+test('failed source save keeps TLS inputs and releases the save button', async () => {
+    const ui=uiContext();
+    ui.run(`editSource({id:'pg',type:'postgresql',tls:{mode:'verify-full',ca:'/certs/ca.pem'}});
+        api=async()=>{throw new Error('network disconnected');};`);
+    await ui.element('save-source').onclick();
+    assert.equal(ui.element('source-tls-ca').value, '/certs/ca.pem');
+    assert.equal(ui.element('source-tls-mode').value, 'verify-full');
+    assert.equal(ui.element('save-source').disabled, false);
+    assert.match(ui.element('source-message').textContent, /network disconnected/);
+});

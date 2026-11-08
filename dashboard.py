@@ -106,6 +106,11 @@ def safe_error(exc: Exception, fallback: str) -> str:
     if isinstance(exc, (ValueError, RuntimeError)):
         return str(exc)
     logger.exception("%s: %s", fallback, exc)
+    detail = str(getattr(exc, "original_exception", exc)).lower()
+    if "certificate verify failed" in detail or "does not match host name" in detail:
+        return "TLS 证书校验失败，请检查 CA 证书、证书有效期，以及服务器地址是否与证书主机名匹配"
+    if "server does not support ssl" in detail:
+        return "数据库服务器未启用 TLS，请检查服务器加密连接配置"
     return f"{fallback}，详细信息已写入 dashboard_server.log"
 
 
@@ -425,6 +430,8 @@ def save_source_api():
         source_data["password_env"] = existing["password_env"] if existing else password_env_key(source_id)
         if existing and "excluded_tables" in existing:
             source_data["excluded_tables"] = existing["excluded_tables"]
+        if existing and "tls" not in source_data and databases.database_type(existing) == databases.database_type(source_data):
+            source_data["tls"] = existing.get("tls", {})
         source = validate_source(source_data)
         if existing and databases.database_type(existing) != source["type"] and any(
             job["source_id"] == source_id for job in config["jobs"]

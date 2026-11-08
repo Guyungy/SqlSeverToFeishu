@@ -139,6 +139,7 @@ def sql_connection(source: Dict[str, Any], database: Optional[str] = None,
         "charset": "utf8",
         "login_timeout": 10,
         "timeout": int(settings["query_timeout"]),
+        **databases.tls_options(source),
     }
     if source.get("user"):
         kwargs.update(user=source["user"], password=source_password(source))

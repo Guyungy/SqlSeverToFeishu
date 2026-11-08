@@ -209,6 +209,7 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         info = conninfo_to_dict(dsn)
         self.source = workspace.validate_source({
             'id': 'source_test', 'name': '中文测试库', 'type': 'postgresql',
+            'tls': {'mode': 'verify-full', 'ca': os.environ['SQLFEISHU_TEST_TLS_CA']} if os.environ.get('SQLFEISHU_TEST_TLS_CA') else {},
             'server': info['host'], 'port': info.get('port', 5432), 'database': info['dbname'], 'user': info['user'],
         })
         self.password = mock.patch.dict(os.environ, {self.source['password_env']: info.get('password', '')})
@@ -259,6 +260,7 @@ class MySQLWorkflowTests(SQLiteWorkflowTests):
         self.addCleanup(lambda: self.execute(f'DROP DATABASE "{self.schema}"'))
         self.source = workspace.validate_source({
             'id': 'source_test', 'name': '中文测试库', 'type': self.engine,
+            'tls': {'mode': 'verify-full', 'ca': os.environ['SQLFEISHU_TEST_TLS_CA']} if os.environ.get('SQLFEISHU_TEST_TLS_CA') else {},
             'server': info['host'], 'port': info.get('port', 3306), 'database': self.schema,
             'user': info['user'],
         })

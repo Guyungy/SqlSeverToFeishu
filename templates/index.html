@@ -83,6 +83,16 @@
                         <label id="source-user-wrap">只读用户名<input id="source-user" autocomplete="off"></label>
                         <label id="source-password-wrap">密码<input id="source-password" type="password" autocomplete="new-password" placeholder="已保存时留空不变"></label>
                     </div>
+                    <details id="source-tls-wrap" class="editor-advanced">
+                        <summary>加密连接与证书</summary>
+                        <div class="form-grid">
+                            <label>连接模式<select id="source-tls-mode"><option value="default">沿用驱动默认设置</option><option value="disable">关闭 TLS</option><option value="require">强制 TLS 加密</option><option value="verify-full">TLS 并校验证书和主机名</option></select></label>
+                            <label id="source-tls-ca-wrap">CA 证书文件<input id="source-tls-ca" placeholder="留空使用系统信任库"></label>
+                            <label id="source-tls-cert-wrap">客户端证书文件（可选）<input id="source-tls-cert" placeholder="同步电脑上的 PEM 文件绝对路径"></label>
+                            <label id="source-tls-key-wrap">客户端私钥文件（可选）<input id="source-tls-key" placeholder="同步电脑上的未加密 PEM 私钥绝对路径"></label>
+                        </div>
+                        <p id="source-tls-hint" class="plan-hint"></p>
+                    </details>
                     <div class="actions wrap">
                         <button id="save-source" class="btn primary">保存数据源</button>
                         <button id="test-source" class="btn secondary" disabled>测试连接</button>
@@ -296,7 +306,20 @@ $('save-settings').onclick=async()=>{
 });
 
 function blankSource(){return {id:'',name:'',type:'mssql',server:'',port:1433,database:'',user:'',has_password:false,enabled:true};}
-function editSource(s=blankSource()){$('source-type').value=s.type||'mssql';$('source-id').value=s.id||'';$('source-name').value=s.name||'';$('source-server').value=s.server||'';$('source-port').value=s.port||1433;$('source-database').value=s.database||'';$('source-user').value=s.user||'';$('source-password').value='';$('source-password').placeholder=s.has_password?'已安全保存，留空不变':'输入密码';$('source-editor-title').textContent=s.id?`编辑 ${s.name}`:'添加数据源';$('test-source').disabled=!s.id;$('load-databases').disabled=!s.id;$('delete-source').disabled=!s.id;updateSourceType();message('source-message',true,'');}
+function editSource(source=blankSource()){
+    $('source-type').value=source.type||'mssql';
+    for(const field of ['id','name','server','database','user'])$('source-'+field).value=source[field]||'';
+    $('source-port').value=source.port||1433;
+    $('source-password').value='';
+    $('source-password').placeholder=source.has_password?'已安全保存，留空不变':'输入密码';
+    $('source-editor-title').textContent=source.id?`编辑 ${source.name}`:'添加数据源';
+    for(const id of ['test-source','load-databases','delete-source'])$(id).disabled=!source.id;
+    updateSourceType();
+    $('source-tls-mode').value=source.tls?.mode||'default';
+    for(const key of ['ca','cert','key'])$('source-tls-'+key).value=source.tls?.[key]||'';
+    updateSourceTLS();
+    message('source-message',true,'');
+}
 const databaseDefaults={mssql:{port:1433,label:'SQL Server',database:'BusinessDB'},mysql:{port:3306,label:'MySQL',database:'业务数据库'},mariadb:{port:3306,label:'MariaDB',database:'业务数据库'},postgresql:{port:5432,label:'PostgreSQL',database:'postgres'},sqlite:{port:0,label:'SQLite',database:'例如 C:\\data\\business.db 或 /data/business.db'}};
 function updateSourceType(reset=false){
     const type=$('source-type').value||'mssql';
@@ -305,13 +328,71 @@ function updateSourceType(reset=false){
     $('source-database-label').textContent=local?'数据库文件绝对路径（运行程序所在电脑）':'数据库';
     $('source-database').placeholder=databaseDefaults[type].database;
     $('load-databases').disabled=local||!$('source-id').value;
-    if(reset){$('source-port').value=databaseDefaults[type].port;$('database-options').innerHTML='';}
+    if(reset){
+        $('source-port').value=databaseDefaults[type].port;$('database-options').innerHTML='';
+        $('source-tls-mode').value='default';
+        for(const key of ['ca','cert','key'])$('source-tls-'+key).value='';
+    }
+    updateSourceTLS();
 }
+function updateSourceTLS(){
+    const type=$('source-type').value||'mssql';
+    const mode=$('source-tls-mode').value||'default';
+    const certificates=['mysql','mariadb','postgresql'].includes(type);
+    $('source-tls-wrap').hidden=type==='sqlite';
+    $('source-tls-mode').querySelectorAll('option').forEach(option=>option.disabled=option.value==='verify-full'&&!certificates);
+    $('source-tls-ca-wrap').hidden=!certificates||mode!=='verify-full';
+    for(const key of ['cert','key'])$('source-tls-'+key+'-wrap').hidden=!certificates||!['require','verify-full'].includes(mode);
+    $('source-tls-hint').textContent=type==='mssql'
+        ?'SQL Server 支持驱动默认、关闭和强制加密。证书验证由同步电脑的 FreeTDS 配置管理。保存后测试连接。'
+        :'强制加密要求服务器支持 TLS。校验证书和主机名时，服务器地址须与证书匹配。证书路径位于同步电脑，客户端证书与私钥需成对填写。保存后测试连接。';
+}
+$('source-tls-mode').onchange=updateSourceTLS;
 $('source-type').onchange=()=>updateSourceType(true);
 $('new-source').onclick=()=>editSource();
 function renderSources(){const list=$('source-list');list.className=store.config.sources.length?'source-list':'source-list empty';list.innerHTML=store.config.sources.length?store.config.sources.map(s=>`<button class="source-card" data-id="${s.id}"><span><b>${escapeHtml(s.name)}</b><small>${escapeHtml(databaseDefaults[s.type||'mssql'].label)}${s.type==='sqlite'?'':' · '+escapeHtml(s.server)+':'+s.port}</small></span><em>${escapeHtml(s.database)}</em></button>`).join(''):'暂无数据源。';list.querySelectorAll('[data-id]').forEach(el=>el.onclick=()=>editSource(store.config.sources.find(s=>s.id===el.dataset.id)));}
-function sourcePayload(){return {id:$('source-id').value,type:$('source-type').value||'mssql',name:$('source-name').value.trim(),server:$('source-server').value.trim(),port:Number($('source-port').value),database:$('source-database').value.trim(),user:$('source-user').value.trim(),enabled:true};}
-$('save-source').onclick=async()=>{message('source-message',true,'保存中...');const d=await api('/api/sources',{method:'POST',body:JSON.stringify({source:sourcePayload(),password:$('source-password').value})});message('source-message',d.ok,d.message);if(d.ok){store.config=d.config;renderAll();editSource(store.config.sources.find(s=>s.id===d.source_id));$('builder-source').value=d.source_id;nav('builder');await $('scan-tables').onclick();}};
+function sourcePayload(){
+    return {
+        id:$('source-id').value,type:$('source-type').value||'mssql',name:$('source-name').value.trim(),
+        server:$('source-server').value.trim(),port:Number($('source-port').value),
+        database:$('source-database').value.trim(),user:$('source-user').value.trim(),
+        enabled:true,tls:sourceTLS()
+    };
+}
+function sourceTLS(){
+    const type=$('source-type').value||'mssql';
+    const mode=type==='sqlite'?'default':$('source-tls-mode').value||'default';
+    const tls={mode};
+    if(['mysql','mariadb','postgresql'].includes(type)&&['require','verify-full'].includes(mode)){
+        tls.ca=mode==='verify-full'?$('source-tls-ca').value.trim():'';
+        tls.cert=$('source-tls-cert').value.trim();tls.key=$('source-tls-key').value.trim();
+    }
+    return tls;
+}
+$('save-source').onclick=async()=>{
+    const editing=!!$('source-id').value;
+    message('source-message',true,'保存中...');
+    $('save-source').disabled=true;
+    try{
+        const data=await api('/api/sources',{method:'POST',body:JSON.stringify({source:sourcePayload(),password:$('source-password').value})});
+        message('source-message',data.ok,data.message);
+        if(!data.ok)return;
+        store.config=data.config;
+        renderAll();
+        editSource(store.config.sources.find(source=>source.id===data.source_id));
+        if(editing){
+            message('source-message',true,'数据源已保存，可测试连接。');
+        }else{
+            $('builder-source').value=data.source_id;
+            nav('builder');
+            await $('scan-tables').onclick();
+        }
+    }catch(error){
+        message('source-message',false,error.message);
+    }finally{
+        $('save-source').disabled=false;
+    }
+};
 $('test-source').onclick=async()=>{const id=$('source-id').value;message('source-message',true,'测试中...');const d=await api(`/api/sources/${id}/test`,{method:'POST',body:'{}'});message('source-message',d.ok,d.message);};
 $('load-databases').onclick=async()=>{const id=$('source-id').value;message('source-message',true,'识别中...');const d=await api(`/api/sources/${id}/databases`);message('source-message',d.ok,d.ok?`识别到 ${d.databases.length} 个数据库`:d.message);if(d.ok){$('database-options').innerHTML=d.databases.map(x=>`<option value="${escapeHtml(x)}">`).join('');}};
 $('delete-source').onclick=async()=>{const id=$('source-id').value;if(!confirm('确认删除此数据源？'))return;const d=await api(`/api/sources/${id}`,{method:'DELETE'});message('source-message',d.ok,d.message);if(d.ok){store.config=d.config;renderAll();editSource();}};

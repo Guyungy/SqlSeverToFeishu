@@ -4,14 +4,102 @@ import contextlib
 import json
 import re
 import sqlite3
+import ssl
 import time
 from pathlib import Path
 from datetime import datetime, timezone
+
+import pymysql
 
 
 DATABASE_TYPES = {"mssql", "mysql", "mariadb", "postgresql", "sqlite"}
 DEFAULT_PORTS = {"mssql": 1433, "mysql": 3306, "mariadb": 3306, "postgresql": 5432, "sqlite": 0}
 DEFAULT_DATABASES = {"mssql": "master", "mysql": "", "mariadb": "", "postgresql": "postgres", "sqlite": ""}
+
+
+def validate_tls(source):
+    kind = database_type(source)
+    tls = source.get("tls", {})
+    if not isinstance(tls, dict):
+        raise ValueError("TLS 配置必须是对象")
+    mode = tls.get("mode", "default")
+    modes = {"default"} if kind == "sqlite" else {"default", "disable", "require"}
+    if kind in {"postgresql", "mysql", "mariadb"}:
+        modes.add("verify-full")
+    if not isinstance(mode, str) or mode not in modes:
+        raise ValueError(f"{kind} 不支持此 TLS 模式")
+    result = {"mode": mode}
+    for key, label in (("ca", "CA 证书"), ("cert", "客户端证书"), ("key", "客户端私钥")):
+        value = tls.get(key, "")
+        if not isinstance(value, str) or "\x00" in value:
+            raise ValueError(f"{label}路径格式错误")
+        value = value.strip()
+        if value:
+            if kind in {"mssql", "sqlite"} or mode not in {"require", "verify-full"}:
+                raise ValueError(f"当前数据库和 TLS 模式不支持设置{label}")
+            if key == "ca" and mode != "verify-full":
+                raise ValueError("设置 CA 证书时请选择校验证书和主机名")
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                raise ValueError(f"{label}请填写运行同步程序的电脑上的绝对路径")
+            value = str(path)
+        result[key] = value
+    if bool(result["cert"]) != bool(result["key"]):
+        raise ValueError("客户端证书和私钥必须同时填写")
+    if kind == "postgresql" and mode in {"require", "verify-full"}:
+        if any(host.strip().startswith(("/", "@")) for host in source.get("server", "").split(",")):
+            raise ValueError("PostgreSQL TLS 连接请使用 TCP 主机名或 IP 地址")
+    return result
+
+
+def tls_options(source):
+    """Build driver options after validation, including files on the sync host."""
+    tls = validate_tls(source)
+    mode = tls["mode"]
+    if mode == "default":
+        return {}
+    kind = database_type(source)
+    if kind == "mssql":
+        return {"encryption": "off" if mode == "disable" else "require"}
+    for key, label in (("ca", "CA 证书"), ("cert", "客户端证书"), ("key", "客户端私钥")):
+        if tls[key] and not Path(tls[key]).is_file():
+            raise ValueError(f"{label}文件不存在，请检查同步程序所在电脑上的路径")
+    if kind == "postgresql":
+        options = {"sslmode": mode, "gssencmode": "disable"}
+        if mode == "verify-full":
+            options["sslrootcert"] = tls["ca"] or "system"
+        if tls["cert"]:
+            try:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.load_cert_chain(tls["cert"], tls["key"], password=lambda: "")
+            except (OSError, ValueError) as exc:
+                raise ValueError("TLS 客户端证书加载失败，请检查 PEM 格式、文件权限及未加密私钥是否匹配") from exc
+            options.update(sslcert=tls["cert"], sslkey=tls["key"])
+        return options
+    if mode == "disable":
+        return {"ssl_disabled": True}
+    try:
+        if mode == "verify-full":
+            context = ssl.create_default_context(cafile=tls["ca"] or None)
+        else:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        if tls["cert"]:
+            # An encrypted key should fail promptly instead of prompting on stdin.
+            context.load_cert_chain(tls["cert"], tls["key"], password=lambda: "")
+    except (OSError, ValueError) as exc:
+        raise ValueError("TLS 证书加载失败，请检查 PEM 格式、文件权限及客户端证书与未加密私钥是否匹配") from exc
+    return {"ssl": context}
+
+
+class TLSMySQLConnection(pymysql.connections.Connection):
+    """PyMySQL 1.1.2 otherwise falls back to plaintext when CLIENT.SSL is absent."""
+
+    def _request_authentication(self):
+        if not self.server_capabilities & pymysql.constants.CLIENT.SSL:
+            raise ValueError("数据库服务器未启用 TLS，已在发送认证信息前停止连接")
+        return super()._request_authentication()
 
 
 def database_type(source):
@@ -63,13 +151,14 @@ def connect(source, database=None, settings=None):
         deadline = time.monotonic() + timeout
         conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
     elif kind in {"mysql", "mariadb"}:
-        import pymysql
-
-        conn = pymysql.connect(
+        options = tls_options(source)
+        connector = TLSMySQLConnection if "ssl" in options else pymysql.connect
+        conn = connector(
             host=source["server"], port=source["port"], user=source["user"],
             password=source_password(source), database=database or None, charset="utf8mb4",
             connect_timeout=10, read_timeout=timeout, write_timeout=timeout,
             cursorclass=pymysql.cursors.SSCursor,
+            **options,
         )
     elif kind == "postgresql":
         import psycopg
@@ -78,6 +167,7 @@ def connect(source, database=None, settings=None):
             host=source["server"], port=source["port"], dbname=database,
             user=source["user"], password=source_password(source), connect_timeout=10,
             client_encoding="UTF8", options=f"-c statement_timeout={timeout * 1000} -c default_transaction_read_only=on",
+            **tls_options(source),
         )
     else:
         raise ValueError("SQL Server 连接应通过 sql_connection 创建")
