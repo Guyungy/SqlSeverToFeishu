@@ -82,6 +82,7 @@
 - PostgreSQL `json` / `jsonb` 直接读取数据库输出的 JSON 文本，保留字符串引号、布尔值、JSON `null` 及高精度数字。SQL NULL 继续按空值策略处理。数组转为 JSON 文本，二进制值转成十六进制文本。MySQL 多位 `BIT` 保留整数值。
 - 自动增量优先使用常见更新时间字段，其次使用正向自增主键。ID 增量适用于新增数据，更新历史记录需要维护更新时间字段。
 - 增量游标沿用数据库的排序结果，文本比较遵循数据库排序规则。PostgreSQL JSON/JSONB 按数据库输出的文本排序和筛选，MySQL/MariaDB ENUM、SET 按文本排序和筛选。已有非数值、非日期及非布尔增量计划升级后全量核对一次，再按新规则保存游标。
+- 二进制增量字段的游标带有类型标记，以十六进制保存，查询时还原为字节参数。支持 SQL Server rowversion/timestamp、binary/varbinary/image、PostgreSQL bytea 及其 domain、MySQL/MariaDB 二进制类型和 SQLite BLOB。旧版字符串游标会触发全量核对，成功后保存新格式。
 - 增量条件包含 NULL 行，每轮重新核对并记录数量。游标损坏、日期时区类型变化或整数类型不匹配时回退全量读取。MySQL/MariaDB 零日期等无效增量值会显示字段错误。
 - SQLite 日期建议统一保存为固定格式 ISO 日期时间文本。混用文本、Unix 时间戳和不同偏移会影响排序与增量比较。
 - 复合主键生成稳定标识，无主键表使用内容标识并全量读取。源端删除不自动删除飞书记录。
@@ -125,6 +126,8 @@ MySQL 8.4.13 和 MariaDB 11.4.13 有限权限回归覆盖表及列级授权、�
 MySQL/MariaDB 的时长增量回归覆盖正负 838 小时边界、负一微秒、零值、跨天时长、NULL 行、旧字符串游标恢复及跨分表写入响应丢失重试。Chrome 页面验证覆盖时长增量计划的保存、重新打开和预览，保存结果另经过首次及重复同步验证。PostgreSQL `interval` 回归验证日与微秒组成的正负时长，以及新旧游标格式的边界读取。
 
 四种真实引擎均覆盖大小写不敏感文本排序、跨 1000 行批次、NULL 行、边界更新、跨分表重试和旧计划重新核对。PostgreSQL 另覆盖 UUID、混合 IPv4/IPv6、原生枚举、JSON/JSONB 及 JSON domain 的增量边界。MySQL/MariaDB 验证 ENUM、SET 的筛选与排序一致。Chrome 页面验证覆盖 PostgreSQL JSON 和 MySQL/MariaDB ENUM 的增量配置保存、重新打开、中文预览及保存后的重复同步。SQL Server 的 text/ntext 比较表达式和跨批次游标使用驱动结果替身验证。
+
+四种真实引擎的二进制增量回归覆盖空字节串、前导零、高位字节、NULL 行、跨 1000 行批次、旧游标恢复和跨分表响应丢失重试，检查原记录 ID 与同步状态。PostgreSQL 另验证嵌套 bytea domain。Chrome 页面验证覆盖 PostgreSQL、MySQL/MariaDB 的二进制增量配置保存、重新打开、十六进制预览及保存后的重复同步。SQL Server rowversion/timestamp、binary/varbinary/image 的字节参数绑定与旧游标回退使用驱动结果替身验证。
 
 PostgreSQL 16 JSON 回归覆盖 JSON/JSONB 标量、嵌套对象、高精度小数、5000 位整数、SQL NULL、旧任务全量重核、自动标识迁移、首次写入及升级时的分表响应丢失重试、状态保存失败、运行期间重置及跨批次重复行。飞书记录 ID 在可唯一匹配的升级中保留。
 

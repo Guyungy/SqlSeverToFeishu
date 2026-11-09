@@ -246,6 +246,96 @@ class SQLiteWorkflowTests(unittest.TestCase):
         self.assertEqual((summary['create'], summary['skip']), (0, 1))
         self.assertEqual(state['jobs'][job['id']]['cursor'], original_cursor)
 
+    def test_binary_incremental_boundaries_preserve_exact_bytes(self):
+        kind = databases.database_type(self.source)
+        binary_type = 'BYTEA' if kind == 'postgresql' else 'BLOB'
+        relation = databases.qualified_table(self.source, self.schema, '二进制进度')
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "版本" {binary_type}, "名称" TEXT)')
+        values = [b'', b'\x00', b'\x00\x01', b'\x00\xff', b'\x01', b'\x80', b'\xff\x00', b'\xff\xff']
+        for index, value in enumerate(values):
+            self.execute(f'INSERT INTO {relation} VALUES ({self.marker},{self.marker},{self.marker})',
+                         (index, value, '中文版本😀'))
+        self.execute(f'INSERT INTO {relation} VALUES (99,NULL,\'空版本\')')
+        self.writer.commit()
+        result = self.request('/api/jobs/bulk', {'tables': [
+            {'source_id': self.source['id'], 'schema': self.schema, 'name': '二进制进度'}]})
+        self.assertEqual(result['errors'], [])
+        job = result['config']['jobs'][0]
+        job['incremental'] = {'enabled': True, 'column': '版本'}
+        self.request('/api/jobs', {'job': job})
+        preview = self.request('/api/sources/' + self.source['id'] + '/preview',
+                               {'schema': self.schema, 'table': '二进制进度', 'columns': ['Id', '版本']})
+        self.assertEqual(dict(preview['rows']), {**{str(i): value.hex() for i, value in enumerate(values)}, '99': None})
+        for index, value in enumerate(values):
+            with self.subTest(value=value):
+                rows, maximum, used = multi_sync.fetch_job_rows(
+                    self.source, job, {'cursor': multi_sync._encode_cursor(value)})
+                self.assertTrue(used)
+                self.assertEqual({row['Id'] for row in rows}, {99, *range(index, len(values))})
+                self.assertEqual(maximum, values[-1])
+                self.assertEqual(next(row['版本'] for row in rows if row['Id'] == index), value.hex())
+        for cursor in ({'type': 'str', 'value': 'ffff'}, {'type': 'bytes', 'value': 'xyz'},
+                       {'type': 'bytes', 'value': 'f'}, {'type': 'bytes', 'value': None}):
+            rows, maximum, used = multi_sync.fetch_job_rows(self.source, job, {'cursor': cursor})
+            self.assertFalse(used)
+            self.assertEqual(len(rows), len(values) + 1)
+            self.assertEqual(maximum, values[-1])
+
+    def test_binary_cursor_upgrade_and_split_retry_preserve_record_ids(self):
+        kind = databases.database_type(self.source)
+        binary_type = 'BYTEA' if kind == 'postgresql' else 'VARBINARY(20)'
+        relation = databases.qualified_table(self.source, self.schema, '二进制重试')
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "版本" {binary_type}, "名称" TEXT)')
+        with contextlib.closing(self.writer.cursor()) as cursor:
+            cursor.executemany(f'INSERT INTO {relation} VALUES ({self.marker},{self.marker},{self.marker})',
+                               [(index, b'\x00\x01', '中文旧值') for index in range(1001)] +
+                               [(1001, b'\x00\xff', '边界'), (1002, None, '空版本')])
+        self.writer.commit()
+        result = self.request('/api/jobs/bulk', {'tables': [
+            {'source_id': self.source['id'], 'schema': self.schema, 'name': '二进制重试'}]})
+        self.assertEqual(result['errors'], [])
+        job = result['config']['jobs'][0]
+        job['incremental'] = {'enabled': True, 'column': '版本'}
+        job['split']['row_limit'] = 1000
+        self.request('/api/jobs', {'job': job})
+        config = workspace.load_config()
+        fake, state = FakeFeishu(), {'jobs': {}}
+        fake.record_count = lambda *args: None
+        first = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(first['create'], 1003)
+        self.assertEqual(state['jobs'][job['id']]['cursor'], {'type': 'bytes', 'value': '00ff'})
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertTrue(repeated['incremental'])
+        self.assertEqual((repeated['source_rows'], repeated['skip']), (2, 2))
+        original_ids = {row['record_id'] for rows in fake.records.values() for row in rows}
+        state['jobs'][job['id']]['cursor'] = {'type': 'str', 'value': '00ff'}
+        workspace.save_state(state)
+        self.execute(f'UPDATE {relation} SET "名称"={self.marker} WHERE "Id"=0', ('补齐旧记录',))
+        self.writer.commit()
+        upgraded = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertFalse(upgraded['incremental'])
+        self.assertEqual((upgraded['source_rows'], upgraded['update'], upgraded['create']), (1003, 1, 0))
+        self.assertEqual(original_ids, {row['record_id'] for rows in fake.records.values() for row in rows})
+        self.assertEqual(state['jobs'][job['id']]['cursor'], {'type': 'bytes', 'value': '00ff'})
+        self.execute(f'UPDATE {relation} SET "名称"={self.marker} WHERE "Id"=1001', ('边界更新😀',))
+        self.execute(f'INSERT INTO {relation} VALUES ({self.marker},{self.marker},{self.marker})', (1003, b'\xff\x00', '新增'))
+        self.writer.commit()
+        before, disk_before = copy.deepcopy(state), workspace.STATE_PATH.read_bytes()
+        fake.fail_on_batch = fake.batch_count + 1
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state, before)
+        self.assertEqual(workspace.STATE_PATH.read_bytes(), disk_before)
+        fake.fail_on_batch = None
+        multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual(state['jobs'][job['id']]['cursor'], {'type': 'bytes', 'value': 'ff00'})
+        records = [row for rows in fake.records.values() for row in rows]
+        self.assertEqual(len(records), 1004)
+        self.assertTrue(original_ids <= {row['record_id'] for row in records})
+        self.assertEqual(next(row['fields']['名称'] for row in records if str(row['fields']['Id']) == '1001'), '边界更新😀')
+        repeated = multi_sync.run_job(fake, 'app_test', config, state, job, False)
+        self.assertEqual((repeated['source_rows'], repeated['skip']), (2, 2))
+
     def test_text_incremental_cursor_follows_database_collation_across_batches(self):
         engine = databases.database_type(self.source)
         relation = databases.qualified_table(self.source, self.schema, '文本游标')
@@ -475,6 +565,21 @@ class PostgreSQLWorkflowTests(SQLiteWorkflowTests):
         self.execute(f'CREATE TABLE "{self.schema}"."订单" ("Id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "名称" TEXT, "UpdatedAt" TIMESTAMP, "数据" BYTEA)')
         self.execute(f'CREATE VIEW "{self.schema}"."订单视图" AS SELECT * FROM "{self.schema}"."订单"')
         self.finish_setup()
+
+    def test_binary_domain_cursor_uses_resolved_metadata(self):
+        relation = f'"{self.schema}"."二进制域表"'
+        self.execute(f'CREATE DOMAIN "{self.schema}"."二进制域" AS bytea')
+        self.execute(f'CREATE DOMAIN "{self.schema}"."嵌套二进制域" AS "{self.schema}"."二进制域"')
+        self.execute(f'CREATE TABLE {relation} ("Id" int PRIMARY KEY, "版本" "{self.schema}"."嵌套二进制域")')
+        self.execute(f'INSERT INTO {relation} VALUES (%s,%s),(%s,%s)', (1,b'\x00',2,b'\xff'))
+        job = multi_sync.automatic_job(self.source, self.schema, '二进制域表')
+        job['incremental'] = {'enabled': True, 'column': '版本'}
+        rows, maximum, _ = multi_sync.fetch_job_rows(self.source, job, {})
+        self.assertEqual(maximum, b'\xff')
+        self.assertEqual([row['版本'] for row in rows], ['00', 'ff'])
+        rows, _, used = multi_sync.fetch_job_rows(self.source, job, {'cursor': multi_sync._encode_cursor(maximum)})
+        self.assertTrue(used)
+        self.assertEqual([row['Id'] for row in rows], [2])
 
     def test_native_and_json_incremental_fields_use_database_comparison(self):
         self.execute(f'CREATE TYPE "{self.schema}"."级别" AS ENUM (\'Z\',\'a\')')

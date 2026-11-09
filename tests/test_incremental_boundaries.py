@@ -11,6 +11,53 @@ from sync import ConfigError
 
 
 class CursorBoundaryTests(unittest.TestCase):
+    def test_binary_cursors_round_trip_and_reject_malformed_hex(self):
+        for value in (b'', b'\x00\xff', '中文'.encode('utf-8'), b'\x80',
+                      bytearray(b'\x00\x01'), memoryview(b'\xff\x00')):
+            with self.subTest(value=value):
+                encoded = multi_sync._encode_cursor(value)
+                self.assertEqual(encoded, {'type': 'bytes', 'value': bytes(value).hex()})
+                self.assertEqual(multi_sync._decode_cursor(encoded), bytes(value))
+        for value in ('xyz', '0', '00 ff', '\\x00ff', None, 123, True, ['00']):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, '二进制增量游标格式错误'):
+                multi_sync._decode_cursor({'type': 'bytes', 'value': value})
+        for engine, sql_type in [('mssql','timestamp'), ('mssql','rowversion'), ('mssql','image'),
+                                 ('postgresql','bytea'), ('sqlite','blob'), ('mysql','varbinary'),
+                                 ('mariadb','longblob')]:
+            source = {'type': engine}
+            self.assertTrue(multi_sync._cursor_fits_sql_type(b'\x00\xff', sql_type, source))
+            self.assertFalse(multi_sync._cursor_fits_sql_type('00ff', sql_type, source))
+        self.assertFalse(databases.is_binary_column({'sql_type': 'timestamp'}, {'type': 'mysql'}))
+        self.assertFalse(databases.is_binary_column({'sql_type': 'bigint', 'native_type': 'bit'}, {'type': 'mysql'}))
+
+    def test_sql_server_rowversion_cursor_binds_bytes_and_keeps_row_values(self):
+        source = {'type': 'mssql'}
+        job = {'name': '版本进度', 'schema': 'dbo', 'table': 'Orders', 'unique_key': 'Id',
+               'columns': [{'source': 'Id'}, {'source': '版本'}],
+               'incremental': {'enabled': True, 'column': '版本'}}
+        for sql_type in ('timestamp', 'rowversion', 'binary', 'varbinary', 'image'):
+            metadata = [{'name': 'Id', 'sql_type': 'int'}, {'name': '版本', 'sql_type': sql_type}]
+            connection = mock.MagicMock()
+            cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
+            cursor.fetchmany.side_effect = [[(1, None), (2, b'\x00\x01')], [(3, b'\x00\xff')], []]
+            with self.subTest(sql_type=sql_type), \
+                 mock.patch.object(multi_sync, 'sql_connection', return_value=connection), \
+                 mock.patch.object(multi_sync, 'list_columns', return_value=metadata):
+                rows, maximum, used = multi_sync.fetch_job_rows(source, job, {'cursor': {'type': 'bytes', 'value': '0001'}})
+            self.assertTrue(used)
+            self.assertEqual(maximum, b'\x00\xff')
+            self.assertEqual(rows[-1]['版本'], b'\x00\xff')
+            expression = 'CAST([版本] AS VARBINARY(MAX))' if sql_type == 'image' else '[版本]'
+            cursor.execute.assert_called_with(
+                f'SELECT [Id], [版本] FROM [dbo].[Orders] WHERE ({expression} >= %s OR {expression} IS NULL) '
+                f'ORDER BY {expression}, [Id]', (b'\x00\x01',))
+            cursor.fetchmany.side_effect = [[(1, b'\x00\xff')], []]
+            with mock.patch.object(multi_sync, 'sql_connection', return_value=connection), \
+                 mock.patch.object(multi_sync, 'list_columns', return_value=metadata):
+                _, _, used = multi_sync.fetch_job_rows(source, job, {'cursor': {'type': 'str', 'value': "b'\\x00\\xff'"}})
+            self.assertFalse(used)
+            self.assertNotIn('WHERE', cursor.execute.call_args.args[0])
+
     def test_non_numeric_incremental_plans_invalidate_old_comparison_fingerprints(self):
         dumps = json.dumps
         for engine in ('mssql', 'sqlite', 'postgresql', 'mysql', 'mariadb'):

@@ -411,7 +411,16 @@ def comparison_expression(column, source):
         return f"CAST({name} AS CHAR)"
     if kind == "mssql" and sql_type in {"text", "ntext"}:
         return f"CAST({name} AS NVARCHAR(MAX))"
+    if kind == "mssql" and sql_type == "image":
+        return f"CAST({name} AS VARBINARY(MAX))"
     return name
+
+
+def is_binary_column(column, source):
+    kind = column.get("sql_type")
+    return kind in {"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bytea", "image", "rowversion"} or (
+        kind == "timestamp" and database_type(source) == "mssql"
+    )
 
 
 def prepare_read(cursor, source):

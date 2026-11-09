@@ -359,6 +359,10 @@ def _decode_cursor(cursor: Dict[str, Any]) -> Any:
         raise ValueError("增量游标格式错误")
     value = cursor.get("value")
     value_type = cursor.get("type")
+    if value_type == "bytes":
+        if not isinstance(value, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{2})*", value):
+            raise ValueError("二进制增量游标格式错误")
+        return bytes.fromhex(value)
     if value_type == "timedelta":
         if type(value) is not int:
             raise ValueError("时长增量游标格式错误")
@@ -387,6 +391,8 @@ def _decode_cursor(cursor: Dict[str, Any]) -> Any:
 
 
 def _encode_cursor(value: Any) -> Dict[str, Any]:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"type": "bytes", "value": bytes(value).hex()}
     if isinstance(value, timedelta):
         return {"type": "timedelta", "value": value // timedelta(microseconds=1)}
     if isinstance(value, datetime):
@@ -420,6 +426,8 @@ def fetch_job_rows(
     unique_key = job["unique_key"]
     incremental = job["incremental"]
     incremental_column = incremental.get("column") if incremental.get("enabled") else ""
+    incremental_index = selected.index(incremental_column) if incremental_column else None
+    binary_incremental = bool(incremental_column and databases.is_binary_column(metadata[incremental_column], source))
     query = databases.select_query(source, job["schema"], job["table"],
                                    [sql_column_expression(metadata[name], source) for name in selected])
     params: Tuple[Any, ...] = ()
@@ -457,11 +465,11 @@ def fetch_job_rows(
             databases.prepare_read(cursor, source)
             cursor.execute(query, params)
             while True:
-                values = cursor.fetchmany(1000)
-                if not values:
+                raw_rows = cursor.fetchmany(1000)
+                if not raw_rows:
                     break
                 chunk = []
-                for values_row in values:
+                for values_row in raw_rows:
                     if len(values_row) != len(selected):
                         raise ConfigError(f"任务 {job['name']} 返回的列数与所选字段数不一致")
                     row = {name: decode_sql_value(value, metadata[name], source) for name, value in zip(selected, values_row)}
@@ -469,11 +477,12 @@ def fetch_job_rows(
                 if "generated_key" in job:
                     add_generated_row_keys(chunk, job, occurrences)
                 if incremental_column:
-                    values = [row[incremental_column] for row in chunk if row.get(incremental_column) is not None]
+                    values = [raw[incremental_index] if binary_incremental else row[incremental_column]
+                              for raw, row in zip(raw_rows, chunk) if row.get(incremental_column) is not None]
                     null_cursor_count += len(chunk) - len(values)
                     if values:
                         declared_type = metadata[incremental_column].get("sql_type", "")
-                        if declared_type in DATE_TYPES | NUMERIC_TYPES and any(
+                        if (binary_incremental or declared_type in DATE_TYPES | NUMERIC_TYPES) and any(
                             not _cursor_fits_sql_type(value, declared_type, source, metadata[incremental_column])
                             for value in values
                         ):
@@ -496,6 +505,8 @@ def _cursor_fits_sql_type(value: Any, sql_type: str, source: Optional[Dict[str, 
                          column: Optional[Dict[str, Any]] = None) -> bool:
     """Detect a cursor that no longer matches its incremental column type."""
     kind = (sql_type or "").lower()
+    if databases.is_binary_column({"sql_type": kind}, source or {}):
+        return isinstance(value, (bytes, bytearray, memoryview))
     if kind == "time" and source and databases.database_type(source) in {"mysql", "mariadb"}:
         return isinstance(value, timedelta) and abs(value) < timedelta(hours=839)
     if kind == "interval" and source and databases.database_type(source) == "postgresql":
