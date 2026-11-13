@@ -12,19 +12,19 @@
     <aside class="sidebar">
         <div class="brand"><span class="brand-mark">SF</span><div><strong>同步中心</strong><small>数据库 → 飞书</small></div></div>
         <nav aria-label="页面导航">
-            <button class="nav-item active" data-view="overview">总览</button>
-            <button class="nav-item" data-view="feishu">飞书空间</button>
-            <button class="nav-item" data-view="sources">数据源</button>
-            <button class="nav-item" data-view="builder">同步计划</button>
-            <button class="nav-item" data-view="runs">执行与日志</button>
-            <button class="nav-item" data-view="settings">运行设置</button>
+            <button class="nav-item active" data-view="overview"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg><span>总览</span></button>
+            <button class="nav-item" data-view="feishu"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v13H4z M8 7V4h8v3 M4 12h16"/></svg><span>飞书空间</span></button>
+            <button class="nav-item" data-view="sources"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0"/></svg><span>数据源</span></button>
+            <button class="nav-item" data-view="builder"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z M8 9h8 M8 13h5 M8 16h7"/></svg><span>同步计划</span></button>
+            <button class="nav-item" data-view="runs"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5 M4 19h16 M8 15v-4 M13 15V7 M18 15v-6"/></svg><span>执行与日志</span></button>
+            <button class="nav-item" data-view="settings"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16 M4 17h16 M9 4v6 M15 14v6"/></svg><span>运行设置</span></button>
         </nav>
         <div class="sidebar-note">支持多个数据库、多个表、字段勾选和增量游标。</div>
     </aside>
 
     <main>
         <header class="topbar">
-            <div><p class="kicker">DATA PIPELINE</p><h1>多数据库同步控制台</h1><p>选择数据库，批量调整同步计划，预检后将数据写入飞书。</p></div>
+            <div><h1>数据同步工作台</h1><p>选择数据库，批量调整同步计划，预检后将数据写入飞书。</p></div>
             <div id="global-status" class="pill neutral">正在加载</div>
         </header>
 
@@ -105,8 +105,11 @@
         </section>
 
         <section id="view-builder" class="view">
-            <div class="panel">
-                <div class="panel-head"><div><h2>编辑同步计划</h2><p class="panel-description">选择需要同步的表，字段默认全部包含。</p></div><button id="scan-tables" class="btn primary">读取数据库表</button></div>
+            <div class="workspace-intro"><div><h2>数据库同步</h2><p>整库接入，统一管理每张表的同步。</p></div><button class="btn secondary" data-jump="runs">查看执行记录</button></div>
+            <div class="connection-route"><div class="route-node"><span class="route-symbol">▤</span><div><small>来源数据库</small><strong id="route-source">选择一个数据库</strong></div></div><div class="route-path"><span>只读获取</span><i></i><span>按任务设置写入</span></div><div class="route-node"><span class="route-symbol destination">▦</span><div><small>同步至</small><strong>飞书多维表格</strong></div></div></div>
+            <div class="workspace-tabs" role="tablist" aria-label="同步工作阶段"><button id="tab-tables" role="tab" aria-selected="true" aria-controls="plan-tables" tabindex="0">接入与选表 <span>配置同步范围</span></button><button id="tab-jobs" role="tab" aria-selected="false" aria-controls="saved-jobs" tabindex="-1">任务管理 <span id="workspace-job-count">查看已保存任务</span></button></div>
+            <div class="panel" id="plan-tables" role="tabpanel" aria-labelledby="tab-tables">
+                <div class="panel-head"><div><h2>确定这次同步的范围</h2><p class="panel-description">读取数据库后默认包含全部表和字段。可以取消暂不需要的表，再保存计划。</p></div><button id="scan-tables" class="btn primary">读取数据库表</button></div>
                 <div class="inline-form"><label>选择数据库<select id="builder-source"></select></label><label class="search">搜索数据表<input id="table-search" type="search" placeholder="搜索表名，多个名称用逗号隔开"></label><label class="compact-filter">选择状态<select id="table-status-filter"><option value="all">全部表</option><option value="selected">已选择</option><option value="unselected">未选择</option></select></label></div>
                 <div class="plan-summary" aria-live="polite"><span>数据库表 <strong id="plan-total">0</strong></span><span>已选择 <strong id="plan-selected">0</strong></span><span>未选择 <strong id="plan-unselected">0</strong></span><span id="plan-state" class="pill neutral">待读取</span></div>
                 <div class="actions wrap plan-toolbar"><button id="select-all-tables" class="btn secondary">全选当前筛选表</button><button id="clear-visible-tables" class="btn secondary">取消当前筛选</button><button id="clear-table-selection" class="btn secondary">取消全部</button><button id="configure-selected-tables" class="btn primary">保存同步计划</button><button id="cancel-plan-save" class="btn danger" hidden>停止保存计划</button><span id="table-selection-count" class="message"></span></div>
@@ -153,7 +156,7 @@
             </div>
             </dialog>
 
-            <div class="panel">
+            <div class="panel" id="saved-jobs" role="tabpanel" aria-labelledby="tab-jobs" hidden>
                 <div class="panel-head"><div><h2>已保存的任务</h2><p class="panel-description">可编辑字段、目标表和增量设置。启停开关自动保存。</p></div><span id="job-result-count" class="pill neutral">0 个任务</span></div><div class="job-filters"><label>搜索任务<input id="job-search" type="search" placeholder="任务、表名或数据库"></label><label>运行状态<select id="job-status-filter"><option value="all">全部任务</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></label></div>
                 <div class="actions wrap job-bulk-actions"><button id="configure-incremental" class="btn secondary">批量配置增量</button><button id="check-filtered-jobs" class="btn secondary">预检筛选任务</button><button id="run-filtered-jobs" class="btn primary">同步筛选任务</button><span id="job-scope-hint" class="message"></span></div>
                 <div id="job-list" class="job-list empty">还没有任务。请先在上方保存同步计划。</div>
@@ -234,6 +237,25 @@ async function api(url, options={}) {
     return data;
 }
 function message(id, ok, text) { const el=$(id); el.textContent=text||''; el.className=`message ${ok?'ok':'bad'}`; }
+function setWorkspaceMode(mode){
+    const tables=mode==='tables';
+    $('plan-tables').hidden=!tables;
+    $('saved-jobs').hidden=tables;
+    for(const name of ['tables','jobs']){
+        const active=name===mode;
+        $('tab-'+name).ariaSelected=String(active);
+        $('tab-'+name).tabIndex=active?0:-1;
+    }
+}
+for(const name of ['tables','jobs']){
+    $('tab-'+name).onclick=()=>setWorkspaceMode(name);
+    $('tab-'+name).addEventListener('keydown',event=>{
+        if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+        event.preventDefault();
+        const next=event.key==='Home'?'tables':event.key==='End'?'jobs':name==='tables'?'jobs':'tables';
+        setWorkspaceMode(next);$('tab-'+next).focus();
+    });
+}
 function nav(view) { document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id===`view-${view}`)); document.querySelectorAll('.nav-item').forEach(x=>x.classList.toggle('active',x.dataset.view===view)); }
 document.querySelectorAll('.nav-item').forEach(x=>x.onclick=()=>nav(x.dataset.view));
 document.querySelectorAll('[data-jump]').forEach(x=>x.onclick=()=>nav(x.dataset.jump));
@@ -246,6 +268,7 @@ async function loadWorkspace() {
     $('fs-app-id').value=store.feishu.app_id||''; $('fs-url').value=store.feishu.base_url||''; $('fs-token').value=store.feishu.app_token||'';
     $('fs-secret').placeholder=store.feishu.has_app_secret?'已安全保存，留空不变':'请输入 App Secret';
     renderSettings();
+    setWorkspaceMode(store.config.jobs.length?'jobs':'tables');
     renderAll(); const status=await api('/api/status'); applyRunStatus(status);if(status.running){store.cursor=0;poll();}
 }
 function renderAll(){
@@ -385,7 +408,7 @@ $('save-source').onclick=async()=>{
             message('source-message',true,'数据源已保存，可测试连接。');
         }else{
             $('builder-source').value=data.source_id;
-            nav('builder');
+            nav('builder');setWorkspaceMode('tables');
             await $('scan-tables').onclick();
         }
     }catch(error){
@@ -427,7 +450,7 @@ $('scan-tables').onclick=async()=>{
     }catch(error){message('discovery-message',false,error.message);}
     finally{if(requestId===discoveryRequest)$('scan-tables').disabled=false;}
 };
-$('builder-source').onchange=async()=>{editorRequest++;$('job-editor-panel').hidden=true;await $('scan-tables').onclick();};
+$('builder-source').onchange=async()=>{setWorkspaceMode('tables');editorRequest++;$('job-editor-panel').hidden=true;await $('scan-tables').onclick();};
 $('table-search').oninput=()=>{listPages.table=1;renderTables();};
 $('table-status-filter').onchange=()=>{listPages.table=1;renderTables();};
 function matchesSearch(text, query){
@@ -465,6 +488,7 @@ function updateTableSelection(){
     const total=store.tables.length;
     const selected=store.tables.filter(t=>pendingTables.has(tableKey(t.source_id,t.schema,t.name))).length;
     const dirty=hasPlanChanges();
+    $('route-source').textContent=sourceName($('builder-source').value)||'选择一个数据库';
     $('plan-total').textContent=total;
     $('plan-selected').textContent=selected;
     $('plan-unselected').textContent=total-selected;
@@ -561,7 +585,7 @@ function renderTables(){
         const existing=store.config.jobs.find(j=>j.source_id===sourceId&&j.schema===t.schema&&j.table===t.name);
         const selected=pendingTables.has(tableKey(sourceId,t.schema,t.name));
         const typeLabel={view:'视图',materialized_view:'物化视图'}[t.type]||'数据表';
-        return `<div class="table-row${selected?' is-selected':''}"><label><input type="checkbox" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}" ${pendingTables.has(tableKey(sourceId,t.schema,t.name))?'checked':''} ${planSaving?'disabled':''}><span><b>${escapeHtml(t.schema)}.${escapeHtml(t.name)}</b><small>${escapeHtml(sourceName(sourceId))} · ${typeLabel}</small></span></label><button class="btn secondary configure-table" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}">${existing?'编辑任务':'配置与预览'}</button></div>`;
+        return `<div class="table-row${selected?' is-selected':''}"><label><input type="checkbox" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}" ${pendingTables.has(tableKey(sourceId,t.schema,t.name))?'checked':''} ${planSaving?'disabled':''}><span><b title="${escapeHtml(t.schema)}.${escapeHtml(t.name)}">${escapeHtml(t.schema)}.${escapeHtml(t.name)}</b><small>${escapeHtml(sourceName(sourceId))} · ${typeLabel}</small></span></label><span class="table-plan-status" data-state="${existing?.enabled?'enabled':'inactive'}">${existing?(existing.enabled?'任务已启用':'任务已停用'):'尚未建任务'}</span><button class="btn secondary configure-table" data-source="${escapeHtml(sourceId)}" data-table="${escapeHtml(t.name)}" data-schema="${escapeHtml(t.schema)}">${existing?'编辑任务':'配置与预览'}</button></div>`;
     }).join(''):'没有匹配的数据表。';
     $('table-list').scrollTop=scrollTop;
     document.querySelectorAll('.configure-table').forEach(b=>b.onclick=()=>openJobEditor(b.dataset.source,b.dataset.schema,b.dataset.table));
@@ -778,6 +802,7 @@ function renderJobs(){
     $('configure-incremental').disabled=!jobs.length||incrementalBatchSaving;
     $('check-filtered-jobs').disabled=!runnable.length||store.running;
     $('run-filtered-jobs').disabled=!runnable.length||store.running;
+    $('workspace-job-count').textContent=`${store.config.jobs.length} 个已保存任务`;
     $('job-result-count').textContent=`${jobs.length}/${store.config.jobs.length} 个任务`;
     const page=pageItems(jobs,'job');
     const scrollTop=list.scrollTop;

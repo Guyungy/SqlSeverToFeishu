@@ -328,3 +328,18 @@ test('column editor displays saved types and recommends exact text only for new 
     assert.equal(ui.run('selectedColumns()[0].target'), '精确编号');
     assert.equal(ui.run('selectedColumns()[0].sql_type'), 'bigint');
 });
+
+
+test('workspace stages switch without discarding pending table choices', () => {
+    const ui = uiContext();
+    ui.run(`pendingTables.set('pending',{table:'未保存表'});setWorkspaceMode('jobs');`);
+    assert.equal(ui.element('plan-tables').hidden, true);
+    assert.equal(ui.element('saved-jobs').hidden, false);
+    assert.equal(ui.element('tab-jobs').ariaSelected, 'true');
+    assert.equal(ui.element('tab-tables').tabIndex, -1);
+    ui.element('tab-tables').onclick();
+    assert.equal(ui.element('plan-tables').hidden, false);
+    assert.equal(ui.element('saved-jobs').hidden, true);
+    assert.equal(ui.element('tab-tables').ariaSelected, 'true');
+    assert.equal(ui.run('pendingTables.size'), 1);
+});
